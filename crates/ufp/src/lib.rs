@@ -5,7 +5,11 @@
 //! `main.rs` 只负责参数解析、日志、信号与运行时。
 
 #![cfg_attr(test, allow(non_snake_case))]
+// axum 处理器习惯返回 Result<Response, Response>：Err 变体里的 Response 天生偏大，
+// 这是框架用法的问题，不是错误类型设计的问题。
+#![allow(clippy::result_large_err)]
 
+pub mod alert;
 pub mod api;
 pub mod config;
 pub mod forward;

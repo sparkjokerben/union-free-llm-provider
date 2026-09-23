@@ -27,7 +27,6 @@ use crate::api::error::ApiError;
 use crate::api::AppState;
 use crate::health::cooldown::cooldown_from_response;
 use crate::pipeline::{truncate_error, Pipeline, PipelineCfg, Usage};
-use crate::rectify::{apply_builtin, BuiltinRectifier};
 use crate::router::select::Plan;
 use crate::store::{AttemptLogRow, Candidate, ModelEcho, RequestLogRow, Settings, Write};
 use crate::upstream::{self, AnthropicToolSchemaHints, BuildCtx};
@@ -187,22 +186,31 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             log_template: ctx.log_template.clone(),
         };
         let attempt_started = Instant::now();
-        let mut tried: Vec<BuiltinRectifier> = Vec::new();
+        let mut rectifier = crate::rectify::RectifierState::new();
         let result = loop {
             let r = try_once(&state, cand, &input).await;
-            if let AttemptResult::Rectifiable { message, .. } = &r {
-                // 请求本身有问题：先在同候选上矫正重试（最多几个确定性矫正器）。
-                if let Some(rectifier) =
-                    apply_builtin(&mut input.body, message, &settings.rectifier, &tried)
+            if let AttemptResult::Rectifiable { message, status } = &r {
+                // 请求本身有问题：先在同候选上矫正重试
+                // （内置矫正器 → 已沉淀的规则 → LLM 在线分析）。
+                let protocol = cand.channel.protocol.as_str();
+                if let Some(note) = rectifier
+                    .next_step(
+                        &state,
+                        &settings,
+                        &mut input.body,
+                        *status,
+                        protocol,
+                        message,
+                    )
+                    .await
                 {
                     tracing::info!(
                         request_id = %ctx.request_id,
                         channel = %cand.channel.name,
-                        rectifier = rectifier.as_str(),
-                        "应用矫正器后重试同一候选：{}",
+                        "矫正后重试同一候选：{}（原错误：{}）",
+                        note,
                         truncate_error(message)
                     );
-                    tried.push(rectifier);
                     continue;
                 }
             }
@@ -402,6 +410,19 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
     }
 
     let error = last_error.unwrap_or_else(|| ApiError::overloaded("没有可用的上游候选"));
+    // 整池不可用是要人管的事件：发一次告警（同类事件按设置限频）
+    if error.status.as_u16() == 529 || error.status.is_server_error() {
+        let settings = state.pool.load().settings.clone();
+        state.alerter.notify(
+            &settings.alerts,
+            "pool_unavailable",
+            "ufp：上游池暂时不可用",
+            &format!(
+                "请求 {} 连续尝试 {} 个候选都失败：{}。\n\n去后台「健康与冷却」看看是哪些条目在熔断/冷却。",
+                ctx.request_id, meta.attempts, error.message
+            ),
+        );
+    }
     Outcome::Failed { error, meta }
 }
 

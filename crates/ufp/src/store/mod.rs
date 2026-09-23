@@ -1,6 +1,7 @@
 //! 存储层：SQLite 表结构、读写连接、以及给热路径用的配置快照。
 
 pub mod db;
+pub mod maintenance;
 pub mod schema;
 pub mod settings;
 

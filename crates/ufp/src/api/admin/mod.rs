@@ -266,7 +266,7 @@ async fn overview(
         .and_hms_opt(0, 0, 0)
         .map(|d| d.and_utc().timestamp_millis())
         .unwrap_or(0);
-    let one_hour_ago = chrono::Utc::now().timestamp_millis() - 3600_000;
+    let one_hour_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
     let summary = state
         .db
         .read(move |conn| {
@@ -323,8 +323,8 @@ async fn overview(
             "dropped_writes": state.db.dropped(),
             "version": crate::VERSION,
         }
-    })))
-    .map(IntoResponse::into_response)
+    }))
+    .into_response())
 }
 
 async fn pool_search_backends(state: &Arc<AppState>) -> usize {
@@ -1448,11 +1448,7 @@ async fn export_config(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     require_auth(&state, &headers)?;
-    let value = state
-        .db
-        .read(|conn| export_all(conn))
-        .await
-        .map_err(internal)?;
+    let value = state.db.read(export_all).await.map_err(internal)?;
     Ok(Json(value).into_response())
 }
 

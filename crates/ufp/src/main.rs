@@ -148,6 +148,9 @@ fn spawn_maintenance(state: std::sync::Arc<api::AppState>) {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // 第一次立刻返回，跳过
+        let mut rounds: u64 = 0;
+        // 启动时先跑一次每日维护（重启后也能补上汇总与备份）
+        let mut run_daily_now = true;
         loop {
             tick.tick().await;
             let now = chrono::Utc::now().timestamp_millis();
@@ -156,6 +159,41 @@ fn spawn_maintenance(state: std::sync::Arc<api::AppState>) {
             let settings = state.pool.load().settings.clone();
             let sessions = state.sessions.prune(&state.db, settings.session_ttl_days);
             tracing::info!(cooldowns, sessions, "维护：已清理过期的冷却与会话映射");
+
+            rounds += 1;
+            if rounds % 24 == 0 || run_daily_now {
+                run_daily_now = false;
+                let cutoff = now - settings.detail_retention_days as i64 * 86_400_000;
+                match store::maintenance::run_daily(
+                    &state.db,
+                    cutoff,
+                    settings.session_ttl_days,
+                    &state.backup_dir,
+                )
+                .await
+                {
+                    Ok(r) => tracing::info!(
+                        rolled_up = r.rolled_up,
+                        pruned_details = r.pruned_details,
+                        pruned_attempts = r.pruned_attempts,
+                        backup = ?r.backup,
+                        "每日维护：明细已汇总，过期数据已清理"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "每日维护失败"),
+                }
+                let dropped = state.db.dropped();
+                if dropped > 0 {
+                    state.alerter.notify(
+                        &settings.alerts,
+                        "db_write_dropped",
+                        "ufp：写库开始丢数据",
+                        &format!(
+                            "已经有 {dropped} 条用量记录因为写队列拥塞被丢弃。\
+                             通常是磁盘满了或写入异常，请检查服务器。"
+                        ),
+                    );
+                }
+            }
         }
     });
 }

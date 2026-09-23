@@ -1084,3 +1084,230 @@ async fn 后台_健康接口能重置熔断与冷却() {
     assert_eq!(reset, 1);
     assert!(gw.state.breakers.snapshot().is_empty());
 }
+
+// ============================================================================
+// 矫正：LLM 在线分析 + 规则沉淀
+// ============================================================================
+
+#[tokio::test]
+async fn 未知_400_由分析条目给出补丁并沉淀成规则() {
+    // 分析条目：返回一个 JSON 补丁
+    let analyzer = MockServer::start().await;
+    let patch_text = r#"{"why":"上游不接受工具 schema 里的 additionalProperties","patch":[{"op":"remove","path":"/tools/0/input_schema/additionalProperties"}]}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_body("gpt-4o", patch_text)),
+        )
+        .mount(&analyzer)
+        .await;
+
+    // 挑刺的上游：第一次 400，之后放行
+    let picky = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "invalid request: unsupported field 'additionalProperties' in tool schema"}
+        })))
+        .up_to_n_times(1)
+        .mount(&picky)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_body("gpt-4o-mini", "补丁生效后的回答")),
+        )
+        .mount(&picky)
+        .await;
+
+    let analyzer_uri = analyzer.uri();
+    let picky_uri = picky.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "picky",
+            "openai_chat",
+            &picky_uri,
+            "sk-picky",
+            "gpt-4o-mini",
+            1,
+        );
+        let (_key, entry_id) = seed_channel(
+            conn,
+            "analyzer",
+            "openai_chat",
+            &analyzer_uri,
+            "sk-ana",
+            "gpt-4o",
+            2,
+        );
+        // 指定分析条目
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('runtime', ?1)",
+            rusqlite::params![serde_json::json!({"analysisEntryId": entry_id}).to_string()],
+        )
+        .unwrap();
+    })
+    .await;
+
+    let body = json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "max_tokens": 256,
+        "stream": false,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "帮我读个文件"}]}],
+        "tools": [{
+            "name": "Read",
+            "description": "读取文件",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }]
+    });
+    let resp = client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("请求失败");
+    assert_eq!(
+        resp.status(),
+        200,
+        "矫正后应当成功：{}",
+        resp.text().await.unwrap()
+    );
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["content"][0]["text"], "补丁生效后的回答");
+
+    // 分析条目应当被调到（且骨架里没有正文）
+    let analyzer_requests = analyzer.received_requests().await.unwrap_or_default();
+    assert_eq!(analyzer_requests.len(), 1, "应当调用一次分析条目");
+    let prompt = String::from_utf8_lossy(&analyzer_requests[0].body).to_string();
+    assert!(
+        prompt.contains("additional_properties") || prompt.contains("additionalProperties"),
+        "骨架里应带上工具 schema：{prompt}"
+    );
+    assert!(
+        !prompt.contains("帮我读个文件"),
+        "骨架里不该有对话正文：{prompt}"
+    );
+
+    // 挑刺渠道被调了两次（400 → 矫正 → 200）
+    let picky_requests = picky.received_requests().await.unwrap_or_default();
+    assert_eq!(picky_requests.len(), 2, "应当在同一候选上矫正重试一次");
+
+    // 规则应已沉淀
+    let rule = gw
+        .state
+        .db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT patch_json, source FROM rectify_rules ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(rule.1, "llm");
+    assert!(rule.0.contains("additionalProperties"), "{}", rule.0);
+}
+
+#[tokio::test]
+async fn 已沉淀的规则会被直接套用不再分析() {
+    let analyzer = MockServer::start().await;
+    // 分析条目这次不该被调用：规则已经存在
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_body("gpt-4o", "不该被调用")),
+        )
+        .mount(&analyzer)
+        .await;
+
+    let picky = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "invalid request: unsupported field 'additionalProperties' in tool schema"}
+        })))
+        .up_to_n_times(1)
+        .mount(&picky)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_body("gpt-4o-mini", "规则生效")),
+        )
+        .mount(&picky)
+        .await;
+
+    let analyzer_uri = analyzer.uri();
+    let picky_uri = picky.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "picky", "openai_chat", &picky_uri, "sk-picky", "gpt-4o-mini", 1);
+        let (_key, entry_id) = seed_channel(conn, "analyzer", "openai_chat", &analyzer_uri, "sk-ana", "gpt-4o", 2);
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('runtime', ?1)",
+            rusqlite::params![serde_json::json!({"analysisEntryId": entry_id}).to_string()],
+        )
+        .unwrap();
+        // 预先放一条规则（指纹与下面请求的错误一致）
+        let fp = ufp::rectify::rules::fingerprint(
+            "openai_chat",
+            400,
+            "invalid request: unsupported field 'additionalProperties' in tool schema",
+        );
+        conn.execute(
+            "INSERT INTO rectify_rules (scope, error_fingerprint, error_sample, patch_json, source, enabled, created_ms, updated_ms)
+             VALUES ('openai_chat', ?1, '历史上的同款报错', ?2, 'llm', 1, 0, 0)",
+            rusqlite::params![fp, r#"[{"op":"remove","path":"/tools/0/input_schema/additionalProperties"}]"#],
+        )
+        .unwrap();
+    })
+    .await;
+
+    let body = json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "max_tokens": 256,
+        "stream": false,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "读文件"}]}],
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "additionalProperties": false,
+                   "properties": {"path": {"type": "string"}}, "required": ["path"]}}]
+    });
+    let resp = client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 关键断言：这次没有调用分析条目（省下额度）
+    let analyzer_requests = analyzer.received_requests().await.unwrap_or_default();
+    assert!(analyzer_requests.is_empty(), "已有规则时不该再调分析条目");
+
+    // 命中计数应当被累加（写库是异步批量的，轮询等一下）
+    let mut hits = 0i64;
+    for _ in 0..40 {
+        hits = gw
+            .state
+            .db
+            .read(|conn| conn.query_row("SELECT hits FROM rectify_rules LIMIT 1", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        if hits > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(hits, 1);
+}

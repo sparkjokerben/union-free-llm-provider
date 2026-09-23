@@ -38,6 +38,10 @@ pub struct AppState {
     pub sessions: Arc<Sessions>,
     /// 后台登录会话（内存，重启失效）。
     pub admin_sessions: Arc<admin::session::Sessions>,
+    /// 邮件告警（限频）。
+    pub alerter: Arc<crate::alert::Alerter>,
+    /// 备份目录（每日维护写 SQLite 快照）。
+    pub backup_dir: std::path::PathBuf,
     pub started_ms: i64,
 }
 
@@ -49,6 +53,11 @@ impl AppState {
         cooldowns: Arc<Cooldowns>,
         sessions: Arc<Sessions>,
     ) -> Arc<Self> {
+        let cfg_backup_dir = cfg
+            .db_path
+            .parent()
+            .map(|p| p.join("backup"))
+            .unwrap_or_else(|| std::path::PathBuf::from("./backup"));
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(
                 pool.load().settings.connect_timeout_ms,
@@ -69,6 +78,8 @@ impl AppState {
             cooldowns,
             sessions,
             admin_sessions: Arc::new(admin::session::Sessions::new()),
+            alerter: Arc::new(crate::alert::Alerter::new()),
+            backup_dir: cfg_backup_dir,
             started_ms: chrono::Utc::now().timestamp_millis(),
         })
     }
@@ -76,10 +87,18 @@ impl AppState {
     /// 上游明确拒绝这个 key（401/403）：落库禁用并立刻刷新快照，
     /// 后续请求不会再选它；后台会把它标红，等人工恢复。
     pub fn disable_upstream_key(&self, key_id: i64, reason: &str) {
+        let reason = crate::pipeline::truncate_error(reason);
         self.db.write_blocking(crate::store::Write::DisableKey {
             key_id,
-            reason: crate::pipeline::truncate_error(reason),
+            reason: reason.clone(),
         });
+        let settings = self.pool.load().settings.clone();
+        self.alerter.notify(
+            &settings.alerts,
+            "key_disabled",
+            "ufp：上游拒绝了网关的 key",
+            &format!("key id {key_id} 已被自动禁用，请在后台「渠道与条目」确认后手动恢复。\n\n原因：{reason}"),
+        );
         let pool = Arc::clone(&self.pool);
         let db = Arc::clone(&self.db);
         tokio::spawn(async move {
