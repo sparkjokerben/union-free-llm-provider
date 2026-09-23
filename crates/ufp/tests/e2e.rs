@@ -1311,3 +1311,93 @@ async fn 已沉淀的规则会被直接套用不再分析() {
     }
     assert_eq!(hits, 1);
 }
+
+// ============================================================================
+// 在线部署接口（CI 推包用）
+// ============================================================================
+
+#[tokio::test]
+async fn 部署接口_令牌与哈希校验() {
+    // 落盘目录指到临时目录（开发机上没有 /var/lib/ufp）
+    let spool = tempfile::tempdir().unwrap();
+    std::env::set_var("UFP_DEPLOY_SPOOL", spool.path());
+    let gw = spawn_gateway(|conn| {
+        seed_downstream_key(conn);
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('runtime', ?1)",
+            rusqlite::params![serde_json::json!({"deployToken": "test-deploy-token"}).to_string()],
+        )
+        .unwrap();
+    })
+    .await;
+    let url = format!("{}/admin/api/deploy", gw.base);
+    let payload = b"fake-tarball-bytes".to_vec();
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&payload);
+        format!("{:x}", h.finalize())
+    };
+
+    // 1) 没有令牌
+    let resp = client()
+        .post(&url)
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 2) 令牌不对
+    let resp = client()
+        .post(&url)
+        .header("x-ufp-deploy-token", "wrong")
+        .header("x-ufp-sha256", &sha)
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 3) 缺 sha256
+    let resp = client()
+        .post(&url)
+        .header("x-ufp-deploy-token", "test-deploy-token")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 4) 哈希不匹配
+    let resp = client()
+        .post(&url)
+        .header("x-ufp-deploy-token", "test-deploy-token")
+        .header("x-ufp-sha256", "deadbeef")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "哈希不对必须拒绝");
+
+    // 5) 正确请求：网关会落盘；开发机上没有 sudo/doas 或特权脚本，所以返回 503，
+    //    但包必须已经写好（这样人工也能接着装）。
+    let resp = client()
+        .post(&url)
+        .header("x-ufp-deploy-token", "test-deploy-token")
+        .header("x-ufp-sha256", &sha)
+        .header("x-ufp-version", "v9.9.9")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["sha256"], sha);
+    assert!(
+        status == 202 || status == 503,
+        "状态应是 202（已触发）或 503（落盘成功但没特权脚本）：{status} {body}"
+    );
+    let saved = body["file"].as_str().unwrap();
+    assert!(std::path::Path::new(saved).exists(), "包应已落盘：{saved}");
+}

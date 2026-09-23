@@ -82,13 +82,14 @@ jobs:
             - ARM 服务器（Oracle/Ampere 等）：`ufp-aarch64-unknown-linux-musl`
 
             部署见 `deploy/`：OpenRC 服务脚本、nginx 配置、安装脚本；
-            打 tag 时本仓库会自动部署到服务器（见 `.github/workflows/_deploy.yml`）。
+            打 tag 时本仓库会自动部署到服务器（经 Cloudflare 代理的 `/admin/api/deploy`）。
 
+  # 自动部署：编译完 → 发 Release → 通过域名把发布包推给网关（Cloudflare 代理转发到 v6 源站）
   deploy:
-    needs: release
+    needs: [build, release]
     if: ${{ !cancelled() && needs.release.result == 'success' }}
-    uses: ./.github/workflows/_deploy.yml
+    uses: ./.github/workflows/_deploy-http.yml
     with:
       tag: ${{ github.event.inputs.tag || github.ref_name }}
-      artifacts_from: release
+      artifacts_from: local
     secrets: inherit

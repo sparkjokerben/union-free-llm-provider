@@ -112,7 +112,8 @@ pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 pub fn client_ip(headers: &HeaderMap) -> String {
-    for name in ["x-real-ip", "x-forwarded-for"] {
+    // 走 Cloudflare 代理时，这两个头才是真实客户端（x-real-ip 会变成 CF 边缘地址）
+    for name in ["cf-connecting-ip", "x-real-ip", "x-forwarded-for"] {
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
             let first = v.split(',').next().unwrap_or("").trim();
             if !first.is_empty() {

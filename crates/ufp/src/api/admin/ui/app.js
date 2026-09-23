@@ -623,6 +623,12 @@ async function renderSettings(target) {
         <button class="ghost" id="do-import">导入配置 JSON</button></div>
       <p class="muted">导出包含渠道、上游 key、条目、搜索后端、规则与设置（不含下游 key 明文，
       只保留哈希，导入后原密钥继续有效）。</p></div>
+    <div class="card"><h2>在线部署令牌</h2>
+      <p class="muted">CI 通过 <code>POST /admin/api/deploy</code> 推新版本时用的令牌
+      （和后台登录密码是两套）。留空表示关闭该接口。也可以先在服务器上运行
+      <code>ufp set-deploy-token</code>。</p>
+      <div class="row"><button class="ghost" id="rotate-token">生成 / 轮换令牌</button>
+        <span class="muted" id="deploy-state"></span></div></div>
     <div class="card"><h2>改后台密码</h2>
       <div class="row"><input id="old-pw" type="password" placeholder="当前密码">
         <input id="new-pw" type="password" placeholder="新密码（至少 8 位）">
@@ -656,6 +662,17 @@ async function renderSettings(target) {
       } catch (e) { toast('导入失败：' + e.message, 'err'); }
     };
     input.click();
+  };
+  target.querySelector('#deploy-state').textContent = settings.deployToken
+    ? "当前已配置（轮换后旧令牌立刻失效）" : "当前未配置，部署接口关闭";
+  target.querySelector('#rotate-token').onclick = async () => {
+    if (!confirm('生成新令牌会让旧令牌立刻失效，确定？')) return;
+    const out = await api('/admin/api/deploy-token', { method: 'POST' });
+    openDialog(`<h2>部署令牌已生成</h2>
+      <p>只显示这一次，请填到仓库 Secret <code>DEPLOY_TOKEN</code>：</p>
+      <pre>${esc(out.token)}</pre>
+      <button class="primary" onclick="document.getElementById('dialog').close()">我已保存</button>`);
+    renderSettings(target);
   };
   target.querySelector('#save-pw').onclick = async () => {
     try {

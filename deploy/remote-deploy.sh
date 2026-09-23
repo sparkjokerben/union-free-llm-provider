@@ -8,7 +8,9 @@
 #   - 最后一定做健康检查，失败自动回滚到上一版二进制。
 #
 # 用法：
-#   sh remote-deploy.sh <二进制路径>
+#   sh remote-deploy.sh <舞台目录>
+#
+# 舞台目录里应有：ufp、ufp-openrc、ufp-nginx.conf（由 ufp-apply-deploy 从发布包里解开）。
 #
 # 环境变量：
 #   UFP_DEPLOY_DOMAIN   首次安装时顺便写 nginx 配置用的域名（可选）
@@ -16,11 +18,19 @@
 #   UFP_HEALTH_URL      健康检查地址，默认 http://127.0.0.1:8787/healthz
 set -eu
 
-BIN="${1:?用法: remote-deploy.sh <二进制路径>}"
+STAGE="${1:?用法: remote-deploy.sh <舞台目录>}"
+# 发布包里两个架构都带着（CI 推给服务器时没法预先探测架构），这里按本机挑
+case "$(uname -m)" in
+  x86_64)  BIN="$STAGE/ufp-x86_64-unknown-linux-musl" ;;
+  aarch64) BIN="$STAGE/ufp-aarch64-unknown-linux-musl" ;;
+  *)       BIN="" ;;
+esac
+[ -n "$BIN" ] && [ -f "$BIN" ] || BIN="$STAGE/ufp"
 TARGET=/usr/local/bin/ufp
+APPLY=/usr/local/bin/ufp-apply-deploy
 SERVICE=/etc/init.d/ufp
+SUDOERS=/etc/sudoers.d/ufp-deploy
 HEALTH="${UFP_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
-STAGE=/tmp/ufp-deploy
 VERSION="${UFP_DEPLOY_VERSION:-unknown}"
 
 log() { echo "[ufp-deploy] $*"; }
@@ -35,7 +45,7 @@ fetch_health() {
 }
 
 [ "$(id -u)" = "0" ] || { echo "[ufp-deploy] 需要 root 运行" >&2; exit 1; }
-[ -f "$BIN" ] || { echo "[ufp-deploy] 找不到二进制：$BIN" >&2; exit 1; }
+[ -f "$BIN" ] || { echo "[ufp-deploy] 找不到适合 $(uname -m) 的二进制（舞台目录：$STAGE）" >&2; exit 1; }
 command -v apk >/dev/null 2>&1 || {
   echo "[ufp-deploy] 这个脚本假设 Alpine Linux（用 apk 装依赖）" >&2
   exit 1
@@ -49,8 +59,14 @@ if [ "$FIRST_INSTALL" = "1" ]; then
   addgroup -S ufp 2>/dev/null || true
   adduser -S -D -H -G ufp -s /sbin/nologin ufp 2>/dev/null || true
   install -d -o ufp -g ufp -m 0750 /var/lib/ufp /var/log/ufp
+  # 网关收部署包的目录（它以 ufp 用户运行，只能写自己的目录）
+  install -d -o ufp -g ufp -m 0750 /var/lib/ufp/incoming
   install -m 0755 "$BIN" "$TARGET"
+  install -m 0755 "$STAGE/ufp-apply-deploy" "$APPLY"
   install -m 0755 "$STAGE/ufp-openrc" "$SERVICE"
+  # 允许 ufp 用户只免密运行这一个脚本（在线部署用）
+  printf 'ufp ALL=(root) NOPASSWD: %s\n' "$APPLY" > "$SUDOERS"
+  chmod 0440 "$SUDOERS"
   rc-update add ufp default >/dev/null 2>&1 || true
 
   if [ -n "${UFP_DEPLOY_DOMAIN:-}" ]; then
@@ -70,6 +86,9 @@ else
   if ! cmp -s "$STAGE/ufp-openrc" "$SERVICE"; then
     log "顺带更新 OpenRC 服务脚本"
     install -m 0755 "$STAGE/ufp-openrc" "$SERVICE"
+  fi
+  if [ -f "$STAGE/ufp-apply-deploy" ] && ! cmp -s "$STAGE/ufp-apply-deploy" "$APPLY"; then
+    install -m 0755 "$STAGE/ufp-apply-deploy" "$APPLY"
   fi
   install -m 0755 "$BIN" "$TARGET.new"
   if ! UFP_UPGRADE_NO_WAIT=1 rc-service ufp upgrade; then

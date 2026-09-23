@@ -29,6 +29,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "set-deploy-token" => {
+            match set_deploy_token() {
+                Ok(token) => {
+                    println!("部署令牌已写入（只显示这一次，复制到仓库 Secret DEPLOY_TOKEN）：\n\n{token}\n");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("设置部署令牌失败：{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "set-admin-password" => match set_admin_password(args.get(2).map(String::as_str)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -42,7 +54,7 @@ fn main() -> ExitCode {
         }
         "help" | "-h" | "--help" => {
             println!(
-                "ufp {}\n\n用法：\n  ufp serve                     启动网关（环境变量见 deploy/openrc/ufp）\n  ufp set-admin-password [密码]  设置后台登录密码，不传则从 stdin 读一行\n  ufp version",
+                "ufp {}\n\n用法：\n  ufp serve                      启动网关（环境变量见 deploy/openrc/ufp）\n  ufp set-admin-password [密码]   设置后台登录密码，不传则从 stdin 读一行\n  ufp set-deploy-token           生成新的部署令牌（CI 用）\n  ufp version",
                 env!("CARGO_PKG_VERSION")
             );
             ExitCode::SUCCESS
@@ -276,6 +288,32 @@ fn init_logging(
         eprintln!("日志订阅器已被设置过，忽略重复初始化");
     }
     guard
+}
+
+/// 生成并写入部署令牌（CI 往 /admin/api/deploy 推新版本时用）。
+fn set_deploy_token() -> Result<String, Box<dyn std::error::Error>> {
+    use rand::Rng;
+    let cfg = config::Config::from_env().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let token: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect();
+    let db = store::Db::open(&cfg.db_path)?;
+    let token_for_db = token.clone();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            db.admin(move |conn| {
+                let mut settings = store::load_settings(conn)?;
+                settings.deploy_token = token_for_db;
+                store::save_settings(conn, &settings)?;
+                Ok(())
+            })
+            .await
+        })?;
+    Ok(token)
 }
 
 fn set_admin_password(arg: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {

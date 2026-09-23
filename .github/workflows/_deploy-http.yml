@@ -1,0 +1,139 @@
+name: _deploy-http
+
+# 可复用的「在线部署」流程：CI 把发布包 POST 给网关的 /admin/api/deploy，
+# 网关校验 sha256 后通过本地 sudo/doas 触发 ufp-apply-deploy 完成升级。
+#
+# 为什么不用 SSH：GitHub 托管 runner 只有 IPv4 出口，而目标服务器是 IPv6-only；
+# 走 Cloudflare 代理的 HTTPS（runner v4 → CF 边缘 → 源站 v6）是唯一稳定可达的路径。
+# SSH 部署留给能连 IPv6 的机器手动执行，见 README 的「运维」一节。
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "要部署的版本号（仅用于比对 healthz 的 version 与日志）"
+        required: true
+        type: string
+      artifacts_from:
+        description: "local=用本次构建的产物；release=从该 tag 的 Release 下载"
+        required: false
+        type: string
+        default: release
+      dry_run:
+        description: "只验证域名可达与令牌有效，不推送、不改服务器"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DEPLOY_URL:
+        required: true
+      DEPLOY_TOKEN:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取本次构建的产物
+        if: inputs.artifacts_from == 'local'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 从 Release 下载产物
+        if: ${{ inputs.artifacts_from == 'release' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p dist
+          gh release download "${{ inputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'ufp-*' --dir dist
+          ls -lh dist
+
+      - name: 连通性自检（域名 /healthz）
+        env:
+          URL: ${{ secrets.DEPLOY_URL }}
+        run: |
+          set -eu
+          curl -fsS --max-time 20 "${URL%/}/healthz" | tee /tmp/healthz-before.json
+          echo
+          grep -q '"version"' /tmp/healthz-before.json || {
+            echo "::warning::healthz 里没有版本号（旧版本？）"
+          }
+
+      - name: 干跑到此为止
+        if: inputs.dry_run
+        run: echo "::notice::dry_run：域名可达、healthz 正常，没有推送任何东西"
+
+      - name: 打包（两个架构都带上，服务器自己挑）
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -eu
+          mkdir -p upload
+          cp dist/ufp-x86_64-unknown-linux-musl upload/
+          cp dist/ufp-aarch64-unknown-linux-musl upload/
+          cp deploy/openrc/ufp upload/ufp-openrc
+          cp deploy/nginx/ufp.conf upload/ufp-nginx.conf
+          cp deploy/remote-deploy.sh upload/remote-deploy.sh
+          cp deploy/ufp-apply-deploy upload/ufp-apply-deploy
+          tar czf deploy.tgz -C upload .
+          ls -lh deploy.tgz
+          sha256sum deploy.tgz | awk '{print $1}' > deploy.sha256
+          echo "SHA=$(cat deploy.sha256)" >> "$GITHUB_ENV"
+
+      - name: 推给网关
+        if: ${{ !inputs.dry_run }}
+        env:
+          URL: ${{ secrets.DEPLOY_URL }}
+          TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          CODE=$(curl -sS -o resp.json -w '%{http_code}' -X POST "${URL%/}/admin/api/deploy" \
+            -H "x-ufp-deploy-token: $TOKEN" \
+            -H "x-ufp-sha256: $SHA" \
+            -H "x-ufp-version: $TAG" \
+            -H "content-type: application/gzip" \
+            --data-binary @deploy.tgz --max-time 600)
+          echo "HTTP $CODE"
+          cat resp.json; echo
+          case "$CODE" in
+            202) echo "::notice::网关已接收部署包（HTTP 202）" ;;
+            200|201) echo "::notice::网关返回 $CODE" ;;
+            503) echo "::error::网关收到包但无法触发升级脚本（检查 sudoers 与 ufp-apply-deploy）"; exit 1 ;;
+            *) echo "::error::网关拒绝部署（HTTP $CODE）"; exit 1 ;;
+          esac
+
+      - name: 轮询新版本上线
+        if: ${{ !inputs.dry_run }}
+        env:
+          URL: ${{ secrets.DEPLOY_URL }}
+          EXPECT: ${{ inputs.tag }}
+        run: |
+          set -eu
+          EXPECT="${EXPECT#v}"
+          for i in $(seq 1 72); do
+            if curl -fsS --max-time 10 "${URL%/}/healthz" > hz.json 2>/dev/null; then
+              cat hz.json; echo
+              if grep -q "\"version\":\"${EXPECT}\"" hz.json; then
+                echo "::notice::已升级到 $EXPECT"
+                {
+                  echo "## ufp 部署"
+                  echo
+                  echo "- 版本：\`${{ inputs.tag }}\`"
+                  echo "- 目标：\`${URL}\`"
+                  echo "- healthz：\`$(cat hz.json)\`"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "::error::等了 6 分钟没等到新版本：去后台看 /var/lib/ufp/incoming/last-deploy.log" >&2
+          exit 1

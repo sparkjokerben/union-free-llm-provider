@@ -1,7 +1,7 @@
 name: deploy
 
-# 手动部署：默认下发最近一次 Release 的产物；也可以指定 tag。
-# 先跑 dry_run 能确认「Runner 连得上服务器 + 服务器架构识别正确」而不动服务器。
+# 手动部署：把指定 tag（默认最近一次 Release）的产物通过域名推给网关。
+# 先跑 dry_run 能确认域名可达、healthz 正常，而不推送任何东西。
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ on:
         description: "要部署的 tag（例如 v0.1.0；留空=最近一次 Release）"
         required: false
       dry_run:
-        description: "只探测连通性与架构，不改服务器"
+        description: "只验证域名可达（不推送、不改服务器）"
         required: false
         type: boolean
         default: false
@@ -47,7 +47,7 @@ jobs:
 
   deploy:
     needs: resolve_tag
-    uses: ./.github/workflows/_deploy.yml
+    uses: ./.github/workflows/_deploy-http.yml
     with:
       tag: ${{ needs.resolve_tag.outputs.tag }}
       artifacts_from: release

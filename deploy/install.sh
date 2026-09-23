@@ -32,6 +32,13 @@ echo "== 安装二进制"
 install -m 0755 "$BINARY" /usr/local/bin/ufp
 /usr/local/bin/ufp version
 
+echo "== 安装部署脚本与 sudoers（在线部署用）"
+install -d -o ufp -g ufp -m 0750 /var/lib/ufp/incoming
+install -m 0755 "$(dirname "$0")/ufp-apply-deploy" /usr/local/bin/ufp-apply-deploy
+printf 'ufp ALL=(root) NOPASSWD: /usr/local/bin/ufp-apply-deploy\n' > /etc/sudoers.d/ufp-deploy
+chmod 0440 /etc/sudoers.d/ufp-deploy
+command -v sudo >/dev/null 2>&1 || apk add --no-cache sudo >/dev/null
+
 echo "== 安装 OpenRC 服务"
 install -m 0755 "$(dirname "$0")/openrc/ufp" /etc/init.d/ufp
 rc-update add ufp default >/dev/null 2>&1 || true

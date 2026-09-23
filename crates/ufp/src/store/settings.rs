@@ -145,6 +145,10 @@ pub struct Settings {
     pub session_ttl_days: u64,
     /// 请求明细保留天数，之后汇总进 daily_rollups。
     pub detail_retention_days: u64,
+    /// 部署令牌：CI 往 /admin/api/deploy 推新版本时用；空表示关闭该接口。
+    /// 用 `ufp set-deploy-token` 或在后台生成。
+    #[serde(default)]
+    pub deploy_token: String,
 }
 
 impl Default for Settings {
@@ -166,6 +170,7 @@ impl Default for Settings {
             admin_session_hours: 24,
             session_ttl_days: 30,
             detail_retention_days: 30,
+            deploy_token: String::new(),
         }
     }
 }

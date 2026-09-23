@@ -24,6 +24,7 @@ use axum::{Json, Router};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 
 use crate::api::error::ApiError;
 use crate::api::AppState;
@@ -84,6 +85,8 @@ pub fn routes() -> Router<Arc<AppState>> {
             patch(update_search_backend).delete(delete_search_backend),
         )
         .route("/admin/api/settings", get(get_settings).put(put_settings))
+        .route("/admin/api/deploy", post(deploy))
+        .route("/admin/api/deploy-token", post(rotate_deploy_token))
         .route("/admin/api/export", get(export_config))
         .route("/admin/api/import", post(import_config))
 }
@@ -315,6 +318,11 @@ async fn overview(
             "breakers_open": breakers.iter().filter(|b| b.state != crate::health::BreakerState::Closed).count(),
             "breakers": breakers.len(),
             "cooldowns": cooldowns.len(),
+        },
+        "deploy": {
+            "token_set": !state.pool.load().settings.deploy_token.is_empty(),
+            "apply_script": APPLY_SCRIPT,
+            "spool": DEPLOY_SPOOL,
         },
         "runtime": {
             "uptime_ms": chrono::Utc::now().timestamp_millis() - state.started_ms,
@@ -1437,6 +1445,213 @@ async fn put_settings(
     })
     .await?;
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 在线部署接口（给 CI 用）
+// ============================================================================
+
+/// 上传的归档落在哪里（网关以 ufp 用户身份运行，只能写自己的目录）。
+pub const DEPLOY_SPOOL: &str = "/var/lib/ufp/incoming";
+
+/// 实际用的落盘目录：可用环境变量覆盖（测试与非常规部署用）。
+fn deploy_spool_dir() -> std::path::PathBuf {
+    std::env::var_os("UFP_DEPLOY_SPOOL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEPLOY_SPOOL))
+}
+/// 特权应用脚本：root 所有，网关通过 sudo / doas 调用它。
+pub const APPLY_SCRIPT: &str = "/usr/local/bin/ufp-apply-deploy";
+/// 单个归档的大小上限（二进制约 10MB，压缩后 4MB 上下）。
+const DEPLOY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// `POST /admin/api/deploy`：CI 把「新版本 tar.gz」推上来。
+///
+/// 认证用 `x-ufp-deploy-token`（和后台登录是两套），并且必须带
+/// `x-ufp-sha256`；网关只负责「验签 + 落盘 + 触发特权脚本」，
+/// 真正的安装/升级/回滚由 `ufp-apply-deploy`（root）执行。
+async fn deploy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, Response> {
+    let settings = state.pool.load().settings.clone();
+    if settings.deploy_token.is_empty() {
+        return Err(bad_request(
+            "没有配置部署令牌：先在服务器上运行 `ufp set-deploy-token`",
+        ));
+    }
+    let Some(token) = headers
+        .get("x-ufp-deploy-token")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Err(session::unauthorized("缺少 x-ufp-deploy-token"));
+    };
+    let ok = token
+        .as_bytes()
+        .ct_eq(settings.deploy_token.as_bytes())
+        .unwrap_u8()
+        == 1;
+    if !ok {
+        // 部署接口被扫到过就值得看一眼日志
+        tracing::warn!(ip = %session::client_ip(&headers), "部署接口令牌不匹配");
+        return Err(session::unauthorized("部署令牌不正确"));
+    }
+
+    let Some(expected) = headers
+        .get("x-ufp-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+    else {
+        return Err(bad_request("缺少 x-ufp-sha256（上传内容的 sha256）"));
+    };
+    if body.len() > DEPLOY_MAX_BYTES {
+        return Err(
+            ApiError::too_large(format!("归档超过上限（{DEPLOY_MAX_BYTES} 字节）")).into_response(),
+        );
+    }
+    let actual = sha256_hex(&body);
+    if actual != expected {
+        return Err(bad_request(&format!(
+            "sha256 不匹配：期望 {expected}，实际 {actual}"
+        )));
+    }
+
+    // 落盘
+    let dir = deploy_spool_dir();
+    let dir = dir.as_path();
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        return Err(internal(format!("创建 {} 失败：{e}", dir.display())));
+    }
+    let version = headers
+        .get("x-ufp-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let path = dir.join(format!(
+        "deploy-{}.tgz",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    if let Err(e) = tokio::fs::write(&path, &body).await {
+        return Err(internal(format!("写入 {} 失败：{e}", path.display())));
+    }
+    tracing::info!(
+        version = %version,
+        bytes = body.len(),
+        file = %path.display(),
+        "收到部署包，准备触发升级"
+    );
+
+    // 触发特权脚本（不等待它跑完：升级过程中网关自己会被替换掉）
+    let (triggered, note) = trigger_apply(&path, &actual);
+    let status = if triggered {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    Ok((
+        status,
+        Json(json!({
+            "ok": triggered,
+            "version": version,
+            "file": path.display().to_string(),
+            "sha256": actual,
+            "triggered": triggered,
+            "note": note,
+            "next": "升级脚本在后台跑；轮询 /healthz 看 version 是否变成新版本",
+        })),
+    )
+        .into_response())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// 调特权脚本。优先 sudo -n（配了 NOPASSWD 才不会卡住），再试 doas。
+fn trigger_apply(tarball: &std::path::Path, sha: &str) -> (bool, String) {
+    let log_path = deploy_spool_dir().join("last-deploy.log");
+    for (launcher, args) in [
+        ("sudo", vec!["-n", APPLY_SCRIPT]),
+        ("doas", vec![APPLY_SCRIPT]),
+    ] {
+        if which(launcher).is_none() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(launcher);
+        cmd.args(args)
+            .arg(tarball)
+            .arg(sha)
+            .stdin(std::process::Stdio::null());
+        // 升级日志追加到 spool 里的固定文件，方便事后排查（每次尝试单独打开）
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => {
+                let err = f.try_clone().ok();
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(match err {
+                    Some(f) => std::process::Stdio::from(f),
+                    None => std::process::Stdio::null(),
+                });
+            }
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                // 不 wait：升级过程中网关会被新进程替换，脚本要在后台跑完
+                tracing::info!(pid = child.id(), launcher, "已触发升级脚本");
+                return (true, format!("已通过 {launcher} 触发 {APPLY_SCRIPT}"));
+            }
+            Err(e) => {
+                tracing::warn!(launcher, error = %e, "触发升级脚本失败");
+            }
+        }
+    }
+    (
+        false,
+        format!(
+            "没有可用的 sudo/doas，或 {APPLY_SCRIPT} 未安装；归档已保存在 {}",
+            tarball.display()
+        ),
+    )
+}
+
+fn which(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|p| p.is_file())
+}
+
+/// 生成（或轮换）部署令牌。
+async fn rotate_deploy_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let token = random_token(48);
+    let token_for_db = token.clone();
+    mutate(&state, move |conn| {
+        let mut settings = crate::store::load_settings(conn)?;
+        settings.deploy_token = token_for_db;
+        crate::store::save_settings(conn, &settings)?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({
+        "token": token,
+        "hint": "只显示这一次；填到仓库 Secret DEPLOY_TOKEN",
+    }))
+    .into_response())
 }
 
 // ============================================================================
