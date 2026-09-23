@@ -94,31 +94,30 @@ git tag v0.1.0 ──▶ Actions 编译(x86_64 + aarch64) ──▶ GitHub Relea
 
 ## 四、没有网关时怎么装第一版
 
-在线部署依赖「网关已经在跑」，所以**第一次必须手动装**（在你自己这台能连 IPv6 的机器上执行）：
+在线部署依赖「网关已经在跑」，所以**第一次必须手动装**。发布流程会把二进制与辅助文件
+推到 **`dist` 分支**（`raw.githubusercontent.com` 由 Fastly 提供，你的服务器在 v6 上实测可达），
+所以一条命令就够：
 
 ```sh
-# 本地：打一个包（两个架构都带上，服务器自己挑）
-tar czf /tmp/ufp-boot.tgz \
-  ufp-x86_64-unknown-linux-musl ufp-aarch64-unknown-linux-musl \
-  ufp-openrc ufp-nginx.conf remote-deploy.sh ufp-apply-deploy
-# 目录布局：把 deploy/openrc/ufp 拷成 ufp-openrc、deploy/nginx/ufp.conf 拷成 ufp-nginx.conf
-
-# 上传并应用（root 直接跑 apply 脚本）
-scp /tmp/ufp-boot.tgz root@[你的IPv6]:/tmp/ufp-boot.tgz
-ssh root@[你的IPv6] 'sh -s' <<'EOF'
-  # 先放好 apply 脚本本身（它要从包里更新自己）
-  mkdir -p /tmp/boot && tar xzf /tmp/ufp-boot.tgz -C /tmp/boot
-  install -m 0755 /tmp/boot/ufp-apply-deploy /usr/local/bin/ufp-apply-deploy
-  UFP_DEPLOY_VERSION=boot UFP_DEPLOY_DOMAIN=你的域名 \
-    /usr/local/bin/ufp-apply-deploy /tmp/ufp-boot.tgz
-EOF
-
-# 装完还有两件人工事（脚本会提醒）：
-ssh root@[你的IPv6] 'ufp set-admin-password'
-#   证书按上面第一节装好，再 rc-service nginx start
+ssh root@[你的IPv6] \
+  'wget -qO- https://raw.githubusercontent.com/sparkjokerben/union-free-llm-provider/main/deploy/bootstrap.sh \
+   | UFP_DOMAIN=你的域名 sh'
 ```
 
-装完、域名能打开 `https://你的域名/admin` 之后，再回去做第三节的令牌与 Secrets。
+`bootstrap.sh` 会读 `dist` 分支的 `latest.json`、按架构挑二进制、校验 sha256、
+拉齐 OpenRC 脚本与 nginx 配置，然后交给 `ufp-apply-deploy` 完成安装
+（健康检查失败会自动回滚）。
+
+装完还有两件人工事（脚本结束时会再提醒一次）：
+
+```sh
+ssh root@[你的IPv6] 'ufp set-admin-password'      # 后台密码
+# 证书按第一节装好 → nginx -t && rc-service nginx start
+```
+
+之后打开 `https://你的域名/admin` 确认能进，再回去做第三节的令牌与 Secrets。
+
+> 不想用 bootstrap 也行：本地 `scp` 二进制，再跑 `deploy/install.sh`（见 README 快速开始）。
 
 ## 五、SSH 部署（备用）
 

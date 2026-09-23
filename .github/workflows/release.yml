@@ -84,6 +84,61 @@ jobs:
             部署见 `deploy/`：OpenRC 服务脚本、nginx 配置、安装脚本；
             打 tag 时本仓库会自动部署到服务器（经 Cloudflare 代理的 `/admin/api/deploy`）。
 
+  # 把二进制发布到 dist 分支：源站是 IPv6-only，拉不到 GitHub Release 资产，
+  # 但 raw.githubusercontent.com（Fastly）在 v6 上可达 —— 首次安装与人工拉取都靠它。
+  publish-dist-branch:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 推送到 dist 分支
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          git config user.name "ufp release bot"
+          git config user.email "actions@users.noreply.github.com"
+          # 独立分支，只放最新版本（每次 orphan 提交，历史保持干净）
+          git checkout --orphan dist-new
+          git rm -rf . >/dev/null 2>&1 || true
+          mkdir -p binaries
+          cp dist/ufp-x86_64-unknown-linux-musl dist/ufp-aarch64-unknown-linux-musl binaries/
+          cp deploy/bootstrap.sh binaries/
+          cp deploy/ufp-apply-deploy binaries/
+          cp deploy/remote-deploy.sh binaries/
+          cp deploy/openrc/ufp binaries/ufp-openrc
+          cp deploy/nginx/ufp.conf binaries/ufp-nginx.conf
+          python3 - <<'PYEOF'
+          import hashlib, json, os, pathlib
+          tag = os.environ["TAG"]
+          files = {}
+          for p in sorted(pathlib.Path("binaries").iterdir()):
+              data = p.read_bytes()
+              files[p.name] = {
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "size": len(data),
+              }
+          pathlib.Path("latest.json").write_text(
+              json.dumps({"tag": tag, "files": files}, indent=2, ensure_ascii=False) + "\n"
+          )
+          print(pathlib.Path("latest.json").read_text())
+          PYEOF
+          git add -A
+          git commit -q -m "dist: $TAG"
+          git push -f origin HEAD:dist
+          echo "::notice::已发布到 dist 分支：$TAG"
+
   # 自动部署：编译完 → 发 Release → 通过域名把发布包推给网关（Cloudflare 代理转发到 v6 源站）
   deploy:
     needs: [build, release]
