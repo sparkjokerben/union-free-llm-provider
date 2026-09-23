@@ -47,7 +47,8 @@ jobs:
           merge-multiple: true
 
       - name: 从 Release 下载产物
-        if: inputs.artifacts_from == 'release'
+        # dry_run 只探测连通性与架构，没有 Release 也能跑
+        if: ${{ inputs.artifacts_from == 'release' && !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
