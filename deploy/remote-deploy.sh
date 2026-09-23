@@ -111,6 +111,27 @@ else
   if [ -f "$STAGE/ufp-apply-deploy" ] && ! cmp -s "$STAGE/ufp-apply-deploy" "$APPLY"; then
     install -m 0755 "$STAGE/ufp-apply-deploy" "$APPLY"
   fi
+  # 已有 nginx 配置：把新模板同步过去（域名从现有配置里读，别被 example.com 覆盖）。
+  # 校验不过就回滚旧文件，绝不把 nginx 搞挂。
+  NGINX_CONF=/etc/nginx/http.d/ufp.conf
+  if [ -f "$NGINX_CONF" ] && [ -f "$STAGE/ufp-nginx.conf" ]; then
+    CUR_DOMAIN=$(sed -n 's/^[[:space:]]*server_name[[:space:]]\+\([^;]*\);.*/\1/p' "$NGINX_CONF" | head -1)
+    TMP=$(mktemp)
+    sed "s/example.com/$CUR_DOMAIN/g" "$STAGE/ufp-nginx.conf" > "$TMP"
+    if ! cmp -s "$TMP" "$NGINX_CONF"; then
+      cp -a "$NGINX_CONF" "$TMP.bak"
+      mv "$TMP" "$NGINX_CONF"
+      if nginx -t >/dev/null 2>&1; then
+        log "已更新 nginx 配置（域名 $CUR_DOMAIN）"
+        rc-service nginx reload >/dev/null 2>&1 || rc-service nginx restart >/dev/null 2>&1 || true
+      else
+        log "新 nginx 配置校验没过，回滚到旧文件"
+        mv "$TMP.bak" "$NGINX_CONF"
+      fi
+      rm -f "$TMP.bak"
+    fi
+    rm -f "$TMP"
+  fi
   install -m 0755 "$BIN" "$TARGET.new"
   # 换二进制 + 重启（旧进程排空在途请求，最多 30 秒，见 OpenRC 脚本里的 UFP_DRAIN_SECONDS）
   install -m 0755 "$TARGET.new" "$TARGET"
