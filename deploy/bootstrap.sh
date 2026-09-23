@@ -77,7 +77,6 @@ if [ -n "$EXPECT" ] && [ "$EXPECT" != "$ACTUAL" ]; then
   exit 1
 fi
 [ -n "$EXPECT" ] && log "sha256 校验通过"
-mv "$WORK/$BIN" "$WORK/ufp-$ARCH"
 
 # 4) 拉齐其余文件（脚本以 main 为准，二进制必须用发布产物）
 for f in ufp-apply-deploy remote-deploy.sh; do
