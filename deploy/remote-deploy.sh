@@ -25,6 +25,15 @@ VERSION="${UFP_DEPLOY_VERSION:-unknown}"
 
 log() { echo "[ufp-deploy] $*"; }
 
+# 服务器上不保证有 curl（Alpine 默认只有 busybox wget）
+fetch_health() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 3 "$HEALTH"
+  else
+    wget -q -O - -T 3 "$HEALTH"
+  fi
+}
+
 [ "$(id -u)" = "0" ] || { echo "[ufp-deploy] 需要 root 运行" >&2; exit 1; }
 [ -f "$BIN" ] || { echo "[ufp-deploy] 找不到二进制：$BIN" >&2; exit 1; }
 command -v apk >/dev/null 2>&1 || {
@@ -76,7 +85,7 @@ fi
 # 健康检查：最多等 30 秒
 i=0
 while [ "$i" -lt 30 ]; do
-  if curl -fsS --max-time 3 "$HEALTH" > /tmp/ufp-healthz.json 2>/dev/null; then
+  if fetch_health > /tmp/ufp-healthz.json 2>/dev/null; then
     log "健康检查通过：$(cat /tmp/ufp-healthz.json)"
     if [ "$FIRST_INSTALL" = "1" ]; then
       cat <<'EOF'

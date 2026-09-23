@@ -73,11 +73,8 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          # IPv6 字面量要加方括号才能和 user@ 拼在一起
-          case "$DEPLOY_HOST" in
-            *:*) TARGET="$DEPLOY_USER@[$DEPLOY_HOST]" ;;
-            *)   TARGET="$DEPLOY_USER@$DEPLOY_HOST" ;;
-          esac
+          # ssh 直接吃裸 IPv6；文件上传走 tar 管道，不用 scp（scp 才需要方括号）
+          TARGET="$DEPLOY_USER@$DEPLOY_HOST"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "port=$DEPLOY_PORT" >> "$GITHUB_OUTPUT"
 
@@ -128,16 +125,15 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -eu
-          scp -i ~/.ssh/deploy_key -P "$PORT" -o BatchMode=yes \
-              deploy.tgz "$TARGET:/tmp/ufp-deploy.tgz"
-          ssh -i ~/.ssh/deploy_key -p "$PORT" -o BatchMode=yes "$TARGET" \
-            "set -eu
-             rm -rf /tmp/ufp-deploy && mkdir -p /tmp/ufp-deploy
-             tar xzf /tmp/ufp-deploy.tgz -C /tmp/ufp-deploy
-             chmod +x /tmp/ufp-deploy/remote-deploy.sh
-             UFP_DEPLOY_VERSION='${TAG}' UFP_DEPLOY_DOMAIN='${DOMAIN}' \
-               sh /tmp/ufp-deploy/remote-deploy.sh /tmp/ufp-deploy/ufp" \
-            | tee deploy.log
+          # 打包内容直接通过 ssh 管道传过去（不用 scp，避免 IPv6 方括号的麻烦）
+          tar czf - -C upload . | ssh -i ~/.ssh/deploy_key -p "$PORT" -o BatchMode=yes "$TARGET" "
+            set -eu
+            rm -rf /tmp/ufp-deploy && mkdir -p /tmp/ufp-deploy
+            tar xzf - -C /tmp/ufp-deploy
+            chmod +x /tmp/ufp-deploy/remote-deploy.sh
+            UFP_DEPLOY_VERSION='${TAG}' UFP_DEPLOY_DOMAIN='${DOMAIN}' \
+              sh /tmp/ufp-deploy/remote-deploy.sh /tmp/ufp-deploy/ufp
+          " | tee deploy.log
 
       - name: 校验部署结果
         if: ${{ !inputs.dry_run }}
@@ -147,7 +143,8 @@ jobs:
         run: |
           set -eu
           ssh -i ~/.ssh/deploy_key -p "$PORT" -o BatchMode=yes "$TARGET" \
-              'curl -fsS http://127.0.0.1:8787/healthz' | tee /tmp/healthz.json
+              'if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8787/healthz;
+                else wget -q -O - http://127.0.0.1:8787/healthz; fi' | tee /tmp/healthz.json
           echo
           if grep -q '"version":"' /tmp/healthz.json; then
             echo "::notice::网关健康检查通过：$(cat /tmp/healthz.json)"
