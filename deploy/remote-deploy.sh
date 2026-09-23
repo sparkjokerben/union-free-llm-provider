@@ -65,6 +65,7 @@ if [ "$FIRST_INSTALL" = "1" ]; then
   install -m 0755 "$STAGE/ufp-apply-deploy" "$APPLY"
   install -m 0755 "$STAGE/ufp-openrc" "$SERVICE"
   # 允许 ufp 用户只免密运行这一个脚本（在线部署用）
+  command -v sudo >/dev/null 2>&1 || apk add --no-cache sudo >/dev/null 2>&1 || true
   printf 'ufp ALL=(root) NOPASSWD: %s\n' "$APPLY" > "$SUDOERS"
   chmod 0440 "$SUDOERS"
   rc-update add ufp default >/dev/null 2>&1 || true
@@ -75,7 +76,13 @@ if [ "$FIRST_INSTALL" = "1" ]; then
     mkdir -p /etc/nginx/certs /var/www/acme /etc/nginx/http.d
     sed "s/example.com/$UFP_DEPLOY_DOMAIN/g" "$STAGE/ufp-nginx.conf" \
       > /etc/nginx/http.d/ufp.conf
-    nginx -t && (rc-service nginx restart >/dev/null 2>&1 || rc-service nginx start >/dev/null 2>&1 || true)
+    if nginx -t >/dev/null 2>&1; then
+      rc-service nginx restart >/dev/null 2>&1 || rc-service nginx start >/dev/null 2>&1 || true
+      log "nginx 已载入配置"
+    else
+      log "nginx 配置已写入 /etc/nginx/http.d/ufp.conf，但校验没过（通常是没有证书）"
+      log "把证书放到 /etc/nginx/certs/ 后再执行：nginx -t && rc-service nginx start"
+    fi
   else
     log "没给域名：跳过 nginx（之后可手动装 deploy/nginx/ufp.conf）"
   fi
