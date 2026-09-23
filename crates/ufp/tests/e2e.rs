@@ -891,7 +891,10 @@ async fn 后台_未登录被拒() {
         .await
         .unwrap();
     assert_eq!(page.status(), 200);
-    assert!(page.text().await.unwrap().contains("ufp 管理后台"));
+    let html = page.text().await.unwrap();
+    // 断言用稳定的结构标记（页面标题会随设计变，别再绑文案）
+    assert!(html.contains("/admin/app.js"), "{html:.200}");
+    assert!(html.contains("<title>"), "{html:.200}");
 }
 
 #[tokio::test]
