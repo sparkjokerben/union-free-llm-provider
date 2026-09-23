@@ -19,7 +19,9 @@
 set -eu
 
 REPO="${UFP_REPO:-sparkjokerben/union-free-llm-provider}"
+# 二进制与清单走 dist 分支（发布产物）；部署脚本走 main（改脚本不必重新打 tag）
 BASE="${UFP_BASE:-https://raw.githubusercontent.com/$REPO/dist}"
+SCRIPTS_BASE="${UFP_SCRIPTS_BASE:-https://raw.githubusercontent.com/$REPO/main/deploy}"
 DOMAIN="${UFP_DOMAIN:-}"
 WORK=$(mktemp -d /tmp/ufp-boot.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT INT TERM
@@ -77,10 +79,12 @@ fi
 [ -n "$EXPECT" ] && log "sha256 校验通过"
 mv "$WORK/$BIN" "$WORK/ufp-$ARCH"
 
-# 4) 拉齐其余文件
-for f in ufp-apply-deploy remote-deploy.sh ufp-openrc ufp-nginx.conf; do
-  fetch "$BASE/binaries/$f" "$WORK/$f"
+# 4) 拉齐其余文件（脚本以 main 为准，二进制必须用发布产物）
+for f in ufp-apply-deploy remote-deploy.sh; do
+  fetch "$SCRIPTS_BASE/$f" "$WORK/$f"
 done
+fetch "$SCRIPTS_BASE/openrc/ufp" "$WORK/ufp-openrc"
+fetch "$SCRIPTS_BASE/nginx/ufp.conf" "$WORK/ufp-nginx.conf"
 chmod +x "$WORK/ufp-"* "$WORK/remote-deploy.sh"
 
 # 5) 打成一个包，交给 apply 脚本（它会自己更新自己）

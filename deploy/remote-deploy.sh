@@ -74,6 +74,20 @@ if [ "$FIRST_INSTALL" = "1" ]; then
     log "安装 nginx 配置（域名 $UFP_DEPLOY_DOMAIN）"
     command -v nginx >/dev/null 2>&1 || apk add --no-cache nginx >/dev/null
     mkdir -p /etc/nginx/certs /var/www/acme /etc/nginx/http.d
+    # 没有证书时先放一张自签占位证书：nginx 能立刻起来、链路可以本地验证；
+    # 接了 Cloudflare 之后要换成 Origin CA 证书（否则 Full (strict) 会握手失败）。
+    if [ ! -f "/etc/nginx/certs/$UFP_DEPLOY_DOMAIN.crt" ]; then
+      command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1 || true
+      if openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+           -keyout "/etc/nginx/certs/$UFP_DEPLOY_DOMAIN.key" \
+           -out "/etc/nginx/certs/$UFP_DEPLOY_DOMAIN.crt" \
+           -subj "/CN=$UFP_DEPLOY_DOMAIN" >/dev/null 2>&1; then
+        chmod 600 "/etc/nginx/certs/$UFP_DEPLOY_DOMAIN.key"
+        log "已生成自签占位证书；接 Cloudflare 前换成 Origin CA 证书"
+      else
+        log "自签证书生成失败（缺 openssl），请自行放证书到 /etc/nginx/certs/"
+      fi
+    fi
     sed "s/example.com/$UFP_DEPLOY_DOMAIN/g" "$STAGE/ufp-nginx.conf" \
       > /etc/nginx/http.d/ufp.conf
     if nginx -t >/dev/null 2>&1; then
