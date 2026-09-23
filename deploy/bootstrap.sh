@@ -19,9 +19,11 @@
 set -eu
 
 REPO="${UFP_REPO:-sparkjokerben/union-free-llm-provider}"
-# 二进制与清单走 dist 分支（发布产物）；部署脚本走 main（改脚本不必重新打 tag）
+# 二进制与清单走 dist 分支（发布产物）；部署脚本走 main（改脚本不必重新打 tag）。
+# 脚本用 jsDelivr 而不是 raw：raw 对分支引用有几分钟 CDN 缓存（刚推的改动会拿到旧文件），
+# jsDelivr 的 gh/ 引用在推送后会失效重建，拿到的总是最新。
 BASE="${UFP_BASE:-https://raw.githubusercontent.com/$REPO/dist}"
-SCRIPTS_BASE="${UFP_SCRIPTS_BASE:-https://raw.githubusercontent.com/$REPO/main/deploy}"
+SCRIPTS_BASE="${UFP_SCRIPTS_BASE:-https://cdn.jsdelivr.net/gh/$REPO@main/deploy}"
 DOMAIN="${UFP_DOMAIN:-}"
 WORK=$(mktemp -d /tmp/ufp-boot.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT INT TERM
