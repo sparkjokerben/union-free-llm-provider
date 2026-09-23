@@ -111,7 +111,8 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           # 独立分支，只放最新版本（每次 orphan 提交，历史保持干净）
           git checkout --orphan dist-new
-          git rm -rf . >/dev/null 2>&1 || true
+          # 注意用 --cached：只清空索引，别把工作区的 deploy/ 也删掉（后面还要拷文件）
+          git rm -rf --cached . >/dev/null 2>&1 || true
           mkdir -p binaries
           cp dist/ufp-x86_64-unknown-linux-musl dist/ufp-aarch64-unknown-linux-musl binaries/
           cp deploy/bootstrap.sh binaries/
@@ -134,7 +135,8 @@ jobs:
           )
           print(pathlib.Path("latest.json").read_text())
           PYEOF
-          git add -A
+          # 只提交要发布的内容，不把整个源码树带进 dist 分支
+          git add binaries latest.json
           git commit -q -m "dist: $TAG"
           git push -f origin HEAD:dist
           echo "::notice::已发布到 dist 分支：$TAG"

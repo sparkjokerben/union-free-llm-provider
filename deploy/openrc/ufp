@@ -18,10 +18,12 @@ description="统一 LLM 中转网关"
 command="/usr/local/bin/ufp"
 command_args="serve"
 command_user="ufp:ufp"
-command_background=true
+# 用 supervise-daemon 托管：崩溃自动拉起（这是「强稳定」的第一道保险）。
+# 注意不要同时设 command_background，supervise-daemon 自己负责后台化。
 supervisor="supervise-daemon"
 respawn_delay=3
 respawn_max=0
+respawn_period=10
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/ufp/stdout.log"
 error_log="/var/log/ufp/stderr.log"
@@ -32,7 +34,11 @@ UFP_DB="${UFP_DB:-/var/lib/ufp/ufp.db}"
 UFP_LOG_DIR="${UFP_LOG_DIR:-/var/log/ufp}"
 UFP_MAX_BODY_BYTES="${UFP_MAX_BODY_BYTES:-33554432}"
 UFP_MAX_INFLIGHT="${UFP_MAX_INFLIGHT:-32}"
-UFP_DRAIN_SECONDS="${UFP_DRAIN_SECONDS:-600}"
+# 收到 SIGTERM 后等在途请求结束的最长时间。
+# 设为 30 秒是权衡后的结果：升级时 OpenRC 会先停后起，这段窗口里新连接会被拒，
+# 所以窗口要短；代价是超过 30 秒的长流会被打断（Claude Code 会报连接错误并重试）。
+# 想彻底不打断，用下面 upgrade() 注释里那条「热切换」命令。
+UFP_DRAIN_SECONDS="${UFP_DRAIN_SECONDS:-30}"
 UFP_WORKERS="${UFP_WORKERS:-2}"
 # UFP_LOG=info,ufp=debug 可以调日志级别
 
@@ -51,49 +57,20 @@ stop_pre() {
     einfo "正在等待在途请求结束（最多 ${UFP_DRAIN_SECONDS}s）"
 }
 
-# 无缝升级：新进程先起（SO_REUSEPORT 接管监听），再让旧进程排空退出。
+# 升级：换二进制 + 重启服务。
+#
+# 为什么不用「新进程先起、旧进程排空」那套交接：supervise-daemon 会盯着自己的子进程，
+# 手动起的新进程会被它当成「多余的」，旧进程退出时它还会再拉一个起来 —— 两套机制
+# 互相打架，反而更容易出问题。这里选「崩溃自动重启」这一条更值钱的特性，
+# 升级用一次有界重启（默认最多 30 秒窗口，见上面的 UFP_DRAIN_SECONDS）。
+#
+# 想要零中断的话，手动做热切换（两个进程靠 SO_REUSEPORT 共存）：
+#   install -m 0755 /usr/local/bin/ufp.new /usr/local/bin/ufp
+#   setsid /usr/local/bin/ufp serve >/dev/null 2>&1 < /dev/null &
+#   rc-service ufp stop        # 只停被托管的那一个，在途请求会排空
 upgrade() {
-    ebegin "启动新版本 ${command}.new"
-    if [ ! -x "${command}.new" ]; then
-        eend 1 "${command}.new 不存在（先把新二进制放过去）"
-        return 1
-    fi
-    # 先备份当前二进制，再把新的挪到位
-    cp -f "$command" "${command}.old" 2>/dev/null || :
-    mv -f "${command}.new" "$command" || { eend 1 "替换二进制失败"; return 1; }
-    chmod 0755 "$command"
-
-    # 起一个新进程（它与旧进程同时监听同一端口）
-    start-stop-daemon --start --quiet --background \
-        --make-pidfile --pidfile "${pidfile}.new" \
-        --user "$command_user" \
-        --env UFP_LISTEN="$UFP_LISTEN" --env UFP_DB="$UFP_DB" \
-        --env UFP_LOG_DIR="$UFP_LOG_DIR" --env UFP_MAX_BODY_BYTES="$UFP_MAX_BODY_BYTES" \
-        --env UFP_MAX_INFLIGHT="$UFP_MAX_INFLIGHT" --env UFP_WORKERS="$UFP_WORKERS" \
-        --exec "$command" -- $command_args
-
-    # 旧进程收到 SIGTERM 后不再接新连接，等在途请求结束再退出
-    if [ -f "$pidfile" ]; then
-        old_pid=$(cat "$pidfile")
-        einfo "旧进程 $old_pid 开始排空"
-        start-stop-daemon --stop --quiet --signal TERM --pidfile "$pidfile" || :
-        # UFP_UPGRADE_NO_WAIT=1 时不等旧进程（CI/脚本用，健康检查由调用方做）；
-        # 否则等它退出（最多 10 分钟），期间新进程一直在服务。
-        if [ "${UFP_UPGRADE_NO_WAIT:-0}" = "1" ]; then
-            einfo "按 UFP_UPGRADE_NO_WAIT 跳过等待，旧进程会在排空超时后自行退出"
-        else
-            i=0
-            while [ -d "/proc/$old_pid" ] && [ $i -lt 600 ]; do
-                sleep 1
-                i=$((i + 1))
-            done
-            if [ -d "/proc/$old_pid" ]; then
-                ewarn "旧进程仍在运行（可能有很长的流式请求），它自己会在排空超时后退出"
-            fi
-        fi
-    fi
-
-    # 把新进程的 pid 文件接过来，后续操作针对新进程
-    mv -f "${pidfile}.new" "$pidfile" 2>/dev/null || :
-    eend 0 "升级完成"
+    ebegin "重启以应用新版本"
+    rc-service "$RC_SVCNAME" restart
+    eend $?
 }
+

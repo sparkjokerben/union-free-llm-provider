@@ -98,7 +98,9 @@ else
     install -m 0755 "$STAGE/ufp-apply-deploy" "$APPLY"
   fi
   install -m 0755 "$BIN" "$TARGET.new"
-  if ! UFP_UPGRADE_NO_WAIT=1 rc-service ufp upgrade; then
+  # 换二进制 + 重启（旧进程排空在途请求，最多 30 秒，见 OpenRC 脚本里的 UFP_DRAIN_SECONDS）
+  install -m 0755 "$TARGET.new" "$TARGET"
+  if ! rc-service ufp restart; then
     log "升级失败，尝试回滚"
     if [ -f "$TARGET.old" ]; then
       install -m 0755 "$TARGET.old" "$TARGET"
@@ -108,9 +110,9 @@ else
   fi
 fi
 
-# 健康检查：最多等 30 秒
+# 健康检查：最多等 90 秒（升级时旧进程可能还在排空在途请求）
 i=0
-while [ "$i" -lt 30 ]; do
+while [ "$i" -lt 90 ]; do
   if fetch_health > /tmp/ufp-healthz.json 2>/dev/null; then
     log "健康检查通过：$(cat /tmp/ufp-healthz.json)"
     if [ "$FIRST_INSTALL" = "1" ]; then
