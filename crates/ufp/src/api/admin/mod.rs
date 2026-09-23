@@ -320,7 +320,7 @@ async fn overview(
             "cooldowns": cooldowns.len(),
         },
         "deploy": {
-            "token_set": !state.pool.load().settings.deploy_token.is_empty(),
+            "token_set": !current_deploy_token(&state).await.is_empty(),
             "apply_script": APPLY_SCRIPT,
             "spool": DEPLOY_SPOOL,
         },
@@ -1454,6 +1454,19 @@ async fn put_settings(
 /// 上传的归档落在哪里（网关以 ufp 用户身份运行，只能写自己的目录）。
 pub const DEPLOY_SPOOL: &str = "/var/lib/ufp/incoming";
 
+/// 直读库里的部署令牌。
+///
+/// 不能用内存快照：`ufp set-deploy-token` 是离线命令，直接写库，运行中的网关不会
+/// 知道快照已经过期（自测时就踩到过这个坑：接口报「没有配置部署令牌」）。
+/// 令牌是安全敏感配置，每次直读也更利于轮换即时生效。
+async fn current_deploy_token(state: &Arc<AppState>) -> String {
+    state
+        .db
+        .read(|conn| Ok(crate::store::load_settings(conn)?.deploy_token))
+        .await
+        .unwrap_or_default()
+}
+
 /// 实际用的落盘目录：可用环境变量覆盖（测试与非常规部署用）。
 fn deploy_spool_dir() -> std::path::PathBuf {
     std::env::var_os("UFP_DEPLOY_SPOOL")
@@ -1475,8 +1488,9 @@ async fn deploy(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, Response> {
-    let settings = state.pool.load().settings.clone();
-    if settings.deploy_token.is_empty() {
+    // 直读库里的令牌（不依赖内存快照，见 current_deploy_token 的说明）
+    let expected_token = current_deploy_token(&state).await;
+    if expected_token.is_empty() {
         return Err(bad_request(
             "没有配置部署令牌：先在服务器上运行 `ufp set-deploy-token`",
         ));
@@ -1489,7 +1503,7 @@ async fn deploy(
     };
     let ok = token
         .as_bytes()
-        .ct_eq(settings.deploy_token.as_bytes())
+        .ct_eq(expected_token.as_bytes())
         .unwrap_u8()
         == 1;
     if !ok {
