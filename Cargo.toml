@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ufp-convert"]
+members = ["crates/ufp-convert", "crates/ufp"]
 
 [workspace.package]
 edition = "2021"

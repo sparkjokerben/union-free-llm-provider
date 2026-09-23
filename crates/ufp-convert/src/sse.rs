@@ -1,5 +1,5 @@
 #[inline]
-pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+pub fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     line.strip_prefix(&format!("{field}: "))
         .or_else(|| line.strip_prefix(&format!("{field}:")))
 }
@@ -33,7 +33,7 @@ pub fn take_sse_block(buffer: &mut String) -> Option<String> {
 ///
 /// A defensive guard discards `remainder` via lossy conversion if it ever
 /// exceeds 3 bytes, which cannot happen with well-formed UTF-8 streams.
-pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new_bytes: &[u8]) {
+pub fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new_bytes: &[u8]) {
     // Build the byte slice to decode: prepend any leftover bytes from previous chunk.
     let (owned, bytes): (Option<Vec<u8>>, &[u8]) = if remainder.is_empty() {
         (None, new_bytes)

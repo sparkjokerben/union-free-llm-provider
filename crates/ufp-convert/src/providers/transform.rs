@@ -279,7 +279,7 @@ pub fn anthropic_to_openai_with_reasoning_content(
 ///
 /// 由 Claude→openai_chat（claude.rs）与 Codex Responses→Chat（transform_codex_chat.rs）
 /// 两条转换路径共用，确保两个客户端方向行为一致。
-pub(crate) fn inject_openai_stream_include_usage(result: &mut Value) {
+pub fn inject_openai_stream_include_usage(result: &mut Value) {
     let is_stream = result
         .get("stream")
         .and_then(|v| v.as_bool())
