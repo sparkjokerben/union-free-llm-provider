@@ -52,7 +52,33 @@ git tag v0.1.0 ──▶ Actions 编译(x86_64 + aarch64) ──▶ GitHub Relea
    用 acme.sh 申请公共证书也可以（`--issue --nginx`，Let's Encrypt 支持 v6 验证），
    只是套了 CF 代理之后没必要多这一层。
 
-## 二、Cloudflare 上要注意的几件事
+## 二、防火墙只放 Cloudflare
+
+源站不需要对整个互联网开放，只允许 Cloudflare 的回源 IP（官方公布，随时以
+<https://www.cloudflare.com/ips-v6/> 为准）：
+
+```
+2400:cb00::/32   2606:4700::/32   2803:f800::/32   2405:b500::/32
+2405:8100::/32   2a06:98c0::/29   2c0f:f248::/32
+```
+
+**Vultr 云防火墙**（推荐，面板里配 Inbound 规则）：源站没有公网 v4，只加 IPv6 规则 ——
+80/tcp 与 443/tcp 的来源填上面这些网段；22/tcp 只允许你自己的 IP。
+
+**服务器本机 ufw**（如果用它而不是 Vultr 的）：
+
+```sh
+for net in 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 \
+           2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32; do
+  ufw allow from $net to any port 80 proto tcp
+  ufw allow from $net to any port 443 proto tcp
+done
+ufw reload && ufw status | head -20
+```
+
+> 注意：Cloudflare 会更新自己的网段，隔一段时间对一下官网列表。
+
+## 三、Cloudflare 上要注意的几件事
 
 | 事项 | 说明 |
 |---|---|
@@ -62,7 +88,7 @@ git tag v0.1.0 ──▶ Actions 编译(x86_64 + aarch64) ──▶ GitHub Relea
 | 真实客户端 IP | 走 CF 后 `X-Real-IP` 是 CF 边缘地址，真实 IP 在 `CF-Connecting-IP`（网关优先读它，后台登录限速不受影响） |
 | 请求体大小 | CF 免费版单请求最大 100MB，网关自己限 32MB（`UFP_MAX_BODY_BYTES`） |
 
-## 三、在线部署怎么开
+## 四、在线部署怎么开
 
 1. 服务器上生成部署令牌：
 
@@ -91,7 +117,7 @@ git tag v0.1.0 ──▶ Actions 编译(x86_64 + aarch64) ──▶ GitHub Relea
 5. 排查：服务器上 `tail -f /var/lib/ufp/incoming/last-deploy.log`
    （网关收到包 → 触发 → 安装/升级 → 健康检查的完整输出都写在这里）。
 
-## 四、没有网关时怎么装第一版
+## 五、没有网关时怎么装第一版
 
 在线部署依赖「网关已经在跑」，所以**第一次必须手动装**。发布流程会把二进制与辅助文件
 推到 **`dist` 分支**（`raw.githubusercontent.com` 由 Fastly 提供，你的服务器在 v6 上实测可达），
@@ -118,7 +144,7 @@ ssh root@[你的IPv6] 'ufp set-admin-password'      # 后台密码
 
 > 不想用 bootstrap 也行：本地 `scp` 二进制，再跑 `deploy/install.sh`（见 README 快速开始）。
 
-## 五、SSH 部署（备用）
+## 六、SSH 部署（备用）
 
 如果你换了双栈机器、或者给 VPS 加了公网 IPv4，也可以直接从能连 IPv6 的机器 SSH 部署
 （CI 里的 runner 不行，原因见文首）：
