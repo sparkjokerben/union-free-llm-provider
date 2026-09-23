@@ -23,11 +23,13 @@ on:
         required: false
         type: boolean
         default: false
+    # 故意都声明成 required: false —— 声明成必填时，密钥没配会在任务启动前直接失败
+    # （连日志都没有），这里改成运行时检查：没配就跳过部署，首次安装前 tag 构建仍是绿的。
     secrets:
       DEPLOY_URL:
-        required: true
+        required: false
       DEPLOY_TOKEN:
-        required: true
+        required: false
 
 jobs:
   deploy:
