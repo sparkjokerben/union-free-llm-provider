@@ -7,6 +7,8 @@
 
 pub mod gemini_schema;
 pub mod gemini_shadow;
+// UFP: 无状态签名信封（替代 shadow store）。
+pub mod gemini_signature;
 pub mod reasoning_bridge;
 pub mod streaming;
 pub mod streaming_gemini;

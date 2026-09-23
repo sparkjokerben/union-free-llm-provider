@@ -5,7 +5,9 @@
 //! responses for Claude-compatible clients.
 
 use super::gemini_schema::build_gemini_function_declaration;
+// UFP: 无状态签名信封
 use super::gemini_shadow::{GeminiAssistantTurn, GeminiShadowStore, GeminiToolCallMeta};
+use super::gemini_signature::{decode_thought, decode_tool_id, encode_thought, encode_tool_id};
 use crate::error::ConvertError;
 use crate::tool_media::{
     strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
@@ -217,7 +219,20 @@ pub fn gemini_to_anthropic_with_shadow_and_hints(
     let mut has_tool_use = false;
 
     for part in &rectified_parts {
+        // UFP: 思考部分不再丢弃 —— 正文进 thinking 块，签名进信封，
+        // 客户端会在下一轮回传，Gemini 3 的多轮工具调用才不会报
+        // "missing a thought_signature"。是否展示给用户由网关的管线决定。
         if part.get("thought").and_then(|value| value.as_bool()) == Some(true) {
+            let signature = part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            content.push(json!({
+                "type": "thinking",
+                "thinking": part.get("text").and_then(|value| value.as_str()).unwrap_or(""),
+                "signature": encode_thought(signature),
+            }));
             continue;
         }
 
@@ -239,6 +254,16 @@ pub fn gemini_to_anthropic_with_shadow_and_hints(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(synthesize_tool_call_id);
+            // UFP: 把 Gemini 的 thoughtSignature 编进 tool_use.id，
+            // 靠客户端的历史回传把签名带回来（不再依赖进程内存里的 shadow）。
+            let id = match part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(|value| value.as_str())
+            {
+                Some(sig) if !sig.is_empty() => encode_tool_id(&id, sig),
+                _ => id,
+            };
             content.push(json!({
                 "type": "tool_use",
                 "id": id,
@@ -348,6 +373,44 @@ fn collect_system_texts(value: &Value, texts: &mut Vec<String>) -> Result<(), Co
 
 fn build_generation_config(body: &Value) -> Option<Value> {
     let mut config = Map::new();
+    // UFP: 把 Anthropic 的 thinking 设置映射成 Gemini 的 thinkingConfig。
+    // - enabled/adaptive：includeThoughts=true，带上 budget_tokens；
+    // - disabled：gemini-2.5 用 thinkingBudget=0 关掉思考；
+    //   gemini-3 关不掉（官方限制），只把 includeThoughts 设成 false，
+    //   避免把 0 发过去被拒。
+    if let Some(thinking) = body.get("thinking") {
+        let kind = thinking
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("disabled");
+        let model = body
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let is_gemini_3 = model.contains("gemini-3");
+        let mut thinking_config = Map::new();
+        match kind {
+            "enabled" | "adaptive" => {
+                thinking_config.insert("includeThoughts".to_string(), json!(true));
+                if let Some(budget) = thinking
+                    .get("budget_tokens")
+                    .and_then(|value| value.as_u64())
+                {
+                    thinking_config.insert("thinkingBudget".to_string(), json!(budget));
+                }
+            }
+            "disabled" => {
+                thinking_config.insert("includeThoughts".to_string(), json!(false));
+                if !is_gemini_3 {
+                    thinking_config.insert("thinkingBudget".to_string(), json!(0));
+                }
+            }
+            _ => {}
+        }
+        if !thinking_config.is_empty() {
+            config.insert("thinkingConfig".to_string(), Value::Object(thinking_config));
+        }
+    }
 
     if let Some(value) = body.get("max_tokens") {
         config.insert("maxOutputTokens".to_string(), value.clone());
@@ -658,7 +721,7 @@ fn convert_message_content_to_parts(
                     ));
                 }
 
-                let id = block
+                let raw_id = block
                     .get("id")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
@@ -666,9 +729,13 @@ fn convert_message_content_to_parts(
                     .get("name")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                if !id.is_empty() && !name.is_empty() {
-                    tool_name_by_id.insert(id.to_string(), name.to_string());
+                if !raw_id.is_empty() && !name.is_empty() {
+                    // tool_result 里的 tool_use_id 是客户端看到的那个（带信封的）id，
+                    // 所以映射表要按原样登记。
+                    tool_name_by_id.insert(raw_id.to_string(), name.to_string());
                 }
+                // UFP: 拆出信封里的签名与裸 id。
+                let (id, signature_from_id) = decode_tool_id(raw_id);
 
                 // A synthesized id is an internal proxy identifier — never
                 // forward it to Gemini. Gemini will disambiguate the missing
@@ -677,7 +744,7 @@ fn convert_message_content_to_parts(
                     "name": name,
                     "args": block.get("input").cloned().unwrap_or_else(|| json!({}))
                 });
-                if !id.is_empty() && !is_synthesized_tool_call_id(id) {
+                if !id.is_empty() && !is_synthesized_tool_call_id(&id) {
                     function_call["id"] = json!(id);
                 }
 
@@ -687,7 +754,13 @@ fn convert_message_content_to_parts(
                 // on every functionCall in a multi-turn tool-use exchange.
                 // Without replaying the stored signature the upstream may
                 // reject with "missing a `thought_signature`".
-                if let Some(sig) = thought_signature_by_id.get(id) {
+                if let Some(sig) = thought_signature_by_id
+                    .get(&id)
+                    .or_else(|| thought_signature_by_id.get(raw_id))
+                {
+                    function_call["thoughtSignature"] = json!(sig);
+                } else if let Some(sig) = signature_from_id {
+                    // UFP: 无状态信封里的签名（shadow 为空也能回传）。
                     function_call["thoughtSignature"] = json!(sig);
                 }
 
@@ -728,8 +801,11 @@ fn convert_message_content_to_parts(
                     "name": name,
                     "response": response
                 });
-                if !tool_use_id.is_empty() && !is_synthesized_tool_call_id(tool_use_id) {
-                    function_response["id"] = json!(tool_use_id);
+                // UFP: functionResponse.id 要和上面 functionCall.id 对得上，
+                // 所以这里也要拆信封、只留裸 id。
+                let bare_tool_use_id = super::gemini_signature::bare_tool_id(tool_use_id);
+                if !tool_use_id.is_empty() && !is_synthesized_tool_call_id(&bare_tool_use_id) {
+                    function_response["id"] = json!(bare_tool_use_id);
                 }
 
                 if supports_multimodal_function_response && !media_parts.is_empty() {
@@ -747,7 +823,35 @@ fn convert_message_content_to_parts(
                     }
                 }
             }
-            "thinking" | "redacted_thinking" => {}
+            // UFP: 思考块回放成 Gemini 的 thought part —— 正文要带上，
+            // 签名从信封里解出来（Gemini 3 的多轮推理校验）。
+            "thinking" | "redacted_thinking" => {
+                let text = if block_type == "thinking" {
+                    block
+                        .get("thinking")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                } else {
+                    ""
+                };
+                let signature = block
+                    .get("signature")
+                    .or_else(|| block.get("data"))
+                    .and_then(|value| value.as_str())
+                    .and_then(decode_thought);
+                let mut part = Map::new();
+                if !text.is_empty() {
+                    part.insert("text".to_string(), json!(text));
+                } else {
+                    // 空 part 可能被拒，放一个空格占位（签名才是关键）。
+                    part.insert("text".to_string(), json!(" "));
+                }
+                part.insert("thought".to_string(), json!(true));
+                if let Some(signature) = signature {
+                    part.insert("thoughtSignature".to_string(), json!(signature));
+                }
+                parts.push(Value::Object(part));
+            }
             _ => {}
         }
     }

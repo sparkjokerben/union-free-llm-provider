@@ -206,6 +206,33 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                     continue;
                                 }
 
+                                // UFP: 上游在流里报错（形如 {"error":{...}}）以前会被
+                                // 解析成空 chunk 悄悄吞掉；这里先看原始 JSON，是错误就
+                                // 转成 Anthropic error 事件收尾（未提交时网关还能换候选）。
+                                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(data) {
+                                    if let Some(error) = raw.get("error") {
+                                        let message = error
+                                            .get("message")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("上游在流中返回了错误");
+                                        let kind = error
+                                            .get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("api_error");
+                                        let event = json!({
+                                            "type": "error",
+                                            "error": {"type": kind, "message": message}
+                                        });
+                                        let sse_data = format!(
+                                            "event: error\ndata: {}\n\n",
+                                            serde_json::to_string(&event).unwrap_or_default()
+                                        );
+                                        log::warn!("[Claude/OpenRouter] 上游流内错误：{message}");
+                                        yield Ok(Bytes::from(sse_data));
+                                        return;
+                                    }
+                                }
+
                                 if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
                                     log::debug!("[Claude/OpenRouter] <<< SSE chunk received");
 
@@ -1366,5 +1393,55 @@ mod tests {
             collect_delta_text(&events, "text_delta", "/delta/text"),
             "答案是 42"
         );
+    }
+}
+
+// UFP: 流内错误的专项测试（上游修复项）。
+#[cfg(test)]
+mod ufp_stream_error_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn run(chunks: Vec<&str>) -> String {
+        let owned: Vec<String> = chunks.into_iter().map(ToString::to_string).collect();
+        let stream = futures::stream::iter(
+            owned
+                .into_iter()
+                .map(|c| Ok::<Bytes, std::io::Error>(Bytes::from(c))),
+        );
+        let converted = create_anthropic_sse_stream(stream);
+        futures::executor::block_on(async move {
+            converted
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|i| String::from_utf8(i.unwrap().to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+    }
+
+    #[test]
+    fn 流内错误转成_anthropic_error_事件() {
+        let out = run(vec![
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"upstream exploded\",\"type\":\"server_error\"}}\n\n",
+        ]);
+        assert!(out.contains("event: error"), "{out}");
+        assert!(
+            out.contains("upstream exploded"),
+            "错误信息要带给客户端：{out}"
+        );
+    }
+
+    #[test]
+    fn 正常流不受影响() {
+        let out = run(vec![
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert!(out.contains("text_delta"), "{out}");
+        assert!(!out.contains("event: error"), "{out}");
     }
 }

@@ -27,7 +27,8 @@
 | `src/providers/transform_gemini.rs` | `proxy/providers/transform_gemini.rs` |
 | `src/providers/streaming_gemini.rs` | `proxy/providers/streaming_gemini.rs` |
 | `src/providers/gemini_schema.rs` | `proxy/providers/gemini_schema.rs` |
-| `src/providers/gemini_shadow.rs` | `proxy/providers/gemini_shadow.rs` |
+| `src/providers/gemini_shadow.rs` | `proxy/providers/gemini_shadow.rs`（保留但已不参与主链路） |
+| `src/providers/gemini_signature.rs` | **UFP 新增**：无状态签名信封，替代 shadow store |
 | `src/usage/parser.rs` | `proxy/usage/parser.rs` |
 
 ## 移植时做的改动
@@ -46,14 +47,28 @@ git -C references/cc-switch log -1 --format=%H          # 确认基准提交
 rg -n 'UFP:' crates/ufp-convert/src                     # 列出所有本地改动
 ```
 
-## 已知要修的上游缺口（实现时逐一补，均加 `// UFP:` 注释）
+## 上游缺口的处理情况（逐条对照，改动都带 `// UFP:` 注释）
 
-- `message_start` 缺 `content: []` / `stop_reason` / `stop_sequence`。
-- Chat 流里 `data: {"error":…}` 被当成空 chunk 吞掉；流在没有 `finish_reason` 时
-  不补 `message_delta` / `message_stop`，块一直悬着。
-- Gemini 流内错误直接变成 `io::Error` 断开连接，应改成 Anthropic `error` 事件。
-- Gemini 的工具调用被堆到流的末尾才输出，位置相对文本丢失。
-- Gemini 完全没有映射 `thinkingConfig`，思考部分被丢弃。
-- Chat 上 gpt-5.x 需要 `max_completion_tokens`。
-- `gemini_shadow.rs` 的进程内 `thoughtSignature` 存储要换成无状态签名信封
-  （泛化 `reasoning_bridge.rs` 的做法），否则重启即丢。
+已修（有专项测试）：
+
+- ✅ `message_start` 缺 `content: []` / `stop_reason` / `stop_sequence`
+  → 由网关的 `pipeline` 补齐（转换层不动，避免和上游 diff 打架）。
+- ✅ Chat 流里 `data: {"error":…}` 被吞 → `streaming.rs` 转成 Anthropic `error` 事件。
+- ✅ 流缺 `finish_reason` 时不收尾 → 网关 `pipeline::finalize()` 补
+  `message_delta` + `message_stop`。
+- ✅ Gemini 流内错误体被静默忽略 → `streaming_gemini.rs` 转成 `error` 事件；
+  传输层 `io::Error` 由网关管线统一转成 `error` 事件（不再断连）。
+- ✅ Gemini 没有映射 `thinkingConfig` → `build_generation_config` 按
+  `thinking.type` 映射 `includeThoughts` / `thinkingBudget`（gemini-3 关不掉思考，只关展示）。
+- ✅ Gemini 思考部分被丢弃 → 响应（流式与非流式）产出 `thinking` 块；
+  请求方向把 thinking/redacted_thinking 回放成 `thought: true` part。
+- ✅ 工具调用的 `thoughtSignature` 依赖进程内存 shadow → 换成无状态签名信封
+  （`gemini_signature.rs`：签名编进 `tool_use.id` 与思考块签名），重启/多实例都不丢。
+- ✅ Chat 上 gpt-5.x 需要 `max_completion_tokens` → `needs_max_completion_tokens()`。
+
+仍未处理（不阻塞主线）：
+
+- Gemini 流式的工具调用仍在流的末尾输出（相对文本的位置丢失）。对 Claude Code
+  这类「先扫到 tool_use 再统一执行」的客户端不影响；真要严格保序需要按 part 原始
+  下标切分文本块，风险与收益不成比例，暂不做。
+- 域名过滤（`web_search.allowed_domains`）没有下发到搜索后端。

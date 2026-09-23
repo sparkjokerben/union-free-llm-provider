@@ -4,6 +4,8 @@
 //! SSE events for Claude-compatible clients.
 
 use super::gemini_shadow::{GeminiShadowStore, GeminiToolCallMeta};
+// UFP: 无状态签名信封
+use super::gemini_signature::encode_tool_id;
 use super::transform_gemini::{
     build_anthropic_usage, is_synthesized_tool_call_id, rectify_tool_call_parts,
     synthesize_tool_call_id, AnthropicToolSchemaHints,
@@ -78,6 +80,29 @@ fn extract_tool_calls(
             ))
         })
         .collect()
+}
+
+/// UFP: 思考部分的正文（thought=true 的 part 的 text）。
+fn extract_thought_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|part| part.get("thought").and_then(|value| value.as_bool()) == Some(true))
+        .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+        .collect::<String>()
+}
+
+/// UFP: 思考部分的签名。
+fn extract_thought_signature(parts: &[Value]) -> Option<String> {
+    parts
+        .iter()
+        .filter(|part| part.get("thought").and_then(|value| value.as_bool()) == Some(true))
+        .filter_map(|part| {
+            part.get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(|value| value.as_str())
+        })
+        .next_back()
+        .map(ToString::to_string)
 }
 
 fn extract_text_thought_signature(parts: &[Value]) -> Option<String> {
@@ -253,6 +278,10 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         let mut open_indices: HashSet<u32> = HashSet::new();
         let mut tool_call_snapshots: Vec<GeminiToolCallMeta> = Vec::new();
         let mut text_thought_signature: Option<String> = None;
+        // UFP: 思考部分单独成块（正文给用户，签名随信封回传）
+        let mut accumulated_thought = String::new();
+        let mut thought_block_index: Option<u32> = None;
+        let mut thought_signature: Option<String> = None;
         let mut latest_usage: Option<Value> = None;
         let mut latest_finish_reason: Option<String> = None;
         let mut blocked_text: Option<String> = None;
@@ -288,6 +317,26 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                             Ok(value) => value,
                             Err(_) => continue,
                         };
+
+                        // UFP: Gemini 在流里直接抛错误体（{"error":{...}}）时，
+                        // 以前会因为找不到 candidates 被静默忽略；这里转成
+                        // Anthropic error 事件（未提交时网关还能换候选）。
+                        if let Some(error) = chunk_json.get("error") {
+                            let message = error
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("上游在流中返回了错误");
+                            let kind = error
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("api_error");
+                            let event = json!({
+                                "type": "error",
+                                "error": {"type": kind, "message": message}
+                            });
+                            yield Ok(encode_sse("error", &event));
+                            return;
+                        }
 
                         if message_id.is_none() {
                             message_id = chunk_json
@@ -348,6 +397,70 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                                 rectify_tool_call_parts(&mut rectified_parts, tool_schema_hints.as_ref());
                                 if let Some(signature) = extract_text_thought_signature(parts) {
                                     text_thought_signature = Some(signature);
+                                }
+                                // UFP: 思考部分 → thinking 块（与正文各自独立累积）
+                                if let Some(signature) = extract_thought_signature(&rectified_parts) {
+                                    thought_signature = Some(signature);
+                                }
+                                let thought_text = extract_thought_text(&rectified_parts);
+                                if !thought_text.is_empty() {
+                                    let is_cumulative = thought_text.starts_with(&accumulated_thought);
+                                    let delta = if is_cumulative {
+                                        thought_text[accumulated_thought.len()..].to_string()
+                                    } else {
+                                        thought_text.clone()
+                                    };
+                                    if !delta.is_empty() {
+                                        let index = *thought_block_index.get_or_insert_with(|| {
+                                            let assigned = next_content_index;
+                                            next_content_index += 1;
+                                            assigned
+                                        });
+                                        if !open_indices.contains(&index) {
+                                            let start_event = json!({
+                                                "type": "content_block_start",
+                                                "index": index,
+                                                "content_block": {"type": "thinking", "thinking": ""}
+                                            });
+                                            yield Ok(encode_sse("content_block_start", &start_event));
+                                            open_indices.insert(index);
+                                        }
+                                        let delta_event = json!({
+                                            "type": "content_block_delta",
+                                            "index": index,
+                                            "delta": {"type": "thinking_delta", "thinking": delta}
+                                        });
+                                        yield Ok(encode_sse("content_block_delta", &delta_event));
+                                        if is_cumulative {
+                                            accumulated_thought = thought_text;
+                                        } else {
+                                            accumulated_thought.push_str(&delta);
+                                        }
+                                    }
+                                }
+                                // 正文要开始了（或已经开始了）：把思考块收尾 —— 先补
+                                // 签名（Gemini 3 的多轮校验靠它），再关块。
+                                if !extract_visible_text(&rectified_parts).is_empty() {
+                                    if let Some(index) = thought_block_index {
+                                        if open_indices.remove(&index) {
+                                            if let Some(signature) = thought_signature.clone() {
+                                                let sig_event = json!({
+                                                    "type": "content_block_delta",
+                                                    "index": index,
+                                                    "delta": {
+                                                        "type": "signature_delta",
+                                                        "signature": super::gemini_signature::encode_thought(&signature)
+                                                    }
+                                                });
+                                                yield Ok(encode_sse("content_block_delta", &sig_event));
+                                            }
+                                            let stop_event = json!({
+                                                "type": "content_block_stop",
+                                                "index": index
+                                            });
+                                            yield Ok(encode_sse("content_block_stop", &stop_event));
+                                        }
+                                    }
                                 }
                                 merge_tool_call_snapshots(
                                     &mut tool_call_snapshots,
@@ -519,17 +632,43 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         // segment the accumulated text into multiple content blocks at
         // tool-call boundaries, and flush in original order.
         // ------------------------------------------------------------------
+        // UFP: 收尾前先关掉可能还开着的思考块
+        if let Some(index) = thought_block_index {
+            if open_indices.remove(&index) {
+                if let Some(signature) = thought_signature.clone() {
+                    let sig_event = json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": super::gemini_signature::encode_thought(&signature)
+                        }
+                    });
+                    yield Ok(encode_sse("content_block_delta", &sig_event));
+                }
+                let stop_event = json!({"type": "content_block_stop", "index": index});
+                yield Ok(encode_sse("content_block_stop", &stop_event));
+            }
+        }
+
         let tool_calls = tool_call_snapshots;
         for tool_call in &tool_calls {
             let index = next_content_index;
             next_content_index += 1;
 
+            // UFP: 把该次调用的 thoughtSignature 编进 id，客户端原样回传后
+            // 我们在请求侧再解出来 —— 不依赖进程内存里的 shadow。
+            let raw_id = tool_call.id.clone().unwrap_or_default();
+            let id = match tool_call.thought_signature.as_deref() {
+                Some(signature) if !signature.is_empty() => encode_tool_id(&raw_id, signature),
+                _ => raw_id,
+            };
             let start_event = json!({
                 "type": "content_block_start",
                 "index": index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_call.id.clone().unwrap_or_default(),
+                    "id": id,
                     "name": tool_call.name
                 }
             });
@@ -570,6 +709,31 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
 
         let message_stop = json!({ "type": "message_stop" });
         yield Ok(encode_sse("message_stop", &message_stop));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// UFP: 供新增的签名测试复用（把合成 SSE 片段跑成 Anthropic 流）。
+    pub(crate) fn collect_stream_output(chunks: Vec<&str>) -> String {
+        let owned_chunks: Vec<String> = chunks.into_iter().map(ToString::to_string).collect();
+        let stream = futures::stream::iter(
+            owned_chunks
+                .into_iter()
+                .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from(chunk))),
+        );
+        let converted = create_anthropic_sse_stream_from_gemini(stream, None, None, None, None);
+        futures::executor::block_on(async move {
+            converted
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .join("")
+        })
     }
 }
 
@@ -1050,5 +1214,100 @@ mod tests {
             shadow["parts"][0]["thoughtSignature"], "sig-keep",
             "prior thoughtSignature must survive a later chunk that omits it: {shadow}"
         );
+    }
+}
+
+// UFP: 无状态签名信封与思考块的专项测试（新增行为，与上游 cc-switch 的 shadow 方案不同）。
+#[cfg(test)]
+mod ufp_signature_tests {
+    use super::tests_support::collect_stream_output;
+    use super::*;
+    use crate::providers::gemini_signature::{decode_thought, decode_tool_id, encode_tool_id};
+    use crate::providers::transform_gemini::anthropic_to_gemini;
+
+    #[test]
+    fn 思考部分产出_thinking_块并带上签名信封() {
+        let out = collect_stream_output(vec![
+            "data: {\"responseId\":\"r1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"我先想想\",\"thought\":true,\"thoughtSignature\":\"sig-thought\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":6}}\n\n",
+            "data: {\"responseId\":\"r1\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"我先想想\",\"thought\":true,\"thoughtSignature\":\"sig-thought\"},{\"text\":\"答案是 42\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":9}}\n\n",
+        ]);
+        assert!(out.contains("\"type\":\"thinking\""), "{out}");
+        assert!(out.contains("thinking_delta"), "{out}");
+        assert!(out.contains("我先想想"), "{out}");
+        // 签名以信封形式出现，且带 gemini-thought 前缀
+        assert!(out.contains("signature_delta"), "{out}");
+        assert!(out.contains("gemini-thought-v1:"), "{out}");
+        // 思考块必须先于正文块关闭
+        let think_pos = out.find("\"type\":\"thinking\"").unwrap();
+        let text_pos = out.find("\"type\":\"text\"").unwrap();
+        assert!(think_pos < text_pos, "思考块应在正文之前：{out}");
+        assert!(out.contains("答案是 42"), "{out}");
+    }
+
+    #[test]
+    fn 工具调用的_id_带上签名且可解回() {
+        let out = collect_stream_output(vec![
+            "data: {\"responseId\":\"r2\",\"modelVersion\":\"gemini-3-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}},\"thoughtSignature\":\"sig-call\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":8}}\n\n",
+        ]);
+        assert!(out.contains("_gs_"), "工具 id 应带信封：{out}");
+        // 从事件里取 id 再解回签名
+        let id = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find_map(|v| {
+                v.get("content_block")
+                    .and_then(|b| b.get("id"))
+                    .and_then(|i| i.as_str())
+                    .map(|s| s.to_string())
+            })
+            .expect("应有 tool_use 块");
+        let (bare, sig) = decode_tool_id(&id);
+        assert_eq!(sig.as_deref(), Some("sig-call"), "{id}");
+        assert!(!bare.contains("_gs_"), "裸 id 应干净：{bare}");
+    }
+
+    #[test]
+    fn 带信封的_id_与思考签名能回到_gemini_请求里() {
+        // 模拟客户端历史：网关发出去的那条消息原样回来
+        let signature = "sig-call";
+        let body = json!({
+            "model": "gemini-3-pro",
+            "max_tokens": 256,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "东京天气"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "先查天气",
+                     "signature": crate::providers::gemini_signature::encode_thought("sig-thought")},
+                    {"type": "tool_use", "id": encode_tool_id("call_1", signature),
+                     "name": "get_weather", "input": {"city": "Tokyo"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": encode_tool_id("call_1", signature),
+                     "content": [{"type": "text", "text": "晴"}]}
+                ]}
+            ]
+        });
+        let converted = anthropic_to_gemini(body).unwrap();
+        let text = serde_json::to_string(&converted).unwrap();
+        assert!(text.contains("sig-call"), "工具调用的签名要回传：{text}");
+        assert!(text.contains("sig-thought"), "思考的签名要回放：{text}");
+        assert!(!text.contains("_gs_"), "信封不该留给 Gemini：{text}");
+        let _ = decode_thought;
+    }
+}
+
+// UFP: Gemini 流内错误的专项测试（上游修复项）。
+#[cfg(test)]
+mod ufp_gemini_error_tests {
+    use super::tests_support::collect_stream_output;
+
+    #[test]
+    fn gemini_流内错误转成_error_事件() {
+        let out = collect_stream_output(vec![
+            "data: {\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"The model is overloaded\"}}\n\n",
+        ]);
+        assert!(out.contains("event: error"), "{out}");
+        assert!(out.contains("The model is overloaded"), "{out}");
     }
 }

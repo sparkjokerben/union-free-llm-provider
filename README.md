@@ -82,6 +82,7 @@ claude
 
 ```
 crates/ufp-convert/   协议转换层（移植自 cc-switch，改动带 // UFP: 注释）
+  src/providers/gemini_signature.rs  UFP 新增：Gemini 签名的无状态信封
 crates/ufp/           网关本体
   src/api/            下游面（/v1/messages、count_tokens、models）与后台
   src/router/         候选选择：层级、会话粘性、能力过滤
@@ -122,6 +123,9 @@ wget <新版本> -O /usr/local/bin/ufp.new && rc-service ufp upgrade
 ## 已知边界
 
 - 只支持流式请求的 WebSearch 续写；非流式请求遇到搜索调用时只做形态转换、不续写。
-- Gemini 的 `thoughtSignature` 目前会在历史中丢弃，多轮工具调用可能被 Gemini 3 拒绝（待补：无状态签名信封）。
+- Gemini 流式响应里工具调用仍在流的末尾输出（文本与工具调用的相对位置丢失），
+  对 Claude Code 这类客户端没有影响。
 - 搜索后端的域名过滤（`allowed_domains`）暂未下发到后端。
 - 上游压缩响应只在非流式路径解压；流式路径强制 `accept-encoding: identity`。
+- Gemini 的思考回放（thought part）与 `thinkingBudget: 0` 的行为需要在真机
+  免费额度上实测一遍（已按官方文档实现，但免费层各版本策略有差异）。

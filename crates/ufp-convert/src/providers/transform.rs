@@ -53,6 +53,12 @@ pub(crate) fn strip_leading_anthropic_billing_header(text: &str) -> &str {
     }
 }
 
+/// UFP: 除了 o-series，GPT-5 系列（gpt-5、gpt-5.1、gpt-5-codex…）也只认
+/// `max_completion_tokens`，继续发 `max_tokens` 会被 400 拒掉。
+pub fn needs_max_completion_tokens(model: &str) -> bool {
+    is_openai_o_series(model) || model.starts_with("gpt-5")
+}
+
 /// Detect OpenAI o-series reasoning models (o1, o3, o4-mini, etc.)
 /// These models require `max_completion_tokens` instead of `max_tokens`.
 pub fn is_openai_o_series(model: &str) -> bool {
@@ -208,10 +214,10 @@ pub fn anthropic_to_openai_with_reasoning_content(
 
     result["messages"] = json!(messages);
 
-    // 转换参数 — o-series 模型需要 max_completion_tokens
+    // 转换参数 — o-series 与 gpt-5 系列需要 max_completion_tokens
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     if let Some(v) = body.get("max_tokens") {
-        if is_openai_o_series(model) {
+        if needs_max_completion_tokens(model) {
             result["max_completion_tokens"] = v.clone();
         } else {
             result["max_tokens"] = v.clone();
@@ -2081,5 +2087,40 @@ mod tests {
             run_tool_choice(json!({"type": "tool", "name": "search"})),
             json!({"type": "function", "function": {"name": "search"}}),
         );
+    }
+}
+
+// UFP: gpt-5 系列参数的专项测试（上游修复项）。
+#[cfg(test)]
+mod ufp_gpt5_param_tests {
+    use super::*;
+
+    #[test]
+    fn gpt5_用_max_completion_tokens() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let mut with_model = body.clone();
+        with_model["model"] = json!("gpt-5.1-codex");
+        let out = anthropic_to_openai(with_model).unwrap();
+        assert_eq!(out["max_completion_tokens"], 4096, "{out}");
+        assert!(out.get("max_tokens").is_none(), "{out}");
+
+        // 非 gpt-5 的普通模型仍然用 max_tokens
+        let mut plain = body.clone();
+        plain["model"] = json!("gpt-4o-mini");
+        let out = anthropic_to_openai(plain).unwrap();
+        assert_eq!(out["max_tokens"], 4096, "{out}");
+    }
+
+    #[test]
+    fn 模型判定覆盖_o_系列与_gpt5() {
+        assert!(needs_max_completion_tokens("o3-mini"));
+        assert!(needs_max_completion_tokens("gpt-5"));
+        assert!(needs_max_completion_tokens("gpt-5.4-turbo"));
+        assert!(!needs_max_completion_tokens("gpt-4o"));
+        assert!(!needs_max_completion_tokens("deepseek-reasoner"));
     }
 }
