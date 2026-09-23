@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::api::AppState;
-use crate::store::{Candidate, Settings};
+use crate::store::Settings;
 use crate::upstream::{self, BuildCtx};
 
 use super::patch::{self, PatchOp};
@@ -45,18 +45,6 @@ pub struct Analysis {
     pub used_model: String,
 }
 
-/// 从池里挑出分析条目对应的候选（条目 × 该渠道第一把启用的 key）。
-pub fn analysis_candidate(pool: &crate::store::Pool, entry_id: i64) -> Option<Candidate> {
-    let entry = pool.entries.iter().find(|e| e.id == entry_id)?.clone();
-    let channel = pool.channels.get(&entry.channel_id)?.clone();
-    let key = pool.keys.get(&entry.channel_id)?.first()?.clone();
-    Some(Candidate {
-        channel,
-        key,
-        entry,
-    })
-}
-
 /// 让分析条目给出补丁。
 pub async fn analyze(
     state: &Arc<AppState>,
@@ -70,7 +58,7 @@ pub async fn analyze(
     };
     let cand = {
         let pool = state.pool.load();
-        analysis_candidate(&pool, entry_id).ok_or_else(|| {
+        crate::router::select::candidate_for_entry(&pool, entry_id).ok_or_else(|| {
             "分析条目不可用（条目被禁用、渠道没有启用的 key，或条目已被删除）".to_string()
         })?
     };

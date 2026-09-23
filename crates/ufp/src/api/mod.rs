@@ -112,6 +112,9 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     let body_limit = state.cfg.max_body_bytes;
     Router::new()
+        // 根路径给一个极简落地页（别人打开域名时不会看到 nginx 的 404）
+        .route("/", get(landing))
+        .route("/favicon.ico", get(favicon))
         // 下游面（Anthropic 协议）
         .route("/v1/messages", post(messages::messages))
         .route("/v1/messages/count_tokens", post(models::count_tokens))
@@ -122,6 +125,46 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(admin::routes())
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
+}
+
+/// 极简落地页：告诉来者这是什么、怎么用，不暴露任何内部信息。
+async fn landing() -> impl axum::response::IntoResponse {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ufp</title>
+<style>
+ :root {{ color-scheme: dark }}
+ body {{ margin:0; min-height:100vh; display:grid; place-items:center;
+        font:15px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+        background:#0f1115; color:#e6e8ee }}
+ main {{ max-width:34rem; padding:2rem }}
+ h1 {{ font-size:1.25rem; margin:0 0 .25rem }}
+ p {{ color:#98a0b0; margin:.35rem 0 }}
+ code {{ background:#1f232c; padding:.1rem .35rem; border-radius:.25rem; font-size:.9em }}
+ a {{ color:#6ea8fe }}
+ .row {{ margin-top:1.25rem; display:flex; gap:1.25rem; flex-wrap:wrap }}
+</style></head>
+<body><main>
+<h1>ufp · 统一 LLM 中转网关</h1>
+<p>本服务只提供 Anthropic Messages 协议（<code>/v1/messages</code>），供 Claude Code 之类的客户端使用。</p>
+<div class="row">
+  <a href="/admin">管理后台</a>
+  <a href="/healthz">健康状态</a>
+</div>
+<p style="margin-top:1.5rem;font-size:.8rem;opacity:.6">v{}</p>
+</main></body></html>"#,
+        crate::VERSION
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+}
+
+async fn favicon() -> axum::http::StatusCode {
+    axum::http::StatusCode::NO_CONTENT
 }
 
 async fn healthz(

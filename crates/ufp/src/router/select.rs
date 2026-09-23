@@ -56,6 +56,20 @@ pub struct Plan {
     pub skipped_pdf: usize,
 }
 
+/// 按条目 id 取一个候选（条目 × 该渠道第一把启用的 key）。
+///
+/// 用于不走正常路由的旁路场景：LLM 分析条目、后台的「测试连通性」。
+pub fn candidate_for_entry(pool: &Pool, entry_id: i64) -> Option<Candidate> {
+    let entry = pool.entries.iter().find(|e| e.id == entry_id)?.clone();
+    let channel = pool.channels.get(&entry.channel_id)?.clone();
+    let key = pool.keys.get(&entry.channel_id)?.first()?.clone();
+    Some(Candidate {
+        channel,
+        key,
+        entry,
+    })
+}
+
 pub fn plan(
     pool: &Pool,
     breakers: &Breakers,

@@ -85,6 +85,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             patch(update_search_backend).delete(delete_search_backend),
         )
         .route("/admin/api/settings", get(get_settings).put(put_settings))
+        .route("/admin/api/test_connection", post(test_connection))
         .route("/admin/api/deploy", post(deploy))
         .route("/admin/api/deploy-token", post(rotate_deploy_token))
         .route("/admin/api/export", get(export_config))
@@ -1445,6 +1446,148 @@ async fn put_settings(
     })
     .await?;
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 测试上游连通性（后台「测试」按钮）
+// ============================================================================
+
+#[derive(Deserialize)]
+struct TestPayload {
+    /// 要测的条目 id。
+    entry_id: i64,
+    /// 自定义提问（不传就用一句 ping）。
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// `POST /admin/api/test_connection`：拿条目的真实配置发一次最小请求。
+///
+/// 纯诊断，**不影响熔断与冷却状态**（不记账、不写库、不进路由），
+/// 所以你可以放心用它试那些已经熔断/冷却的条目。
+async fn test_connection(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<TestPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+
+    let cand = {
+        let pool = state.pool.load();
+        crate::router::select::candidate_for_entry(&pool, p.entry_id)
+    };
+    let Some(cand) = cand else {
+        return Err(bad_request(
+            "这个条目现在不在池里（被禁用、渠道没 key，或已被删除）",
+        ));
+    };
+
+    let prompt = p
+        .prompt
+        .unwrap_or_else(|| "连通性测试：请只回复 OK".to_string());
+    let body = json!({
+        "model": cand.entry.upstream_model,
+        "max_tokens": 32,
+        "stream": false,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    });
+    let base = json!({
+        "ok": false,
+        "channel": cand.channel.name,
+        "key": cand.key.label,
+        "upstream_model": cand.entry.upstream_model,
+        "protocol": cand.channel.protocol.as_str(),
+    });
+
+    let started = std::time::Instant::now();
+    let build = crate::upstream::build(
+        &cand,
+        &crate::upstream::BuildCtx {
+            client_body: &body,
+            client_anthropic_version: None,
+            stream: false,
+        },
+    );
+    let req = match build {
+        Ok(r) => r,
+        Err(e) => {
+            let mut out = base.clone();
+            out["error"] = json!(format!("构造上游请求失败：{e}"));
+            return Ok(Json(out).into_response());
+        }
+    };
+
+    let timeout = Duration::from_millis(
+        state
+            .pool
+            .load()
+            .settings
+            .first_content_timeout_ms
+            .min(30_000),
+    );
+    let resp = match crate::upstream::send(&state.client, &req, timeout, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            let mut out = base.clone();
+            out["latency_ms"] = json!(started.elapsed().as_millis() as u64);
+            out["error_type"] = json!(e.kind());
+            out["error"] = json!(e.to_string());
+            return Ok(Json(out).into_response());
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if !resp.status().is_success() {
+        let (status, _body, text) = crate::upstream::error_body(resp).await;
+        let mut out = base.clone();
+        out["status"] = json!(status);
+        out["latency_ms"] = json!(latency_ms);
+        out["error_type"] = json!("http");
+        out["error"] = json!(crate::pipeline::truncate_error(&text));
+        return Ok(Json(out).into_response());
+    }
+
+    // 成功：转成 Anthropic 形态，取模型回话与 usage
+    let raw: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            let mut out = base.clone();
+            out["status"] = json!(status);
+            out["latency_ms"] = json!(latency_ms);
+            out["error"] = json!(format!("响应不是 JSON：{e}"));
+            return Ok(Json(out).into_response());
+        }
+    };
+    let hints = crate::upstream::tool_schema_hints(&body);
+    let converted =
+        crate::upstream::response_to_anthropic(cand.channel.protocol, raw, Some(&hints))
+            .unwrap_or(Value::Null);
+    let reply = converted
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let usage = converted.get("usage").cloned().unwrap_or(json!({}));
+
+    Ok(Json(json!({
+        "ok": true,
+        "channel": cand.channel.name,
+        "key": cand.key.label,
+        "upstream_model": cand.entry.upstream_model,
+        "protocol": cand.channel.protocol.as_str(),
+        "status": status,
+        "latency_ms": latency_ms,
+        "reply": crate::pipeline::truncate_error(&reply),
+        "usage": usage,
+    }))
+    .into_response())
 }
 
 // ============================================================================
