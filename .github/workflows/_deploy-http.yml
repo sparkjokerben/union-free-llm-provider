@@ -37,7 +37,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 检查部署配置
+        id: cfg
+        env:
+          URL: ${{ secrets.DEPLOY_URL }}
+          TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::还没配置 DEPLOY_URL / DEPLOY_TOKEN，跳过部署（首次安装见 deploy/cloudflare.md）"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "url=${URL%/}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 取本次构建的产物
+        if: steps.cfg.outputs.skip != 'true'
         if: inputs.artifacts_from == 'local'
         uses: actions/download-artifact@v4
         with:
@@ -45,7 +60,7 @@ jobs:
           merge-multiple: true
 
       - name: 从 Release 下载产物
-        if: ${{ inputs.artifacts_from == 'release' && !inputs.dry_run }}
+        if: ${{ steps.cfg.outputs.skip != 'true' && inputs.artifacts_from == 'release' && !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -57,8 +72,9 @@ jobs:
           ls -lh dist
 
       - name: 连通性自检（域名 /healthz）
+        if: steps.cfg.outputs.skip != 'true'
         env:
-          URL: ${{ secrets.DEPLOY_URL }}
+          URL: ${{ steps.cfg.outputs.url }}
         run: |
           set -eu
           curl -fsS --max-time 20 "${URL%/}/healthz" | tee /tmp/healthz-before.json
@@ -68,11 +84,11 @@ jobs:
           }
 
       - name: 干跑到此为止
-        if: inputs.dry_run
+        if: ${{ steps.cfg.outputs.skip != 'true' && inputs.dry_run }}
         run: echo "::notice::dry_run：域名可达、healthz 正常，没有推送任何东西"
 
       - name: 打包（两个架构都带上，服务器自己挑）
-        if: ${{ !inputs.dry_run }}
+        if: ${{ steps.cfg.outputs.skip != 'true' && !inputs.dry_run }}
         run: |
           set -eu
           mkdir -p upload
@@ -88,9 +104,9 @@ jobs:
           echo "SHA=$(cat deploy.sha256)" >> "$GITHUB_ENV"
 
       - name: 推给网关
-        if: ${{ !inputs.dry_run }}
+        if: ${{ steps.cfg.outputs.skip != 'true' && !inputs.dry_run }}
         env:
-          URL: ${{ secrets.DEPLOY_URL }}
+          URL: ${{ steps.cfg.outputs.url }}
           TOKEN: ${{ secrets.DEPLOY_TOKEN }}
           TAG: ${{ inputs.tag }}
         run: |
@@ -111,9 +127,9 @@ jobs:
           esac
 
       - name: 轮询新版本上线
-        if: ${{ !inputs.dry_run }}
+        if: ${{ steps.cfg.outputs.skip != 'true' && !inputs.dry_run }}
         env:
-          URL: ${{ secrets.DEPLOY_URL }}
+          URL: ${{ steps.cfg.outputs.url }}
           EXPECT: ${{ inputs.tag }}
         run: |
           set -eu
