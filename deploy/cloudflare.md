@@ -32,21 +32,20 @@ git tag v0.1.0 ──▶ Actions 编译(x86_64 + aarch64) ──▶ GitHub Relea
 2. 申请 **Cloudflare Origin CA 证书**（免费，有效期 15 年）：
    Cloudflare 面板 → SSL/TLS → Origin Server → Create Certificate →
    Hostnames 填你的域名 → 拿到 certificate 与 private key。
-3. 装到服务器：
+3. 装到服务器。**文件名要和域名一致**（安装脚本按域名生成了证书路径）：
 
    ```sh
-   mkdir -p /etc/nginx/certs
-   # 把面板给的证书与私钥内容贴进这两个文件
-   vi /etc/nginx/certs/origin.crt
-   vi /etc/nginx/certs/origin.key
-   chmod 600 /etc/nginx/certs/origin.key
+   # 在你自己机器的终端里执行两条，各粘贴一次内容、Ctrl-D 结束
+   ssh root@[你的IPv6] 'mkdir -p /etc/nginx/certs && cat > /etc/nginx/certs/api.jokerben.top.crt'
+   # ← 粘贴证书
+   ssh root@[你的IPv6] 'cat > /etc/nginx/certs/api.jokerben.top.key && chmod 600 /etc/nginx/certs/api.jokerben.top.key'
+   # ← 粘贴私钥
 
-   # 指向它们（把 deploy/nginx/ufp.conf 里那两行 ssl_certificate* 换掉）
-   sed -i 's#/etc/nginx/certs/example.com.crt#/etc/nginx/certs/origin.crt#; \
-           s#/etc/nginx/certs/example.com.key#/etc/nginx/certs/origin.key#' \
-       /etc/nginx/http.d/ufp.conf
-   nginx -t && rc-service nginx restart
+   ssh root@[你的IPv6] 'nginx -t && rc-service nginx start'
    ```
+
+   证书路径与 `server_name` 已经按你的域名写好（安装时替换了模板里的 example.com），
+   所以上面不用改任何配置文件。
 
 4. Cloudflare 面板 → SSL/TLS → Overview → 模式选 **Full (strict)**。
 
