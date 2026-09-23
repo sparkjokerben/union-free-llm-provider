@@ -97,19 +97,28 @@ pub fn routes() -> Router<Arc<AppState>> {
 // 静态界面
 // ============================================================================
 
+/// 后台页面：注入当前版本号（脚本 URL 带版本，换版本必然换 URL，不会被旧缓存粘住），
+/// 并且一律 no-store —— 后台资源必须跟着二进制走，缓存过期策略在这里只会帮倒忙。
 async fn index() -> impl IntoResponse {
+    let html = INDEX_HTML.replace("__UFP_VERSION__", crate::VERSION);
     (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        INDEX_HTML,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        html,
     )
 }
 
 async fn app_js() -> impl IntoResponse {
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         APP_JS,
     )
 }

@@ -215,6 +215,18 @@ dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
 
 <dialog id="dlg"><div id="dlg-body"></div></dialog>
 <div id="toasts"></div>
-<script src="/admin/app.js"></script>
+<noscript><p class="note" style="padding:20px">这个后台需要 JavaScript。</p></noscript>
+<script src="/admin/app.js?v=__UFP_VERSION__"></script>
+<script>
+// 兜底：脚本没跑起来（旧缓存、扩展拦截、报错）时别让人面对一片空白
+setTimeout(function () {
+  var rail = document.getElementById('rail');
+  var gate = document.getElementById('gate');
+  if (rail && !rail.innerHTML.trim() && gate && gate.hidden) {
+    rail.innerHTML = '<p class="note">界面脚本没有跑起来。先强制刷新一次' +
+      '（Mac：Cmd+Shift+R，Windows：Ctrl+F5）；如果还不行，看一下控制台报错。</p>';
+  }
+}, 2500);
+</script>
 </body>
 </html>

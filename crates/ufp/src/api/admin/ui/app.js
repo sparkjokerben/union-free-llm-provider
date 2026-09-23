@@ -66,6 +66,12 @@ function toast(msg, bad = false) {
 
 function dlg(html) { $('#dlg-body').innerHTML = html; $('#dlg').showModal(); }
 const closeDlg = () => $('#dlg').close();
+// 加载期绑定：节点缺失只警告，不让整页脚本挂掉（历史上就因此白过一次）
+const on = (sel, ev, fn) => {
+  const el = $(sel);
+  if (!el) { console.warn('缺少节点', sel); return; }
+  el.addEventListener(ev, fn);
+};
 
 // 状态灯：熔断 > 冷却 > 在线。skip 只用于尝试色带。
 function stateOf(entryId) {
@@ -96,19 +102,19 @@ async function boot() {
     await reload();
   } catch (e) { if (e.message !== 'unauthorized') gate(e.message); }
 }
-$('#do-login').onclick = async () => {
+on('#do-login', 'click', async () => {
   try {
     await api('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: $('#pw').value }) });
     $('#pw').value = '';
     await boot();
   } catch (e) { $('#gate-msg').textContent = e.message; }
-};
-$('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#do-login').click(); });
-$('#logout').onclick = async () => {
+});
+on('#pw', 'keydown', (e) => { if (e.key === 'Enter') $('#do-login').click(); });
+on('#logout', 'click', async () => {
   await api('/admin/api/logout', { method: 'POST' });
   gate('已退出。');
-};
-$('#refresh').onclick = () => reload();
+});
+on('#refresh', 'click', () => reload());
 
 // ── 共享数据与外壳 ──────────────────────────────────────────────────────
 async function reload() {
