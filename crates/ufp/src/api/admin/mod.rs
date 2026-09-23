@@ -1557,7 +1557,7 @@ async fn deploy(
     );
 
     // 触发特权脚本（不等待它跑完：升级过程中网关自己会被替换掉）
-    let (triggered, note) = trigger_apply(&path, &actual);
+    let (triggered, note) = trigger_apply(&path, &actual, &version);
     let status = if triggered {
         StatusCode::ACCEPTED
     } else {
@@ -1586,7 +1586,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// 调特权脚本。优先 sudo -n（配了 NOPASSWD 才不会卡住），再试 doas。
-fn trigger_apply(tarball: &std::path::Path, sha: &str) -> (bool, String) {
+fn trigger_apply(tarball: &std::path::Path, sha: &str, version: &str) -> (bool, String) {
     let log_path = deploy_spool_dir().join("last-deploy.log");
     for (launcher, args) in [
         ("sudo", vec!["-n", APPLY_SCRIPT]),
@@ -1599,6 +1599,8 @@ fn trigger_apply(tarball: &std::path::Path, sha: &str) -> (bool, String) {
         cmd.args(args)
             .arg(tarball)
             .arg(sha)
+            // 版本号只用于日志（部署脚本会打印它）
+            .env("UFP_DEPLOY_VERSION", version)
             .stdin(std::process::Stdio::null());
         // 升级日志追加到 spool 里的固定文件，方便事后排查（每次尝试单独打开）
         match std::fs::OpenOptions::new()

@@ -145,6 +145,15 @@ else
   fi
 fi
 
+# 备份目录里的部署包只留最近 3 个（每个约 10MB，别把 10G 磁盘慢慢吃满）
+SPOOL="$(dirname "$TARGET")/../lib/ufp/incoming"
+if [ -d "$SPOOL" ]; then
+  ls -1t "$SPOOL"/deploy-*.tgz 2>/dev/null | tail -n +4 | while read -r old; do
+    rm -f "$old"
+  done
+fi
+rm -f "$TARGET.new"
+
 # 健康检查：最多等 90 秒（升级时旧进程可能还在排空在途请求）
 i=0
 while [ "$i" -lt 90 ]; do
