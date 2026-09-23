@@ -326,7 +326,12 @@ fn set_admin_password(arg: Option<&str>) -> Result<(), Box<dyn std::error::Error
         _ => {
             eprintln!("请在后端输入中粘贴后台密码后回车（交互式输入会回显，介意的话用管道传入）：");
             let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
+            if std::io::stdin().read_line(&mut line)? == 0 {
+                return Err("没读到密码（stdin 是空的或已关闭）。两种做法：\n  \
+                     1) 在自己的终端里交互运行：ssh root@<服务器> 'ufp set-admin-password'\n  \
+                     2) 直接把密码当参数传：ufp set-admin-password '你的密码'"
+                    .into());
+            }
             line.trim().to_string()
         }
     };

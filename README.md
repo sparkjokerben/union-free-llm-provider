@@ -181,3 +181,4 @@ wget <新版本> -O /usr/local/bin/ufp.new && rc-service ufp upgrade
 - 上游压缩响应只在非流式路径解压；流式路径强制 `accept-encoding: identity`。
 - Gemini 的思考回放（thought part）与 `thinkingBudget: 0` 的行为需要在真机
   免费额度上实测一遍（已按官方文档实现，但免费层各版本策略有差异）。
+
