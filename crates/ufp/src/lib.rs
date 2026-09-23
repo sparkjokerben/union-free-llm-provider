@@ -16,6 +16,7 @@ pub mod router;
 pub mod store;
 pub mod tokens;
 pub mod upstream;
+pub mod websearch;
 
 /// 当前版本（日志与 UA 用）。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

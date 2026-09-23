@@ -33,6 +33,7 @@ use crate::store::{AttemptLogRow, Candidate, ModelEcho, RequestLogRow, Settings,
 use crate::upstream::{self, AnthropicToolSchemaHints, BuildCtx};
 
 /// 一次调用的上下文。
+#[derive(Clone)]
 pub struct ForwardCtx {
     pub request_id: String,
     pub session_id: Option<String>,

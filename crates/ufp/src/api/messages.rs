@@ -1,7 +1,7 @@
 //! `/v1/messages`：网关主路径。
 //!
-//! 流程：鉴权 → 解析 → 并发闸门 → 提取会话/能力需求 → 选候选 → 转发 → 回程。
-//! 错误一律是 Anthropic 信封（见 `api/error.rs`），不把上游格式泄漏给客户端。
+//! 流程：鉴权 → 解析 → 并发闸门 → 提取会话/能力需求 → 选候选 → WebSearch 预处理
+//! → 转发 → （如果需要）接上搜索循环 → 回程。错误一律是 Anthropic 信封。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,6 +21,7 @@ use crate::pipeline::{self, truncate_error};
 use crate::router::{extract_session_id, select};
 use crate::store::{RequestLogRow, Write};
 use crate::tokens;
+use crate::websearch::{self, backends as search_backends, search_loop::SearchState};
 
 pub async fn messages(
     State(state): State<Arc<AppState>>,
@@ -28,6 +29,7 @@ pub async fn messages(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let key = authenticate(&state, &headers).await?;
+    let started = Instant::now();
 
     if body.len() > state.cfg.max_body_bytes {
         return Err(ApiError::too_large(format!(
@@ -48,7 +50,6 @@ pub async fn messages(
     };
 
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
-    let started = Instant::now();
     let session_id = extract_session_id(&headers, &parsed);
     let requested_model = parsed
         .get("model")
@@ -79,6 +80,38 @@ pub async fn messages(
     }
     .map_err(select_error)?;
 
+    // ---- WebSearch 预处理（D13）----
+    let settings = state.pool.load().settings.clone();
+    let (mut upstream_body, search_plan) = if settings.search.enabled {
+        websearch::history::prepare_request(&parsed, settings.search.max_uses)
+    } else {
+        (parsed.clone(), Default::default())
+    };
+    let mut search_state = SearchState {
+        plan: search_plan,
+        backends: Vec::new(),
+        settings: settings.clone(),
+        request_id: request_id.clone(),
+    };
+    let mut pre_search: Option<(String, Vec<search_backends::SearchItem>, String)> = None;
+    if let Some(query) = search_state.plan.fast_path_query.clone() {
+        // 快速路径：Claude Code 的固定形态搜索请求，先自己搜，省掉一次上游调用。
+        search_state.backends = load_search_backends(&state).await;
+        match websearch::search_loop::run_search(Arc::clone(&state), &search_state, &query).await {
+            Ok((items, text)) => {
+                websearch::history::rewrite_for_fast_path(&mut upstream_body, &query, &text);
+                pre_search = Some((query, items, text));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "快速路径搜索失败，回退到让模型自己调用工具：{}",
+                    truncate_error(&e)
+                );
+            }
+        }
+    }
+
     tracing::debug!(
         request_id = %request_id,
         key = %key.name,
@@ -86,7 +119,8 @@ pub async fn messages(
         candidates = plan.candidates.len(),
         est_tokens = needs.est_tokens,
         vision = needs.vision,
-        pdf = needs.pdf,
+        web_search = search_state.plan.has_tool,
+        fast_path = pre_search.is_some(),
         "开始转发"
     );
 
@@ -104,7 +138,7 @@ pub async fn messages(
         request_id: request_id.clone(),
         session_id,
         downstream_key_id: key.id,
-        body: parsed,
+        body: upstream_body,
         streaming,
         plan,
         client_anthropic_version,
@@ -112,26 +146,60 @@ pub async fn messages(
         show_thinking,
         log_template: Some(log_template.clone()),
     };
-    let outcome = forward::run(Arc::clone(&state), ctx).await;
+    let outcome = forward::run(Arc::clone(&state), ctx.clone()).await;
     let elapsed_ms = started.elapsed().as_millis() as i64;
 
     match outcome {
-        Outcome::NonStreaming { body, meta } => {
+        Outcome::NonStreaming { mut body, meta } => {
+            // 非流式路径里的 WebSearch：把模型的工具调用换成服务端工具块
+            // （不续写；非流式本来就不该承载搜索请求）。
+            if search_state.plan.has_tool {
+                if let Some(query) = first_web_search_query(&body) {
+                    if search_state.backends.is_empty() {
+                        search_state.backends = load_search_backends(&state).await;
+                    }
+                    match websearch::search_loop::run_search(
+                        Arc::clone(&state),
+                        &search_state,
+                        &query,
+                    )
+                    .await
+                    {
+                        Ok((items, _)) => {
+                            websearch::search_loop::replace_tool_use_in_message(
+                                &mut body, &query, &items,
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            request_id = %request_id,
+                            "非流式搜索失败：{}",
+                            truncate_error(&e)
+                        ),
+                    }
+                }
+            }
             write_request_log(&state, &log_template, &meta, 200, None, elapsed_ms);
             Ok(Json(body).into_response())
         }
         Outcome::Streaming { stream, meta } => {
-            // 流式请求的明细由管线在收尾/断开时写（meta.log_written）。
-            let _ = &meta;
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream; charset=utf-8")
-                .header("cache-control", "no-cache")
-                // 双保险：万一反代开了缓冲，这个头会让它别缓冲。
-                .header("x-accel-buffering", "no")
-                .body(Body::from_stream(stream))
-                .expect("构造流式响应失败");
-            Ok(response)
+            let stream = if search_state.plan.has_tool {
+                if search_state.backends.is_empty() {
+                    search_state.backends = load_search_backends(&state).await;
+                }
+                websearch::search_loop::wrap(
+                    Arc::clone(&state),
+                    ctx.clone(),
+                    search_state,
+                    stream,
+                    meta,
+                    pre_search,
+                )
+            } else {
+                stream
+            };
+            // 流式请求的明细由管线在收尾/断开时写（meta.log_written 已置位），
+            // meta 在上面按需交给搜索循环了。
+            Ok(sse_response(stream))
         }
         Outcome::Failed { error, meta } => {
             write_request_log(
@@ -145,6 +213,45 @@ pub async fn messages(
             Err(error)
         }
     }
+}
+
+fn sse_response(
+    stream: impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream; charset=utf-8")
+        .header("cache-control", "no-cache")
+        // 双保险：万一反代开了缓冲，这个头会让它别缓冲。
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .expect("构造流式响应失败")
+}
+
+async fn load_search_backends(state: &Arc<AppState>) -> Vec<search_backends::SearchBackend> {
+    state
+        .db
+        .read(search_backends::load_backends)
+        .await
+        .unwrap_or_default()
+}
+
+/// 响应里第一个 `web_search` 工具调用的查询词。
+fn first_web_search_query(value: &Value) -> Option<String> {
+    value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && b.get("name").and_then(|n| n.as_str()) == Some(websearch::TOOL_NAME)
+        })
+        .and_then(|b| {
+            b.get("input")
+                .and_then(|i| i.get("query"))
+                .and_then(|q| q.as_str())
+                .map(|q| q.to_string())
+        })
 }
 
 /// 把选择失败翻译成客户端能看懂的错误。
@@ -184,7 +291,6 @@ fn walk_content(content: Option<&Value>, vision: &mut bool, pdf: &mut bool) {
             }
         }
         Value::Object(map) => {
-            // 消息对象：看 content 字段
             if let Some(inner) = map.get("content") {
                 walk_content(Some(inner), vision, pdf);
             }
