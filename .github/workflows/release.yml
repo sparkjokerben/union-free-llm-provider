@@ -38,6 +38,15 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # 把 git tag 注入二进制（/healthz 的 version 靠它，部署流水线据此校验升级）
+      - name: 注入版本号
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          echo "${TAG#v}" > crates/ufp/version.txt
+          cat crates/ufp/version.txt
+
       # cross 用容器里的 musl 工具链编译，rusqlite 的 bundled SQLite 也能过
       - name: Install cross
         run: cargo install cross --locked

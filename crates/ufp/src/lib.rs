@@ -22,5 +22,8 @@ pub mod tokens;
 pub mod upstream;
 pub mod websearch;
 
-/// 当前版本（日志与 UA 用）。
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 当前版本（日志、UA 与 /healthz 用）。
+///
+/// 由 `build.rs` 注入：发布流水线在构建前把 git tag 写进 `crates/ufp/version.txt`，
+/// 本地开发则回退到 Cargo.toml 的版本。部署流水线靠 /healthz 的这个值判断升级成功。
+pub const VERSION: &str = env!("UFP_VERSION");

@@ -6,3 +6,4 @@ target/
 backup/
 .env
 .DS_Store
+crates/ufp/version.txt
