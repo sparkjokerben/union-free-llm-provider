@@ -1,0 +1,76 @@
+name: release
+
+# 打 tag 时自动编出两个架构的 musl 静态二进制，附到 GitHub Release。
+# 服务器上不需要装任何编译工具链（0.5G 内存也编不动），下载即可运行。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # cross 用容器里的 musl 工具链编译，rusqlite 的 bundled SQLite 也能过
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: cross build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -eu
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/ufp dist/ufp-${{ matrix.target }}
+          strip dist/ufp-${{ matrix.target }} || true
+          cd dist && sha256sum ufp-${{ matrix.target }} > ufp-${{ matrix.target }}.sha256
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ufp-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            下载与服务器架构对应的静态二进制（Alpine 上不需要任何运行时依赖）：
+
+            - x86_64 服务器：`ufp-x86_64-unknown-linux-musl`
+            - ARM 服务器（Oracle/Ampere 等）：`ufp-aarch64-unknown-linux-musl`
+
+            部署见仓库 `deploy/`：OpenRC 服务脚本、nginx 配置、安装脚本。

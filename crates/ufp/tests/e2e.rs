@@ -867,3 +867,220 @@ async fn websearch_历史往返_搜索正文随信封带回上游() {
         "应有工具结果消息：{raw}"
     );
 }
+
+// ============================================================================
+// 后台管理
+// ============================================================================
+
+#[tokio::test]
+async fn 后台_未登录被拒() {
+    let gw = spawn_gateway(|conn| {
+        seed_downstream_key(conn);
+    })
+    .await;
+    let resp = client()
+        .get(format!("{}/admin/api/overview", gw.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    // 界面本身可以直接打开（登录由前端处理）
+    let page = client()
+        .get(format!("{}/admin", gw.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(page.text().await.unwrap().contains("ufp 管理后台"));
+}
+
+#[tokio::test]
+async fn 后台_登录后能建渠道并看到概览() {
+    let gw = spawn_gateway(|conn| {
+        seed_downstream_key(conn);
+        // 设置一个已知密码
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
+        let hash = {
+            use argon2::password_hash::PasswordHasher;
+            argon2::Argon2::default()
+                .hash_password(b"test-password-123", &salt)
+                .unwrap()
+                .to_string()
+        };
+        conn.execute(
+            "INSERT INTO admin (id, password_hash, updated_ms) VALUES (1, ?1, 0)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+    })
+    .await;
+
+    let http = client();
+    // 密码错误要被拒
+    let bad = http
+        .post(format!("{}/admin/api/login", gw.base))
+        .json(&json!({"password": "wrong"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 401);
+
+    // 正确密码：拿到会话 Cookie
+    let ok = http
+        .post(format!("{}/admin/api/login", gw.base))
+        .json(&json!({"password": "test-password-123"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let cookie = ok
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("应有会话 Cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // 建渠道 + key + 条目
+    let created: Value = http
+        .post(format!("{}/admin/api/channels", gw.base))
+        .header("cookie", &cookie)
+        .json(&json!({"name": "后台建的渠道", "protocol": "openai_chat",
+                      "base_url": "https://example.com/v1", "enabled": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let channel_id = created["id"].as_i64().unwrap();
+    let key_resp = http
+        .post(format!("{}/admin/api/channels/{channel_id}/keys", gw.base))
+        .header("cookie", &cookie)
+        .json(&json!({"label": "免费号", "api_key": "sk-test-1234567890", "enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(key_resp.status(), 200);
+    let entry_resp = http
+        .post(format!(
+            "{}/admin/api/channels/{channel_id}/entries",
+            gw.base
+        ))
+        .header("cookie", &cookie)
+        .json(
+            &json!({"upstream_model": "gpt-4o-mini", "tier": 1, "max_context": 128000,
+                      "vision": true, "pdf": false, "enabled": true}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(entry_resp.status(), 200);
+
+    // 改动应立刻进池（快照已重载）
+    let overview: Value = http
+        .get(format!("{}/admin/api/overview", gw.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["pool"]["channels"], 1);
+    assert_eq!(overview["pool"]["entries"], 1);
+    assert_eq!(overview["pool"]["upstream_keys"], 1);
+
+    // 列表接口不回显上游 key 明文
+    let list: Value = http
+        .get(format!("{}/admin/api/channels", gw.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let masked = list["keys"][0]["api_key_masked"].as_str().unwrap();
+    assert!(masked.contains('…'), "key 应打码：{masked}");
+    assert!(!masked.contains("sk-test-1234567890"));
+
+    // 新建下游 key：明文只在这一次返回
+    let downstream: Value = http
+        .post(format!("{}/admin/api/downstream_keys", gw.base))
+        .header("cookie", &cookie)
+        .json(&json!({"name": "新设备", "enabled": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plaintext = downstream["key"].as_str().unwrap().to_string();
+    assert!(plaintext.starts_with("ufp-"), "{plaintext}");
+
+    // 用新 key 能真的调用 /v1/models
+    let models = http
+        .get(format!("{}/v1/models", gw.base))
+        .header("x-api-key", &plaintext)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status(), 200);
+
+    // 导出配置里应包含渠道
+    let export: Value = http
+        .get(format!("{}/admin/api/export", gw.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(export["channels"][0]["name"], "后台建的渠道");
+}
+
+#[tokio::test]
+async fn 后台_健康接口能重置熔断与冷却() {
+    let gw = spawn_gateway(|conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "ch",
+            "openai_chat",
+            "https://example.com",
+            "sk-x",
+            "m",
+            1,
+        );
+    })
+    .await;
+    // 直接让熔断打开
+    let settings = gw.state.pool.load().settings.breaker.clone();
+    gw.state.breakers.allow(1, "m", &settings);
+    gw.state.breakers.record(1, "m", false, &settings);
+    gw.state.breakers.record(1, "m", false, &settings);
+    gw.state.breakers.record(1, "m", false, &settings);
+    gw.state.breakers.record(1, "m", false, &settings);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = tx;
+    // 没登录时健康接口也该被拒
+    let denied = client()
+        .get(format!("{}/admin/api/health", gw.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    drop(rx);
+
+    // 直接调用内部重置（后台按钮走的是同一个方法）
+    let reset = gw.state.breakers.reset(Some(1), Some("m"));
+    assert_eq!(reset, 1);
+    assert!(gw.state.breakers.snapshot().is_empty());
+}

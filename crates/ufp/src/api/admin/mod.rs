@@ -1,0 +1,1738 @@
+//! 后台管理 API。
+//!
+//! - `/admin` 返回内嵌的单页界面（无前端构建步骤，`include_str!` 进二进制）；
+//! - `/admin/api/*` 是需要登录的 JSON 接口：统计、渠道/key/条目、下游 key、
+//!   熔断与冷却状态与重置、矫正规则、搜索后端、运行期设置、导入导出。
+//!
+//! 所有写操作都走 `mutate()`：写完立刻重载配置快照，改动即时生效，不需要重启。
+
+pub mod session;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
+use argon2::Argon2;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, patch, post};
+use axum::{Json, Router};
+use rusqlite::{params, Connection};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::api::error::ApiError;
+use crate::api::AppState;
+use crate::store::{save_settings, Settings, Write};
+use session::{client_ip, require_auth, session_cookie};
+
+const INDEX_HTML: &str = include_str!("ui/index.html");
+const APP_JS: &str = include_str!("ui/app.js");
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/admin", get(index))
+        .route("/admin/app.js", get(app_js))
+        .route("/admin/api/login", post(login))
+        .route("/admin/api/logout", post(logout))
+        .route("/admin/api/password", post(change_password))
+        .route("/admin/api/overview", get(overview))
+        .route("/admin/api/stats", get(stats))
+        .route("/admin/api/requests", get(requests))
+        .route("/admin/api/attempts", get(attempts))
+        .route(
+            "/admin/api/channels",
+            get(list_channels).post(create_channel),
+        )
+        .route(
+            "/admin/api/channels/{id}",
+            patch(update_channel).delete(delete_channel),
+        )
+        .route("/admin/api/channels/{id}/keys", post(create_key))
+        .route("/admin/api/keys/{id}", patch(update_key).delete(delete_key))
+        .route("/admin/api/keys/{id}/enable", post(enable_key))
+        .route("/admin/api/channels/{id}/entries", post(create_entry))
+        .route(
+            "/admin/api/entries/{id}",
+            patch(update_entry).delete(delete_entry),
+        )
+        .route(
+            "/admin/api/downstream_keys",
+            get(list_downstream_keys).post(create_downstream_key),
+        )
+        .route(
+            "/admin/api/downstream_keys/{id}",
+            patch(update_downstream_key).delete(delete_downstream_key),
+        )
+        .route("/admin/api/health", get(health))
+        .route("/admin/api/health/reset", post(reset_health))
+        .route("/admin/api/rules", get(list_rules))
+        .route(
+            "/admin/api/rules/{id}",
+            patch(update_rule).delete(delete_rule),
+        )
+        .route(
+            "/admin/api/search_backends",
+            get(list_search_backends).post(create_search_backend),
+        )
+        .route(
+            "/admin/api/search_backends/{id}",
+            patch(update_search_backend).delete(delete_search_backend),
+        )
+        .route("/admin/api/settings", get(get_settings).put(put_settings))
+        .route("/admin/api/export", get(export_config))
+        .route("/admin/api/import", post(import_config))
+}
+
+// ============================================================================
+// 静态界面
+// ============================================================================
+
+async fn index() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
+}
+
+async fn app_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        APP_JS,
+    )
+}
+
+// ============================================================================
+// 登录
+// ============================================================================
+
+#[derive(Deserialize)]
+struct LoginPayload {
+    password: String,
+}
+
+async fn login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginPayload>,
+) -> Result<Response, Response> {
+    let ip = client_ip(&headers);
+    if state.admin_sessions.too_many(&ip) {
+        return Err(session::unauthorized("登录失败次数过多，请稍后再试"));
+    }
+    let stored: Option<String> = state
+        .db
+        .admin(|conn| {
+            conn.query_row("SELECT password_hash FROM admin WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+        })
+        .await
+        .map_err(internal)?;
+    let Some(stored) = stored else {
+        return Err(session::unauthorized(
+            "还没有设置后台密码，先在服务器上运行：ufp set-admin-password",
+        ));
+    };
+    let parsed = PasswordHash::new(&stored)
+        .map_err(|e| session::unauthorized(&format!("密码哈希损坏：{e}")))?;
+    if Argon2::default()
+        .verify_password(payload.password.as_bytes(), &parsed)
+        .is_err()
+    {
+        state.admin_sessions.note_failure(&ip);
+        return Err(session::unauthorized("密码不正确"));
+    }
+    state.admin_sessions.clear_failures(&ip);
+    let ttl_hours = state.pool.load().settings.admin_session_hours.max(1);
+    let token = state
+        .admin_sessions
+        .issue(Duration::from_secs(ttl_hours * 3600));
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::SET_COOKIE,
+            session_cookie(&token, ttl_hours),
+        )],
+        Json(json!({"ok": true})),
+    )
+        .into_response())
+}
+
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(token) = session::token_from_headers(&headers) {
+        state.admin_sessions.revoke(&token);
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, session::clear_cookie())],
+        Json(json!({"ok": true})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PasswordPayload {
+    old_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<PasswordPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    if payload.new_password.len() < 8 {
+        return Err(session::unauthorized("新密码至少 8 位"));
+    }
+    let stored: Option<String> = state
+        .db
+        .admin(|conn| {
+            conn.query_row("SELECT password_hash FROM admin WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+        })
+        .await
+        .map_err(internal)?;
+    if let Some(stored) = stored {
+        let parsed = PasswordHash::new(&stored).map_err(internal)?;
+        if Argon2::default()
+            .verify_password(payload.old_password.as_bytes(), &parsed)
+            .is_err()
+        {
+            return Err(session::unauthorized("原密码不正确"));
+        }
+    }
+    let hash = hash_password(&payload.new_password).map_err(internal)?;
+    mutate(&state, move |conn| {
+        conn.execute(
+            "INSERT INTO admin (id, password_hash, updated_ms) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET password_hash = ?1, updated_ms = ?2",
+            params![hash, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| format!("哈希失败：{e}"))
+}
+
+// ============================================================================
+// 概览与统计
+// ============================================================================
+
+async fn overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let pool = state.pool.load();
+    let (channels, entries, keys, downstream) = (
+        pool.channels.len(),
+        pool.entries.len(),
+        pool.keys.values().map(|v| v.len()).sum::<usize>(),
+        pool.downstream.len(),
+    );
+    let search_backends = pool_search_backends(&state).await;
+    drop(pool);
+
+    let today_start = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|d| d.and_utc().timestamp_millis())
+        .unwrap_or(0);
+    let one_hour_ago = chrono::Utc::now().timestamp_millis() - 3600_000;
+    let summary = state
+        .db
+        .read(move |conn| {
+            let today = conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(search_requests),0),
+                        COALESCE(SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END),0),
+                        COALESCE(CAST(AVG(first_content_ms) AS INTEGER),0)
+                 FROM request_logs WHERE created_ms >= ?1",
+                params![today_start],
+                |r| {
+                    Ok(json!({
+                        "requests": r.get::<_, i64>(0)?,
+                        "input_tokens": r.get::<_, i64>(1)?,
+                        "output_tokens": r.get::<_, i64>(2)?,
+                        "cache_read_tokens": r.get::<_, i64>(3)?,
+                        "search_requests": r.get::<_, i64>(4)?,
+                        "errors": r.get::<_, i64>(5)?,
+                        "avg_first_content_ms": r.get::<_, i64>(6)?,
+                    }))
+                },
+            )?;
+            let recent_errors: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM request_logs WHERE created_ms >= ?1 AND http_status >= 400",
+                params![one_hour_ago],
+                |r| r.get(0),
+            )?;
+            Ok(json!({ "today": today, "recent_errors": recent_errors }))
+        })
+        .await
+        .map_err(internal)?;
+
+    let breakers = state.breakers.snapshot();
+    let cooldowns = state.cooldowns.snapshot();
+    Ok(Json(json!({
+        "pool": {
+            "channels": channels,
+            "entries": entries,
+            "upstream_keys": keys,
+            "downstream_keys": downstream,
+            "search_backends": search_backends,
+        },
+        "stats": summary,
+        "health": {
+            "breakers_open": breakers.iter().filter(|b| b.state != crate::health::BreakerState::Closed).count(),
+            "breakers": breakers.len(),
+            "cooldowns": cooldowns.len(),
+        },
+        "runtime": {
+            "uptime_ms": chrono::Utc::now().timestamp_millis() - state.started_ms,
+            "inflight": state.cfg.max_inflight.saturating_sub(state.inflight.available_permits()),
+            "max_inflight": state.cfg.max_inflight,
+            "dropped_writes": state.db.dropped(),
+            "version": crate::VERSION,
+        }
+    })))
+    .map(IntoResponse::into_response)
+}
+
+async fn pool_search_backends(state: &Arc<AppState>) -> usize {
+    state
+        .db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM search_backends WHERE enabled = 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .await
+        .unwrap_or(0) as usize
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    #[serde(default = "default_days")]
+    days: i64,
+}
+
+fn default_days() -> i64 {
+    7
+}
+
+async fn stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<StatsQuery>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let days = q.days.clamp(1, 90);
+    let since = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
+    let value = state
+        .db
+        .read(move |conn| {
+            // 明细 + 已汇总的按天数据合并（明细只留 30 天）
+            let mut daily = conn.prepare(
+                "SELECT day, SUM(requests), SUM(errors), SUM(input_tokens), SUM(output_tokens), SUM(search_requests) FROM (
+                    SELECT date(created_ms/1000,'unixepoch') AS day, COUNT(*) AS requests,
+                           SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END) AS errors,
+                           SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+                           SUM(search_requests) AS search_requests
+                    FROM request_logs WHERE created_ms >= ?1 GROUP BY day
+                    UNION ALL
+                    SELECT date, requests, errors, input_tokens, output_tokens, search_requests
+                    FROM daily_rollups WHERE date >= date(?1/1000,'unixepoch')
+                 ) GROUP BY day ORDER BY day",
+            )?;
+            let daily: Vec<Value> = daily
+                .query_map(params![since], |r| {
+                    Ok(json!({
+                        "date": r.get::<_, String>(0)?,
+                        "requests": r.get::<_, i64>(1)?,
+                        "errors": r.get::<_, i64>(2)?,
+                        "input_tokens": r.get::<_, i64>(3)?,
+                        "output_tokens": r.get::<_, i64>(4)?,
+                        "search_requests": r.get::<_, i64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut by_key = conn.prepare(
+                "SELECT COALESCE(d.name, '（已删除）') , l.downstream_key_id, COUNT(*),
+                        SUM(l.input_tokens), SUM(l.output_tokens),
+                        SUM(CASE WHEN l.http_status >= 400 THEN 1 ELSE 0 END)
+                 FROM request_logs l LEFT JOIN downstream_keys d ON d.id = l.downstream_key_id
+                 WHERE l.created_ms >= ?1 GROUP BY l.downstream_key_id ORDER BY COUNT(*) DESC",
+            )?;
+            let by_key: Vec<Value> = by_key
+                .query_map(params![since], |r| {
+                    Ok(json!({
+                        "name": r.get::<_, String>(0)?,
+                        "id": r.get::<_, Option<i64>>(1)?,
+                        "requests": r.get::<_, i64>(2)?,
+                        "input_tokens": r.get::<_, i64>(3)?,
+                        "output_tokens": r.get::<_, i64>(4)?,
+                        "errors": r.get::<_, i64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut by_channel = conn.prepare(
+                "SELECT COALESCE(c.name, '（已删除）'), l.channel_id, COUNT(*),
+                        SUM(l.input_tokens), SUM(l.output_tokens),
+                        SUM(CASE WHEN l.http_status >= 400 THEN 1 ELSE 0 END)
+                 FROM request_logs l LEFT JOIN channels c ON c.id = l.channel_id
+                 WHERE l.created_ms >= ?1 GROUP BY l.channel_id ORDER BY COUNT(*) DESC",
+            )?;
+            let by_channel: Vec<Value> = by_channel
+                .query_map(params![since], |r| {
+                    Ok(json!({
+                        "name": r.get::<_, String>(0)?,
+                        "id": r.get::<_, Option<i64>>(1)?,
+                        "requests": r.get::<_, i64>(2)?,
+                        "input_tokens": r.get::<_, i64>(3)?,
+                        "output_tokens": r.get::<_, i64>(4)?,
+                        "errors": r.get::<_, i64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut by_model = conn.prepare(
+                "SELECT upstream_model, COUNT(*), SUM(input_tokens), SUM(output_tokens),
+                        SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END),
+                        COALESCE(CAST(AVG(first_content_ms) AS INTEGER),0)
+                 FROM request_logs WHERE created_ms >= ?1
+                 GROUP BY upstream_model ORDER BY COUNT(*) DESC",
+            )?;
+            let by_model: Vec<Value> = by_model
+                .query_map(params![since], |r| {
+                    Ok(json!({
+                        "model": r.get::<_, String>(0)?,
+                        "requests": r.get::<_, i64>(1)?,
+                        "input_tokens": r.get::<_, i64>(2)?,
+                        "output_tokens": r.get::<_, i64>(3)?,
+                        "errors": r.get::<_, i64>(4)?,
+                        "avg_first_content_ms": r.get::<_, i64>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(json!({
+                "days": days,
+                "daily": daily,
+                "by_key": by_key,
+                "by_channel": by_channel,
+                "by_model": by_model,
+            }))
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+#[derive(Deserialize)]
+struct RequestsQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    before_id: Option<i64>,
+    only_errors: Option<bool>,
+}
+
+fn default_limit() -> i64 {
+    100
+}
+
+async fn requests(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<RequestsQuery>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let limit = q.limit.clamp(1, 500);
+    let before = q.before_id.unwrap_or(i64::MAX);
+    let only_errors = q.only_errors.unwrap_or(false);
+    let value = state
+        .db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT l.id, l.request_id, COALESCE(d.name,''), l.requested_model, l.upstream_model,
+                        COALESCE(c.name,''), COALESCE(k.label,''), l.http_status, l.stop_reason,
+                        l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
+                        l.search_requests, l.attempts, l.streaming, l.first_content_ms, l.total_ms,
+                        l.error_type, l.error_message, l.created_ms, l.session_id
+                 FROM request_logs l
+                 LEFT JOIN downstream_keys d ON d.id = l.downstream_key_id
+                 LEFT JOIN channels c ON c.id = l.channel_id
+                 LEFT JOIN upstream_keys k ON k.id = l.key_id
+                 WHERE l.id < ?1 AND (?2 = 0 OR l.http_status >= 400)
+                 ORDER BY l.id DESC LIMIT ?3",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map(params![before, only_errors as i64, limit], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "request_id": r.get::<_, String>(1)?,
+                        "key_name": r.get::<_, String>(2)?,
+                        "requested_model": r.get::<_, String>(3)?,
+                        "upstream_model": r.get::<_, String>(4)?,
+                        "channel": r.get::<_, String>(5)?,
+                        "upstream_key": r.get::<_, String>(6)?,
+                        "status": r.get::<_, i64>(7)?,
+                        "stop_reason": r.get::<_, Option<String>>(8)?,
+                        "input_tokens": r.get::<_, i64>(9)?,
+                        "output_tokens": r.get::<_, i64>(10)?,
+                        "cache_read_tokens": r.get::<_, i64>(11)?,
+                        "cache_creation_tokens": r.get::<_, i64>(12)?,
+                        "search_requests": r.get::<_, i64>(13)?,
+                        "attempts": r.get::<_, i64>(14)?,
+                        "streaming": r.get::<_, i64>(15)? != 0,
+                        "first_content_ms": r.get::<_, Option<i64>>(16)?,
+                        "total_ms": r.get::<_, i64>(17)?,
+                        "error_type": r.get::<_, Option<String>>(18)?,
+                        "error_message": r.get::<_, Option<String>>(19)?,
+                        "created_ms": r.get::<_, i64>(20)?,
+                        "session_id": r.get::<_, Option<String>>(21)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+#[derive(Deserialize)]
+struct AttemptsQuery {
+    request_id: String,
+}
+
+async fn attempts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<AttemptsQuery>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let request_id = q.request_id.clone();
+    let value = state
+        .db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.attempt_no, COALESCE(c.name,''), COALESCE(k.label,''), a.upstream_model,
+                        a.protocol, a.http_status, a.error_type, a.error_message, a.total_ms,
+                        a.committed, a.created_ms
+                 FROM attempt_logs a
+                 LEFT JOIN channels c ON c.id = a.channel_id
+                 LEFT JOIN upstream_keys k ON k.id = a.key_id
+                 WHERE a.request_id = ?1 ORDER BY a.attempt_no",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map(params![request_id], |r| {
+                    Ok(json!({
+                        "attempt_no": r.get::<_, i64>(0)?,
+                        "channel": r.get::<_, String>(1)?,
+                        "upstream_key": r.get::<_, String>(2)?,
+                        "upstream_model": r.get::<_, String>(3)?,
+                        "protocol": r.get::<_, String>(4)?,
+                        "status": r.get::<_, Option<i64>>(5)?,
+                        "error_type": r.get::<_, Option<String>>(6)?,
+                        "error_message": r.get::<_, Option<String>>(7)?,
+                        "total_ms": r.get::<_, i64>(8)?,
+                        "committed": r.get::<_, i64>(9)? != 0,
+                        "created_ms": r.get::<_, i64>(10)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+// ============================================================================
+// 渠道 / key / 条目
+// ============================================================================
+
+#[derive(Deserialize)]
+struct ChannelPayload {
+    name: String,
+    protocol: String,
+    base_url: String,
+    #[serde(default)]
+    extra_headers: HashMap<String, String>,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    notes: String,
+}
+
+#[derive(Deserialize)]
+struct KeyPayload {
+    #[serde(default)]
+    label: String,
+    api_key: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct EntryPayload {
+    upstream_model: String,
+    #[serde(default = "tier_default")]
+    tier: i32,
+    #[serde(default = "context_default")]
+    max_context: u32,
+    #[serde(default = "yes")]
+    vision: bool,
+    #[serde(default)]
+    pdf: bool,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    notes: String,
+}
+
+fn yes() -> bool {
+    true
+}
+fn tier_default() -> i32 {
+    1
+}
+fn context_default() -> u32 {
+    200_000
+}
+
+async fn list_channels(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let value = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, protocol, base_url, extra_headers, enabled, notes, created_ms
+                 FROM channels ORDER BY id",
+            )?;
+            let channels: Vec<Value> = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "protocol": r.get::<_, String>(2)?,
+                        "base_url": r.get::<_, String>(3)?,
+                        "extra_headers": serde_json::from_str::<Value>(&r.get::<_, String>(4)?)
+                            .unwrap_or(json!({})),
+                        "enabled": r.get::<_, i64>(5)? != 0,
+                        "notes": r.get::<_, String>(6)?,
+                        "created_ms": r.get::<_, i64>(7)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, channel_id, label, api_key, enabled, status, status_reason, disabled_ms
+                 FROM upstream_keys ORDER BY id",
+            )?;
+            let keys: Vec<Value> = stmt
+                .query_map([], |r| {
+                    let api_key: String = r.get(3)?;
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "channel_id": r.get::<_, i64>(1)?,
+                        "label": r.get::<_, String>(2)?,
+                        "api_key_masked": mask_key(&api_key),
+                        "enabled": r.get::<_, i64>(4)? != 0,
+                        "status": r.get::<_, String>(5)?,
+                        "status_reason": r.get::<_, String>(6)?,
+                        "disabled_ms": r.get::<_, Option<i64>>(7)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes
+                 FROM entries ORDER BY tier, channel_id, id",
+            )?;
+            let entries: Vec<Value> = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "channel_id": r.get::<_, i64>(1)?,
+                        "upstream_model": r.get::<_, String>(2)?,
+                        "tier": r.get::<_, i64>(3)?,
+                        "max_context": r.get::<_, i64>(4)?,
+                        "vision": r.get::<_, i64>(5)? != 0,
+                        "pdf": r.get::<_, i64>(6)? != 0,
+                        "enabled": r.get::<_, i64>(7)? != 0,
+                        "notes": r.get::<_, String>(8)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(json!({"channels": channels, "keys": keys, "entries": entries}))
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+/// 只显示首尾，中间打码（上游 key 明文存库，但界面不回显）。
+fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n <= 10 {
+        return "•".repeat(n.max(4));
+    }
+    let head: String = key.chars().take(6).collect();
+    let tail: String = key.chars().skip(n - 4).collect();
+    format!("{head}…{tail}")
+}
+
+async fn create_channel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<ChannelPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    if crate::store::Protocol::parse(&p.protocol).is_none() {
+        return Err(bad_request(
+            "协议只能是 openai_chat / openai_responses / gemini / anthropic",
+        ));
+    }
+    let headers_json = serde_json::to_string(&p.extra_headers).unwrap_or_else(|_| "{}".into());
+    let id = mutate(&state, move |conn| {
+        conn.execute(
+            "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                p.name,
+                p.protocol,
+                p.base_url.trim_end_matches('/'),
+                headers_json,
+                p.enabled as i64,
+                p.notes,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+    .await?;
+    Ok(Json(json!({"id": id})).into_response())
+}
+
+async fn update_channel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(p): Json<ChannelPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let headers_json = serde_json::to_string(&p.extra_headers).unwrap_or_else(|_| "{}".into());
+    mutate(&state, move |conn| {
+        conn.execute(
+            "UPDATE channels SET name = ?2, protocol = ?3, base_url = ?4,
+                    extra_headers = ?5, enabled = ?6, notes = ?7 WHERE id = ?1",
+            params![
+                id,
+                p.name,
+                p.protocol,
+                p.base_url.trim_end_matches('/'),
+                headers_json,
+                p.enabled as i64,
+                p.notes
+            ],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn delete_channel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute("DELETE FROM channels WHERE id = ?1", params![id])?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn create_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(channel_id): Path<i64>,
+    Json(p): Json<KeyPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    if p.api_key.trim().is_empty() {
+        return Err(bad_request("api_key 不能为空"));
+    }
+    let id = mutate(&state, move |conn| {
+        conn.execute(
+            "INSERT INTO upstream_keys (channel_id, label, api_key, enabled, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                channel_id,
+                p.label,
+                p.api_key.trim(),
+                p.enabled as i64,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+    .await?;
+    Ok(Json(json!({"id": id})).into_response())
+}
+
+#[derive(Deserialize)]
+struct KeyUpdate {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+async fn update_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(p): Json<KeyUpdate>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        if let Some(label) = p.label {
+            conn.execute(
+                "UPDATE upstream_keys SET label = ?2 WHERE id = ?1",
+                params![id, label],
+            )?;
+        }
+        if let Some(key) = p.api_key {
+            conn.execute(
+                "UPDATE upstream_keys SET api_key = ?2 WHERE id = ?1",
+                params![id, key.trim()],
+            )?;
+        }
+        if let Some(enabled) = p.enabled {
+            conn.execute(
+                "UPDATE upstream_keys SET enabled = ?2, status = ?3, status_reason = '' WHERE id = ?1",
+                params![id, enabled as i64, if enabled { "ok" } else { "disabled" }],
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn delete_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute("DELETE FROM upstream_keys WHERE id = ?1", params![id])?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+/// 重新启用被自动禁用的 key（后台「恢复」按钮）。
+async fn enable_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute(
+            "UPDATE upstream_keys SET enabled = 1, status = 'ok', status_reason = '', disabled_ms = NULL
+             WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn create_entry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(channel_id): Path<i64>,
+    Json(p): Json<EntryPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    if p.upstream_model.trim().is_empty() {
+        return Err(bad_request("upstream_model 不能为空"));
+    }
+    let id = mutate(&state, move |conn| {
+        conn.execute(
+            "INSERT INTO entries (channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                channel_id,
+                p.upstream_model.trim(),
+                p.tier,
+                p.max_context,
+                p.vision as i64,
+                p.pdf as i64,
+                p.enabled as i64,
+                p.notes,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+    .await?;
+    Ok(Json(json!({"id": id})).into_response())
+}
+
+async fn update_entry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(p): Json<EntryPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute(
+            "UPDATE entries SET upstream_model = ?2, tier = ?3, max_context = ?4,
+                    vision = ?5, pdf = ?6, enabled = ?7, notes = ?8 WHERE id = ?1",
+            params![
+                id,
+                p.upstream_model.trim(),
+                p.tier,
+                p.max_context,
+                p.vision as i64,
+                p.pdf as i64,
+                p.enabled as i64,
+                p.notes
+            ],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn delete_entry(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 下游 key
+// ============================================================================
+
+#[derive(Deserialize)]
+struct DownstreamPayload {
+    name: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+}
+
+async fn list_downstream_keys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let value = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, key_prefix, enabled, created_ms, last_used_ms
+                 FROM downstream_keys ORDER BY id",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "key_prefix": r.get::<_, String>(2)?,
+                        "enabled": r.get::<_, i64>(3)? != 0,
+                        "created_ms": r.get::<_, i64>(4)?,
+                        "last_used_ms": r.get::<_, Option<i64>>(5)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+async fn create_downstream_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<DownstreamPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    // 生成明文：只在这次响应里返回一次，库里只存哈希
+    let plaintext = format!("ufp-{}", random_token(32));
+    let hash = crate::api::auth::hash_key(&plaintext);
+    let prefix: String = plaintext.chars().take(12).collect();
+    let name = p.name.clone();
+    mutate(&state, move |conn| {
+        conn.execute(
+            "INSERT INTO downstream_keys (name, key_hash, key_prefix, enabled, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                name,
+                hash,
+                prefix,
+                p.enabled as i64,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"key": plaintext})).into_response())
+}
+
+fn random_token(len: usize) -> String {
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+async fn update_downstream_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(p): Json<DownstreamPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute(
+            "UPDATE downstream_keys SET name = ?2, enabled = ?3 WHERE id = ?1",
+            params![id, p.name, p.enabled as i64],
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn delete_downstream_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute("DELETE FROM downstream_keys WHERE id = ?1", params![id])?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 健康：熔断 / 冷却
+// ============================================================================
+
+async fn health(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let breakers = state
+        .breakers
+        .snapshot()
+        .into_iter()
+        .map(|b| {
+            let name = state
+                .pool
+                .load()
+                .channels
+                .get(&b.channel_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            json!({
+                "channel_id": b.channel_id,
+                "channel": name,
+                "model": b.model,
+                "state": b.state.as_str(),
+                "consecutive_failures": b.consecutive_failures,
+                "total": b.total,
+                "failed": b.failed,
+                "opened_ms": b.opened_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let cooldowns = state
+        .cooldowns
+        .snapshot()
+        .into_iter()
+        .map(|c| {
+            json!({
+                "key_id": c.key_id,
+                "model": c.model,
+                "until_ms": c.until_ms,
+                "reason": c.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"breakers": breakers, "cooldowns": cooldowns})).into_response())
+}
+
+#[derive(Deserialize)]
+struct ResetPayload {
+    #[serde(default)]
+    channel_id: Option<i64>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    key_id: Option<i64>,
+    /// true 表示连冷却一起清。
+    #[serde(default)]
+    clear_cooldowns: bool,
+}
+
+async fn reset_health(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<ResetPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let breakers = state.breakers.reset(p.channel_id, p.model.as_deref());
+    let cooldowns = if p.clear_cooldowns || p.model.is_some() || p.key_id.is_some() {
+        state
+            .cooldowns
+            .clear(&state.db, p.key_id, p.model.as_deref())
+    } else {
+        0
+    };
+    Ok(Json(json!({"breakers_reset": breakers, "cooldowns_cleared": cooldowns})).into_response())
+}
+
+// ============================================================================
+// 矫正规则
+// ============================================================================
+
+async fn list_rules(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let value = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, scope, error_fingerprint, error_sample, patch_json, source, hits,
+                        enabled, created_ms, updated_ms
+                 FROM rectify_rules ORDER BY id DESC",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "scope": r.get::<_, String>(1)?,
+                        "error_fingerprint": r.get::<_, String>(2)?,
+                        "error_sample": r.get::<_, String>(3)?,
+                        "patch_json": r.get::<_, String>(4)?,
+                        "source": r.get::<_, String>(5)?,
+                        "hits": r.get::<_, i64>(6)?,
+                        "enabled": r.get::<_, i64>(7)? != 0,
+                        "created_ms": r.get::<_, i64>(8)?,
+                        "updated_ms": r.get::<_, i64>(9)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+#[derive(Deserialize)]
+struct RuleUpdate {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    patch_json: Option<String>,
+}
+
+async fn update_rule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(p): Json<RuleUpdate>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    if let Some(patch) = &p.patch_json {
+        if serde_json::from_str::<Value>(patch).is_err() {
+            return Err(bad_request("补丁必须是合法 JSON"));
+        }
+    }
+    mutate(&state, move |conn| {
+        if let Some(enabled) = p.enabled {
+            conn.execute(
+                "UPDATE rectify_rules SET enabled = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![id, enabled as i64, chrono::Utc::now().timestamp_millis()],
+            )?;
+        }
+        if let Some(patch) = p.patch_json {
+            conn.execute(
+                "UPDATE rectify_rules SET patch_json = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![id, patch, chrono::Utc::now().timestamp_millis()],
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn delete_rule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute("DELETE FROM rectify_rules WHERE id = ?1", params![id])?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 搜索后端
+// ============================================================================
+
+#[derive(Deserialize)]
+struct SearchBackendPayload {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    notes: String,
+}
+
+async fn list_search_backends(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let value = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, api_key, base_url, enabled, cooldown_until_ms, notes
+                 FROM search_backends ORDER BY id",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map([], |r| {
+                    let key: String = r.get(3)?;
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "kind": r.get::<_, String>(2)?,
+                        "api_key_masked": mask_key(&key),
+                        "base_url": r.get::<_, String>(4)?,
+                        "enabled": r.get::<_, i64>(5)? != 0,
+                        "cooldown_until_ms": r.get::<_, Option<i64>>(6)?,
+                        "notes": r.get::<_, String>(7)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+async fn create_search_backend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<SearchBackendPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    if crate::websearch::backends::SearchKind::parse(&p.kind).is_none() {
+        return Err(bad_request(
+            "搜索后端类型只能是 tavily / exa / firecrawl / parallel / jina",
+        ));
+    }
+    let id = mutate(&state, move |conn| {
+        conn.execute(
+            "INSERT INTO search_backends (name, kind, api_key, base_url, enabled, notes, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                p.name,
+                p.kind,
+                p.api_key.trim(),
+                p.base_url.trim().trim_end_matches('/'),
+                p.enabled as i64,
+                p.notes,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+    .await?;
+    Ok(Json(json!({"id": id})).into_response())
+}
+
+async fn update_search_backend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(p): Json<SearchBackendPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        // api_key 为空表示不改（界面上不回显明文）
+        if p.api_key.trim().is_empty() {
+            conn.execute(
+                "UPDATE search_backends SET name = ?2, kind = ?3, base_url = ?4,
+                        enabled = ?5, notes = ?6 WHERE id = ?1",
+                params![
+                    id,
+                    p.name,
+                    p.kind,
+                    p.base_url.trim().trim_end_matches('/'),
+                    p.enabled as i64,
+                    p.notes
+                ],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE search_backends SET name = ?2, kind = ?3, api_key = ?4, base_url = ?5,
+                        enabled = ?6, notes = ?7, cooldown_until_ms = NULL WHERE id = ?1",
+                params![
+                    id,
+                    p.name,
+                    p.kind,
+                    p.api_key.trim(),
+                    p.base_url.trim().trim_end_matches('/'),
+                    p.enabled as i64,
+                    p.notes
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+async fn delete_search_backend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    mutate(&state, move |conn| {
+        conn.execute("DELETE FROM search_backends WHERE id = ?1", params![id])?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 运行期设置
+// ============================================================================
+
+async fn get_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let row = state
+        .db
+        .read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'runtime'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .await
+        .map_err(internal)?;
+    let value: Value = row
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::to_value(Settings::default()).unwrap_or(json!({})));
+    Ok(Json(value).into_response())
+}
+
+async fn put_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let settings: Settings =
+        serde_json::from_value(payload).map_err(|e| bad_request(&format!("设置格式不对：{e}")))?;
+    mutate(&state, move |conn| {
+        save_settings(conn, &settings)?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+// ============================================================================
+// 导入 / 导出
+// ============================================================================
+
+async fn export_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let value = state
+        .db
+        .read(|conn| export_all(conn))
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+fn export_all(conn: &Connection) -> rusqlite::Result<Value> {
+    let dump = |sql: &str, cols: &[&str]| -> rusqlite::Result<Vec<Value>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            let mut obj = serde_json::Map::new();
+            for (i, col) in cols.iter().enumerate() {
+                let v: rusqlite::types::Value = r.get(i)?;
+                obj.insert(col.to_string(), sql_value_to_json(v));
+            }
+            Ok(Value::Object(obj))
+        })?;
+        rows.collect()
+    };
+    Ok(json!({
+        "version": 1,
+        "channels": dump("SELECT id, name, protocol, base_url, extra_headers, enabled, notes FROM channels", &["id","name","protocol","base_url","extra_headers","enabled","notes"])?,
+        "upstream_keys": dump("SELECT id, channel_id, label, api_key, enabled, status, status_reason FROM upstream_keys", &["id","channel_id","label","api_key","enabled","status","status_reason"])?,
+        "entries": dump("SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes FROM entries", &["id","channel_id","upstream_model","tier","max_context","vision","pdf","enabled","notes"])?,
+        "downstream_keys": dump("SELECT id, name, key_prefix, enabled FROM downstream_keys", &["id","name","key_prefix","enabled"])?,
+        "rectify_rules": dump("SELECT id, scope, error_fingerprint, error_sample, patch_json, source, enabled FROM rectify_rules", &["id","scope","error_fingerprint","error_sample","patch_json","source","enabled"])?,
+        "search_backends": dump("SELECT id, name, kind, api_key, base_url, enabled, notes FROM search_backends", &["id","name","kind","api_key","base_url","enabled","notes"])?,
+        "settings": conn.query_row("SELECT value FROM settings WHERE key = 'runtime'", [], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!({})),
+    }))
+}
+
+fn sql_value_to_json(v: rusqlite::types::Value) -> Value {
+    match v {
+        rusqlite::types::Value::Null => Value::Null,
+        rusqlite::types::Value::Integer(i) => json!(i),
+        rusqlite::types::Value::Real(f) => json!(f),
+        rusqlite::types::Value::Text(s) => {
+            // extra_headers / patch_json 之类的字段是 JSON 字符串，直接展开更好用
+            serde_json::from_str(&s).unwrap_or(Value::String(s))
+        }
+        rusqlite::types::Value::Blob(_) => Value::Null,
+    }
+}
+
+/// 导入：按名字/模型做 upsert，不删现有数据（安全第一）。
+/// 只支持本网关自己导出的格式；下游 key 的明文不在导出里（只存哈希），
+/// 所以导入时保留原哈希，密钥继续可用。
+async fn import_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let imported = mutate(&state, move |conn| import_all(conn, &payload)).await?;
+    Ok(Json(json!({"imported": imported})).into_response())
+}
+
+fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut counts = json!({"channels": 0, "upstream_keys": 0, "entries": 0, "downstream_keys": 0, "search_backends": 0, "rectify_rules": 0});
+    let tx = conn.unchecked_transaction()?;
+
+    // 渠道：按 name 唯一
+    if let Some(channels) = payload.get("channels").and_then(|c| c.as_array()) {
+        for ch in channels {
+            let name = ch.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let headers = ch.get("extra_headers").cloned().unwrap_or(json!({}));
+            tx.execute(
+                "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(name) DO UPDATE SET protocol = ?2, base_url = ?3, extra_headers = ?4, enabled = ?5, notes = ?6",
+                params![
+                    name,
+                    ch.get("protocol").and_then(|v| v.as_str()).unwrap_or("openai_chat"),
+                    ch.get("base_url").and_then(|v| v.as_str()).unwrap_or(""),
+                    serde_json::to_string(&headers).unwrap_or_else(|_| "{}".into()),
+                    ch.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                    ch.get("notes").and_then(|v| v.as_str()).unwrap_or(""),
+                    now
+                ],
+            )?;
+            counts["channels"] = json!(counts["channels"].as_i64().unwrap_or(0) + 1);
+        }
+    }
+
+    let channel_id_by_name = |tx: &Connection, name: &str| -> rusqlite::Result<Option<i64>> {
+        tx.query_row(
+            "SELECT id FROM channels WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    };
+    let channel_name_by_id = |tx: &Connection, id: i64| -> rusqlite::Result<Option<String>> {
+        tx.query_row(
+            "SELECT name FROM channels WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    };
+
+    if let Some(rows) = payload.get("upstream_keys").and_then(|c| c.as_array()) {
+        for row in rows {
+            let channel_id = row.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(channel_name) = channel_name_by_id(&tx, channel_id)? else {
+                continue;
+            };
+            let Some(target) = channel_id_by_name(&tx, &channel_name)? else {
+                continue;
+            };
+            let api_key = row.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+            if api_key.is_empty() {
+                continue;
+            }
+            // 同一个渠道里同一把 key 只留一条
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM upstream_keys WHERE channel_id = ?1 AND api_key = ?2",
+                params![target, api_key],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                tx.execute(
+                    "INSERT INTO upstream_keys (channel_id, label, api_key, enabled, created_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        target,
+                        row.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+                        api_key,
+                        row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                        now
+                    ],
+                )?;
+                counts["upstream_keys"] = json!(counts["upstream_keys"].as_i64().unwrap_or(0) + 1);
+            }
+        }
+    }
+
+    if let Some(rows) = payload.get("entries").and_then(|c| c.as_array()) {
+        for row in rows {
+            let channel_id = row.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(channel_name) = channel_name_by_id(&tx, channel_id)? else {
+                continue;
+            };
+            let Some(target) = channel_id_by_name(&tx, &channel_name)? else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO entries (channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(channel_id, upstream_model) DO UPDATE SET tier = ?3, max_context = ?4, vision = ?5, pdf = ?6, enabled = ?7, notes = ?8",
+                params![
+                    target,
+                    row.get("upstream_model").and_then(|v| v.as_str()).unwrap_or(""),
+                    row.get("tier").and_then(|v| v.as_i64()).unwrap_or(1),
+                    row.get("max_context").and_then(|v| v.as_i64()).unwrap_or(200_000),
+                    row.get("vision").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                    row.get("pdf").and_then(|v| v.as_bool()).unwrap_or(false) as i64,
+                    row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                    row.get("notes").and_then(|v| v.as_str()).unwrap_or(""),
+                    now
+                ],
+            )?;
+            counts["entries"] = json!(counts["entries"].as_i64().unwrap_or(0) + 1);
+        }
+    }
+
+    if let Some(rows) = payload.get("search_backends").and_then(|c| c.as_array()) {
+        for row in rows {
+            let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::websearch::backends::SearchKind::parse(kind).is_none() {
+                continue;
+            }
+            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM search_backends WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                tx.execute(
+                    "INSERT INTO search_backends (name, kind, api_key, base_url, enabled, notes, created_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        name,
+                        kind,
+                        row.get("api_key").and_then(|v| v.as_str()).unwrap_or(""),
+                        row.get("base_url").and_then(|v| v.as_str()).unwrap_or(""),
+                        row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                        row.get("notes").and_then(|v| v.as_str()).unwrap_or(""),
+                        now
+                    ],
+                )?;
+                counts["search_backends"] =
+                    json!(counts["search_backends"].as_i64().unwrap_or(0) + 1);
+            }
+        }
+    }
+
+    if let Some(rows) = payload.get("rectify_rules").and_then(|c| c.as_array()) {
+        for row in rows {
+            tx.execute(
+                "INSERT INTO rectify_rules (scope, error_fingerprint, error_sample, patch_json, source, enabled, created_ms, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT(scope, error_fingerprint) DO UPDATE SET patch_json = ?4, enabled = ?6, updated_ms = ?7",
+                params![
+                    row.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
+                    row.get("error_fingerprint").and_then(|v| v.as_str()).unwrap_or(""),
+                    row.get("error_sample").and_then(|v| v.as_str()).unwrap_or(""),
+                    row.get("patch_json").and_then(|v| v.as_str()).unwrap_or("[]"),
+                    row.get("source").and_then(|v| v.as_str()).unwrap_or("import"),
+                    row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                    now
+                ],
+            )?;
+            counts["rectify_rules"] = json!(counts["rectify_rules"].as_i64().unwrap_or(0) + 1);
+        }
+    }
+
+    if let Some(settings) = payload.get("settings") {
+        if let Ok(s) = serde_json::from_value::<Settings>(settings.clone()) {
+            save_settings(&tx, &s)?;
+        }
+    }
+
+    tx.commit()?;
+    let _ = channel_id_by_name;
+    Ok(counts)
+}
+
+// ============================================================================
+// 小工具
+// ============================================================================
+
+fn internal<E: std::fmt::Display>(e: E) -> Response {
+    tracing::warn!(error = %e, "后台操作失败");
+    ApiError::api(format!("内部错误：{e}")).into_response()
+}
+
+fn bad_request(message: &str) -> Response {
+    ApiError::invalid_request(message.to_string()).into_response()
+}
+
+/// 写完库立刻重载配置快照（改动即时生效，不用重启）。
+async fn mutate<T, F>(state: &Arc<AppState>, f: F) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+{
+    let out = state.db.admin(f).await.map_err(internal)?;
+    if let Err(e) = state.pool.reload(&state.db).await {
+        tracing::warn!(error = %e, "重载配置快照失败");
+    }
+    Ok(out)
+}
+
+/// 供 `/healthz`（无鉴权）与后台共用的健康计数。
+pub fn health_summary(state: &AppState) -> Value {
+    let pool = state.pool.load();
+    json!({
+        "entries": pool.entries.len(),
+        "channels": pool.channels.len(),
+        "breakers": state.breakers.snapshot().len(),
+        "cooldowns": state.cooldowns.snapshot().len(),
+        "dropped_writes": state.db.dropped(),
+    })
+}
+
+/// 供搜索冷却等内部写入复用（避免各处直接依赖 store::Write）。
+pub fn note_search_cooldown(state: &AppState, backend_id: i64, until_ms: i64) {
+    state.db.write(Write::SearchCooldown {
+        backend_id,
+        until_ms,
+    });
+}

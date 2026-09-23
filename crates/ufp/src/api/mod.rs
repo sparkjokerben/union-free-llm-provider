@@ -36,6 +36,8 @@ pub struct AppState {
     pub cooldowns: Arc<Cooldowns>,
     /// 会话粘性映射（落库）。
     pub sessions: Arc<Sessions>,
+    /// 后台登录会话（内存，重启失效）。
+    pub admin_sessions: Arc<admin::session::Sessions>,
     pub started_ms: i64,
 }
 
@@ -66,6 +68,7 @@ impl AppState {
             breakers: Arc::new(Breakers::new()),
             cooldowns,
             sessions,
+            admin_sessions: Arc::new(admin::session::Sessions::new()),
             started_ms: chrono::Utc::now().timestamp_millis(),
         })
     }

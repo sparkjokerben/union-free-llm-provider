@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ufp 管理后台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1f232c; --line: #2a2f3a;
+    --fg: #e6e8ee; --muted: #98a0b0; --accent: #6ea8fe; --ok: #4ade80;
+    --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.6 -apple-system, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  a { color: var(--accent); }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  header .stat { color: var(--muted); font-size: 12px; }
+  nav { display: flex; gap: 6px; flex-wrap: wrap; padding: 12px 20px 0; }
+  nav button { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
+               border-radius: 999px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  nav button.active { background: var(--accent); color: #0b1020; border-color: var(--accent); font-weight: 600; }
+  main { padding: 16px 20px 60px; max-width: 1200px; }
+  section { display: none; }
+  section.active { display: block; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+  .kpi { background: var(--panel-2); border-radius: 8px; padding: 10px 12px; }
+  .kpi .v { font-size: 20px; font-weight: 600; }
+  .kpi .l { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  tr:hover td { background: rgba(255,255,255,.02); }
+  input, select, textarea { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
+                            border-radius: 6px; padding: 6px 8px; font: inherit; }
+  textarea { width: 100%; min-height: 90px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  button.primary { background: var(--accent); color: #0b1020; border: none; border-radius: 6px;
+                   padding: 7px 14px; font-weight: 600; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line);
+                 border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  button.danger { background: transparent; color: var(--err); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+         border: 1px solid var(--line); color: var(--muted); }
+  .tag.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
+  .tag.err { color: var(--err); border-color: rgba(248,113,113,.4); }
+  .tag.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 10px; padding: 18px; max-width: 640px; width: 92%; }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  .login { max-width: 360px; margin: 12vh auto; }
+  pre { background: var(--panel-2); padding: 10px; border-radius: 8px; overflow: auto; font-size: 12px; }
+  .chart { width: 100%; height: 180px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ufp 管理后台</h1>
+  <span class="stat" id="runtime"></span>
+  <span class="spacer"></span>
+  <button class="ghost" id="refresh">刷新</button>
+  <button class="ghost" id="logout">退出</button>
+</header>
+
+<div class="login card" id="login-card" hidden>
+  <h2>登录</h2>
+  <div class="row"><input type="password" id="password" placeholder="后台密码" style="flex:1"></div>
+  <div class="row"><button class="primary" id="do-login">登录</button>
+    <span class="err" id="login-error"></span></div>
+  <p class="muted">还没设置密码？在服务器上运行 <code>ufp set-admin-password</code>。</p>
+</div>
+
+<div id="app" hidden>
+  <nav id="tabs"></nav>
+  <main>
+    <section id="tab-overview"></section>
+    <section id="tab-stats"></section>
+    <section id="tab-requests"></section>
+    <section id="tab-pool"></section>
+    <section id="tab-health"></section>
+    <section id="tab-downstream"></section>
+    <section id="tab-search"></section>
+    <section id="tab-rules"></section>
+    <section id="tab-settings"></section>
+  </main>
+</div>
+
+<dialog id="dialog"><div id="dialog-body"></div></dialog>
+<script src="/admin/app.js"></script>
+</body>
+</html>
