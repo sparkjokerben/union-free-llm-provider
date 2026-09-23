@@ -1,0 +1,27 @@
+[package]
+name = "ufp-convert"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Anthropic Messages ⇄ OpenAI Chat / OpenAI Responses / Gemini protocol conversion, ported from cc-switch"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+bytes = "1"
+futures = "0.3"
+async-stream = "0.3"
+log = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+sha2 = "0.10"
+http = "1"
+regex = "1"
+flate2 = "1"
+brotli = "7"
+zstd = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
