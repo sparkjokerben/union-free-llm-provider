@@ -1,0 +1,170 @@
+name: _deploy
+
+# 可复用的部署流程（release.yml 自动调用，deploy.yml 手动调用）。
+# 做的事：按服务器架构挑二进制 → 连上服务器 → 首次安装或不断流升级 → 健康检查 + 回滚。
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "要部署的 tag（例如 v0.1.0）"
+        required: true
+        type: string
+      artifacts_from:
+        description: "local=用本次构建的产物；release=从该 tag 的 Release 下载"
+        required: false
+        type: string
+        default: release
+      dry_run:
+        description: "只探测连通性与架构，不改服务器"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_PORT:
+        required: false
+      DEPLOY_DOMAIN:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取本次构建的产物
+        if: inputs.artifacts_from == 'local'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 从 Release 下载产物
+        if: inputs.artifacts_from == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p dist
+          gh release download "${{ inputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'ufp-*' --dir dist
+          ls -lh dist
+
+      - name: 准备 SSH
+        id: ssh
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # IPv6 字面量要加方括号才能和 user@ 拼在一起
+          case "$DEPLOY_HOST" in
+            *:*) TARGET="$DEPLOY_USER@[$DEPLOY_HOST]" ;;
+            *)   TARGET="$DEPLOY_USER@$DEPLOY_HOST" ;;
+          esac
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "port=$DEPLOY_PORT" >> "$GITHUB_OUTPUT"
+
+          ssh-keyscan -p "$DEPLOY_PORT" -T 10 -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "已记录 known_hosts（TOFU；要更严格就自己填 DEPLOY_KNOWN_HOSTS）"
+
+      - name: 探测连通性与服务器架构
+        id: probe
+        env:
+          TARGET: ${{ steps.ssh.outputs.target }}
+          PORT: ${{ steps.ssh.outputs.port }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o BatchMode=yes -o ConnectTimeout=15 \
+              "$TARGET" 'uname -s -m && (grep -q "^ID=alpine" /etc/os-release && echo "os=alpine" || echo "os=other")' \
+            | tee probe.txt
+          ARCH=$(head -1 probe.txt | awk '{print $2}')
+          case "$ARCH" in
+            x86_64)  echo "target=x86_64-unknown-linux-musl"  >> "$GITHUB_OUTPUT" ;;
+            aarch64) echo "target=aarch64-unknown-linux-musl" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::不支持的服务器架构：$ARCH" >&2; exit 1 ;;
+          esac
+
+      - name: 干跑到此为止
+        if: inputs.dry_run
+        run: echo "::notice::dry_run：连通性与架构都正常，没有改动服务器"
+
+      - name: 打包待上传文件
+        if: ${{ !inputs.dry_run }}
+        env:
+          TARGET_TRIPLE: ${{ steps.probe.outputs.target }}
+        run: |
+          set -eu
+          mkdir -p upload
+          cp "dist/ufp-${TARGET_TRIPLE}" upload/ufp
+          cp deploy/openrc/ufp upload/ufp-openrc
+          cp deploy/nginx/ufp.conf upload/ufp-nginx.conf
+          cp deploy/remote-deploy.sh upload/remote-deploy.sh
+          tar czf deploy.tgz -C upload .
+          sha256sum deploy.tgz | tee deploy.tgz.sha256
+
+      - name: 上传并执行部署脚本
+        if: ${{ !inputs.dry_run }}
+        env:
+          TARGET: ${{ steps.ssh.outputs.target }}
+          PORT: ${{ steps.ssh.outputs.port }}
+          DOMAIN: ${{ secrets.DEPLOY_DOMAIN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          scp -i ~/.ssh/deploy_key -P "$PORT" -o BatchMode=yes \
+              deploy.tgz "$TARGET:/tmp/ufp-deploy.tgz"
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o BatchMode=yes "$TARGET" \
+            "set -eu
+             rm -rf /tmp/ufp-deploy && mkdir -p /tmp/ufp-deploy
+             tar xzf /tmp/ufp-deploy.tgz -C /tmp/ufp-deploy
+             chmod +x /tmp/ufp-deploy/remote-deploy.sh
+             UFP_DEPLOY_VERSION='${TAG}' UFP_DEPLOY_DOMAIN='${DOMAIN}' \
+               sh /tmp/ufp-deploy/remote-deploy.sh /tmp/ufp-deploy/ufp" \
+            | tee deploy.log
+
+      - name: 校验部署结果
+        if: ${{ !inputs.dry_run }}
+        env:
+          TARGET: ${{ steps.ssh.outputs.target }}
+          PORT: ${{ steps.ssh.outputs.port }}
+        run: |
+          set -eu
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o BatchMode=yes "$TARGET" \
+              'curl -fsS http://127.0.0.1:8787/healthz' | tee /tmp/healthz.json
+          echo
+          if grep -q '"version":"' /tmp/healthz.json; then
+            echo "::notice::网关健康检查通过：$(cat /tmp/healthz.json)"
+          fi
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## ufp 部署"
+            echo
+            echo "- tag: \`${{ inputs.tag }}\`"
+            echo "- 目标: \`${{ steps.ssh.outputs.target }}:${{ steps.ssh.outputs.port }}\`"
+            echo "- 架构: \`${{ steps.probe.outputs.target }}\`"
+            echo "- dry_run: \`${{ inputs.dry_run }}\`"
+            echo
+            echo "服务器端输出（末尾 30 行）："
+            echo '```'
+            tail -30 deploy.log 2>/dev/null || echo "(未执行部署)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

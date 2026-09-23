@@ -109,6 +109,65 @@ cargo run -p ufp -- set-admin-password
 `UFP_MAX_BODY_BYTES`、`UFP_MAX_INFLIGHT`、`UFP_DRAIN_SECONDS`、`UFP_WORKERS`、`UFP_LOG`。
 其余都在后台的「设置」里，改完立即生效。
 
+## CI/CD（GitHub Actions）
+
+三个工作流：
+
+| 工作流 | 触发 | 做什么 |
+|---|---|---|
+| `ci.yml` | push 到 main、PR | `cargo fmt --check`、`clippy -D warnings`、全量测试（含端到端），不碰任何密钥 |
+| `release.yml` | 打 tag `v*` | 编 x86_64 / aarch64 两个 musl 静态二进制 → 发布 Release → **自动部署**到服务器 |
+| `deploy.yml` | 手动 | 下发指定 tag（默认最近一次 Release）的产物；`dry_run` 只探测连通性与架构 |
+
+部署流程（`_deploy.yml` + `deploy/remote-deploy.sh`）：
+
+1. Runner 探测服务器架构（`uname -m`）挑对应二进制，打成一个 tar 上传；
+2. 服务器上**没有** `/etc/init.d/ufp` → 首次安装：建 `ufp` 用户与目录、装二进制与
+   OpenRC 服务、有域名就顺手装 nginx 配置（后台密码与证书仍需人工补一次）；
+3. **已有**服务 → 不断流升级：新二进制先靠 SO_REUSEPORT 接管监听，旧进程排空后退出
+   （CI 走 `UFP_UPGRADE_NO_WAIT=1`，不阻塞流水线）；
+4. 最后必须通过 `http://127.0.0.1:8787/healthz` 健康检查，失败自动回滚到上一版二进制。
+
+### 需要的仓库 Secrets
+
+Settings → Secrets and variables → Actions → New repository secret：
+
+| Secret | 必填 | 说明 |
+|---|---|---|
+| `DEPLOY_HOST` | ✅ | 服务器地址（IPv4 / IPv6 / 域名，填原始值，别加方括号） |
+| `DEPLOY_USER` | ✅ | SSH 用户（一般是 `root`） |
+| `DEPLOY_SSH_KEY` | ✅ | 部署用私钥的**全文**（`-----BEGIN OPENSSH PRIVATE KEY-----` 那一整段） |
+| `DEPLOY_PORT` | | SSH 端口，默认 22 |
+| `DEPLOY_DOMAIN` | | 域名；填了的话首次安装会顺手写 nginx 配置（`sed s/example.com/<域名>/`） |
+
+对应的公钥要放进服务器的 `/root/.ssh/authorized_keys`：
+
+```sh
+# 本地生成一对部署专用钥匙（已经在用的话跳过）
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_uflp_gha -C "ufp-github-actions" -N ''
+
+# 把公钥装到服务器（把 host 换成你的地址；IPv6 记得加方括号）
+ssh-copy-id -i ~/.ssh/id_ed25519_uflp_gha.pub root@[2001:db8::1]
+
+# 本机验证能免密登录后再去填 Secret
+ssh -i ~/.ssh/id_ed25519_uflp_gha root@[2001:db8::1] 'uname -m'
+```
+
+填完 Secret 后，先在 Actions 里手动跑一次 `deploy` 并勾上 **dry_run**：
+能连通、架构识别正确、服务器没被改动，再去打 tag 做真正的部署。
+
+### 打一个版本
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0     # 编译 → 发布 → 自动部署
+```
+
+回滚：服务器上 `/usr/local/bin/ufp.old` 是上一版；手动回滚
+
+```sh
+install -m 0755 /usr/local/bin/ufp.old /usr/local/bin/ufp && rc-service ufp restart
+```
+
 ## 运维
 
 ```sh

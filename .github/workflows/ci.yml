@@ -1,0 +1,36 @@
+name: ci
+
+# 每次推送到 main 或开 PR：格式、lint、全量测试。
+# 这里不碰任何密钥，PR 也安全地跑。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci
+
+      - name: 格式检查
+        run: cargo fmt --all --check
+
+      - name: Clippy（警告即失败）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（单元 + 移植 + 端到端）
+        run: cargo test --workspace

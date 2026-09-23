@@ -130,6 +130,7 @@ async fn healthz(
     let pool = state.pool.load();
     axum::Json(json!({
         "ok": true,
+        "version": crate::VERSION,
         "uptime_ms": chrono::Utc::now().timestamp_millis() - state.started_ms,
         "channels": pool.channels.len(),
         "entries": pool.entries.len(),

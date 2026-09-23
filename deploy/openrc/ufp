@@ -77,14 +77,19 @@ upgrade() {
         old_pid=$(cat "$pidfile")
         einfo "旧进程 $old_pid 开始排空"
         start-stop-daemon --stop --quiet --signal TERM --pidfile "$pidfile" || :
-        # 等它退出（最多 10 分钟），期间新进程一直在服务
-        i=0
-        while [ -d "/proc/$old_pid" ] && [ $i -lt 600 ]; do
-            sleep 1
-            i=$((i + 1))
-        done
-        if [ -d "/proc/$old_pid" ]; then
-            ewarn "旧进程仍在运行（可能有很长的流式请求），它自己会在排空超时后退出"
+        # UFP_UPGRADE_NO_WAIT=1 时不等旧进程（CI/脚本用，健康检查由调用方做）；
+        # 否则等它退出（最多 10 分钟），期间新进程一直在服务。
+        if [ "${UFP_UPGRADE_NO_WAIT:-0}" = "1" ]; then
+            einfo "按 UFP_UPGRADE_NO_WAIT 跳过等待，旧进程会在排空超时后自行退出"
+        else
+            i=0
+            while [ -d "/proc/$old_pid" ] && [ $i -lt 600 ]; do
+                sleep 1
+                i=$((i + 1))
+            done
+            if [ -d "/proc/$old_pid" ]; then
+                ewarn "旧进程仍在运行（可能有很长的流式请求），它自己会在排空超时后退出"
+            fi
         fi
     fi
 

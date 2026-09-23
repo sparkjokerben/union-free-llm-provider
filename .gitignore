@@ -1,2 +1,8 @@
 references/
 target/
+*.db
+*.db-wal
+*.db-shm
+backup/
+.env
+.DS_Store
