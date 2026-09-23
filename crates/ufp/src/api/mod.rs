@@ -64,7 +64,7 @@ impl AppState {
             ))
             .pool_max_idle_per_host(4)
             .tcp_keepalive(Duration::from_secs(60))
-            .user_agent(concat!("ufp/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("ufp/{}", crate::VERSION))
             .build()
             .expect("构造 HTTP 客户端失败");
         let inflight = Arc::new(Semaphore::new(cfg.max_inflight));

@@ -49,13 +49,13 @@ fn main() -> ExitCode {
             }
         },
         "version" | "-v" | "--version" => {
-            println!("ufp {}", env!("CARGO_PKG_VERSION"));
+            println!("ufp {}", ufp::VERSION);
             ExitCode::SUCCESS
         }
         "help" | "-h" | "--help" => {
             println!(
                 "ufp {}\n\n用法：\n  ufp serve                      启动网关（环境变量见 deploy/openrc/ufp）\n  ufp set-admin-password [密码]   设置后台登录密码，不传则从 stdin 读一行\n  ufp set-deploy-token           生成新的部署令牌（CI 用）\n  ufp version",
-                env!("CARGO_PKG_VERSION")
+                ufp::VERSION
             );
             ExitCode::SUCCESS
         }
@@ -70,7 +70,7 @@ fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::Config::from_env().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let _guard = init_logging(&cfg.log_dir, cfg.foreground);
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = ufp::VERSION,
         listen = %cfg.listen,
         db = %cfg.db_path.display(),
         "ufp 启动中"

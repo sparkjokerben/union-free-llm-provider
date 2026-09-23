@@ -16,7 +16,11 @@ fn main() {
     let version = std::fs::read_to_string("version.txt")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+'))
+        .filter(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
+        })
         .or_else(|| std::env::var("UFP_BUILD_VERSION").ok())
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into()));
     println!("cargo:rustc-env=UFP_VERSION={version}");
