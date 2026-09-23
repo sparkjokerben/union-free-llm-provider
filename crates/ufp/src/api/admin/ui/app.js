@@ -47,7 +47,15 @@ function remain(untilMs) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { credentials: 'same-origin', ...opts });
+  const init = { credentials: 'same-origin', ...opts };
+  // 带 body 就默认按 JSON 发。fetch 对字符串 body 默认发的 content-type 是 text/plain，
+  // 服务端（axum 的 Json 提取器）会直接回 415 —— 所有写操作都会挂，包括登录。
+  if (init.body != null) {
+    const h = init.headers || {};
+    const has = Object.keys(h).some((k) => k.toLowerCase() === 'content-type');
+    if (!has) init.headers = { ...h, 'content-type': 'application/json' };
+  }
+  const res = await fetch(path, init);
   if (res.status === 401) { gate('登录已过期，重新输入密码。'); throw new Error('unauthorized'); }
   const text = await res.text();
   let data = null;
