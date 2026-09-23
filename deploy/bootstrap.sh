@@ -30,10 +30,19 @@ log() { echo "[ufp-bootstrap] $*"; }
 
 fetch() {
   # $1 = url, $2 = 输出文件
+  #
+  # raw.githubusercontent.com 是 Fastly 缓存，分支引用的 TTL 有几分钟 —— 刚推上去的
+  # 脚本可能在某些边缘节点上还是旧的。加个时间戳参数换个 URL，绕开缓存。
+  case "$1" in
+    *raw.githubusercontent.com*)
+      case "$1" in *\?*) URL="$1&cb=$(date +%s)" ;; *) URL="$1?cb=$(date +%s)" ;; esac
+      ;;
+    *) URL="$1" ;;
+  esac
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 60 "$1" -o "$2"
+    curl -fsSL --max-time 60 "$URL" -o "$2"
   else
-    wget -q -O "$2" "$1"
+    wget -q -O "$2" "$URL"
   fi
 }
 
