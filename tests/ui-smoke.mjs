@@ -1,0 +1,223 @@
+// 后台界面冒烟测试：用无头 Chrome 真跑一遍管理后台。
+//
+// 为什么需要它：后台是唯一的人机界面，却曾经两次悄悄坏掉 —— 一次是旧 app.js 配新
+// 页面（整页白屏），一次是写请求没带 content-type（fetch 默认发 text/plain，
+// 服务端的 Json 提取器直接回 415，连登录都进不去）。纯 Rust 测试看不见这些，
+// 因为坏的是浏览器里的那段代码。
+//
+// 用法：
+//   cargo build -p ufp
+//   UFP_DB=/tmp/smoke.db ./target/debug/ufp set-admin-password 'ci-smoke-password'
+//   UFP_DB=/tmp/smoke.db UFP_LISTEN=127.0.0.1:8787 ./target/debug/ufp serve &
+//   node tests/ui-smoke.mjs http://127.0.0.1:8787 ci-smoke-password
+//
+// 依赖：Node 22+（用到全局 WebSocket）、本机的 Chrome / Chromium / Edge。
+// 退出码非 0 表示后台不可用，消息里会写明是哪一步坏、控制台报了什么。
+
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const BASE = process.argv[2] || 'http://127.0.0.1:8787';
+const PW = process.argv[3] || 'ci-smoke-password';
+const PORT = 9500 + Math.floor(Math.random() * 400);
+
+const CANDIDATES = [
+  process.env.CHROME,
+  'google-chrome',
+  'google-chrome-stable',
+  'chromium',
+  'chromium-browser',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+].filter(Boolean);
+
+function findBrowser() {
+  for (const c of CANDIDATES) {
+    if (c.includes('/')) { if (existsSync(c)) return c; }
+    else {
+      const p = process.env.PATH.split(':').find((dir) => existsSync(join(dir, c)));
+      if (p) return join(p, c);
+    }
+  }
+  return null;
+}
+
+const browser = findBrowser();
+if (!browser) fail(`找不到浏览器（试过：${CANDIDATES.join(', ')}）`);
+
+function fail(msg) {
+  console.error(`✗ 后台冒烟测试失败：${msg}`);
+  process.exit(1);
+}
+
+const profile = mkdtempSync(join(tmpdir(), 'ufp-smoke-'));
+const child = spawn(browser, [
+  '--headless=new',
+  `--remote-debugging-port=${PORT}`,
+  `--user-data-dir=${profile}`,
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--disable-gpu',
+  '--disable-dev-shm-usage',
+  '--no-sandbox', // CI runner 里内核可能不给用户命名空间，不加这个 Chrome 直接起不来
+  'about:blank',
+], { stdio: ['ignore', 'ignore', 'pipe'] });
+
+let browserLog = '';
+child.stderr.on('data', (d) => { browserLog += d.toString(); });
+process.on('exit', () => { try { child.kill('SIGKILL'); } catch {} });
+
+async function pageTarget() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
+      const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+      if (page) return page;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  fail(`浏览器没起来。\n${browserLog.slice(-1500)}`);
+}
+
+const target = await pageTarget();
+const ws = new WebSocket(target.webSocketDebuggerUrl);
+const pending = new Map();
+const problems = [];
+let collecting = false;
+let msgId = 0;
+
+ws.addEventListener('message', (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.id && pending.has(msg.id)) {
+    const { resolve, reject } = pending.get(msg.id);
+    pending.delete(msg.id);
+    msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
+    return;
+  }
+  if (!collecting) return;
+  if (msg.method === 'Runtime.exceptionThrown') {
+    const d = msg.params.exceptionDetails;
+    const where = d.url ? ` @ ${d.url}:${d.lineNumber + 1}` : '';
+    problems.push(`未捕获异常：${d.text}${where} ${String(d.exception?.description || '').split('\n')[0]}`);
+  } else if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
+    const text = msg.params.args.map((a) => a.value ?? a.description ?? a.type).join(' ');
+    // 登录前的未授权探测是预期噪音，不算故障
+    if (!/401|Unauthorized/.test(text)) problems.push(`console.error：${text}`);
+  } else if (msg.method === 'Page.javascriptDialogOpening') {
+    send('Page.handleJavaScriptDialog', { accept: true, promptText: '__smoke__' });
+  }
+});
+await new Promise((res, rej) => {
+  ws.addEventListener('open', res, { once: true });
+  ws.addEventListener('error', rej, { once: true });
+});
+
+const send = (method, params = {}) =>
+  new Promise((resolve, reject) => {
+    const id = ++msgId;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function evaluate(expression) {
+  const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+  if (r.exceptionDetails) {
+    fail(`页面里这段脚本抛了异常：${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`);
+  }
+  return r.result.value;
+}
+
+async function step(label, expression, ms = 1200) {
+  const ok = await evaluate(expression);
+  if (ok !== true) fail(`「${label}」没通过：${JSON.stringify(ok)}`);
+  await sleep(ms);
+  console.log(`  ✓ ${label}`);
+}
+
+await send('Runtime.enable');
+await send('Page.enable');
+await send('Network.enable');
+await send('Network.setCacheDisabled', { cacheDisabled: true });
+
+console.log(`· 浏览器：${browser}`);
+console.log(`· 目标：${BASE}/admin`);
+await send('Page.navigate', { url: `${BASE}/admin` });
+await sleep(2000);
+
+collecting = true;
+
+await step('页面加载出脚本（没有白屏）',
+  `!!document.querySelector('#rail') && !!document.querySelector('#pages') && !!document.querySelector('#do-login')`, 300);
+
+await step('登录（这一步会发 POST，缺 content-type 就会 415）',
+  `(async () => {
+     document.querySelector('#pw').value = ${JSON.stringify(PW)};
+     document.querySelector('#do-login').click();
+     await new Promise(r => setTimeout(r, 2000));
+     return document.querySelector('#gate').hidden === true;
+   })()`, 300);
+
+await step('外壳渲染：机架 + 读数带 + 九个页签',
+  `document.querySelector('#rail').innerHTML.length > 20 &&
+   document.querySelector('#readout').textContent.trim().length > 0 &&
+   document.querySelectorAll('#pages button').length === 9`, 200);
+
+const pages = await evaluate(`JSON.stringify([...document.querySelectorAll('#pages button')].map(b => b.dataset.page))`);
+for (const page of JSON.parse(pages)) {
+  await step(`页面「${page}」渲染`,
+    `(async () => {
+       document.querySelector('#pages button[data-page="${page}"]').click();
+       await new Promise(r => setTimeout(r, 1000));
+       const host = document.querySelector('#p-${page}');
+       if (!host.classList.contains('on')) return '这一页没有被激活';
+       const t = host.textContent.trim();
+       if (t.length < 20) return '内容几乎为空：' + t.slice(0, 60);
+       if (/加载失败/.test(t)) return '页面报错：' + t.slice(0, 120);
+       return true;
+     })()`, 150);
+}
+
+await step('写操作：设置项原样存回（同样走 POST/PUT）',
+  `(async () => {
+     const s = await api('/admin/api/settings');
+     await api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(s) });
+     return true;
+   })()`, 300);
+
+await step('对话框：新建渠道 → 出现在池子里',
+  `(async () => {
+     document.querySelector('#pages button[data-page="pool"]').click();
+     await new Promise(r => setTimeout(r, 800));
+     document.querySelector('button[data-newch]').click();
+     await new Promise(r => setTimeout(r, 300));
+     document.querySelector('#f-name').value = '__smoke_chan__';
+     document.querySelector('#f-proto').value = 'openai_chat';
+     document.querySelector('#f-url').value = 'http://127.0.0.1:9/v1';
+     document.querySelector('#f-save').click();
+     await new Promise(r => setTimeout(r, 1500));
+     if (!S.pool.channels.some(c => c.name === '__smoke_chan__')) return '新渠道没进池子';
+     return true;
+   })()`, 300);
+
+await step('对话框：删除渠道（自己清理干净）',
+  `(async () => {
+     const b = [...document.querySelectorAll('button[data-delchan]')]
+       .find(x => x.closest('div.sec').textContent.includes('__smoke_chan__'));
+     if (!b) return '找不到删除按钮';
+     b.click();
+     await new Promise(r => setTimeout(r, 1500));
+     if (S.pool.channels.some(c => c.name === '__smoke_chan__')) return '渠道没删掉';
+     return true;
+   })()`, 300);
+
+if (problems.length) {
+  fail('页面控制台有报错：\n  ' + problems.join('\n  '));
+}
+
+console.log('\n✓ 后台冒烟测试通过：登录、九个页面、写操作、对话框都正常，控制台无异常。');
+ws.close();
+child.kill('SIGKILL');
+process.exit(0);

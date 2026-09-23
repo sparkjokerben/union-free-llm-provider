@@ -34,3 +34,39 @@ jobs:
 
       - name: 测试（单元 + 移植 + 端到端）
         run: cargo test --workspace
+
+  # 后台界面是唯一的人机界面，却坏过两次：一次整页白屏，一次写请求缺 content-type
+  # （连登录都 415）。Rust 测试看不见浏览器里那段代码，所以这里真开一个无头浏览器
+  # 走一遍：登录 → 九个页面 → 写操作 → 对话框。
+  ui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # 脚本用了全局 WebSocket，要 Node 22+
+
+      - name: 构建
+        run: cargo build -p ufp
+
+      - name: 起一个本地实例
+        run: |
+          set -euo pipefail
+          UFP_DB="$RUNNER_TEMP/smoke.db" ./target/debug/ufp set-admin-password 'ci-smoke-password'
+          UFP_DB="$RUNNER_TEMP/smoke.db" UFP_LISTEN=127.0.0.1:8787 UFP_LOG_DIR="$RUNNER_TEMP/logs" \
+            ./target/debug/ufp serve &
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8787/healthz && break
+            sleep 1
+          done
+
+      - name: 后台冒烟（无头 Chrome）
+        run: node tests/ui-smoke.mjs http://127.0.0.1:8787 ci-smoke-password
