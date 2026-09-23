@@ -52,8 +52,7 @@ jobs:
           fi
 
       - name: 取本次构建的产物
-        if: steps.cfg.outputs.skip != 'true'
-        if: inputs.artifacts_from == 'local'
+        if: ${{ steps.cfg.outputs.skip != 'true' && inputs.artifacts_from == 'local' }}
         uses: actions/download-artifact@v4
         with:
           path: dist
