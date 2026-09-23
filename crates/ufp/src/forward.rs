@@ -487,12 +487,22 @@ async fn attempt_nonstreaming(
     resp: reqwest::Response,
     input: &AttemptInput,
 ) -> AttemptResult {
-    let body_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
+    // 非流式也要给「读完整响应体」一个上限，否则上游挂住会把请求一直吊着
+    // （客户端自己的 600s 超时会先到，但那段时间里并发名额一直被占）。
+    let body_timeout = Duration::from_millis(state.pool.load().settings.first_content_timeout_ms);
+    let body_bytes = match tokio::time::timeout(body_timeout, resp.bytes()).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
             return AttemptResult::Retryable {
                 kind: "body_read",
                 message: e.to_string(),
+                status: None,
+            }
+        }
+        Err(_) => {
+            return AttemptResult::Retryable {
+                kind: "timeout",
+                message: "读取上游响应体超时".into(),
                 status: None,
             }
         }
