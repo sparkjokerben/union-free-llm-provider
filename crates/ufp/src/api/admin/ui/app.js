@@ -1,31 +1,54 @@
-// ufp 管理后台前端：原生 JS，无构建步骤，随二进制一起发布。
+// ufp 调度台：原生 JS，无构建步骤，随二进制发布。
+//
+// 结构：共享状态（池子 / 健康）→ 机架与页签 → 每页一个 render 函数。
+// 所有写操作之后都会重新拉取池子与健康，让左边的状态灯立刻反映现实。
 'use strict';
 
-const TABS = [
+const PAGES = [
   ['overview', '概览'],
-  ['stats', '统计'],
-  ['requests', '请求日志'],
+  ['stats', '用量'],
+  ['requests', '请求'],
   ['pool', '渠道与条目'],
-  ['health', '健康与冷却'],
+  ['health', '健康'],
   ['downstream', '下游 key'],
-  ['search', '搜索后端'],
+  ['search', '搜索'],
   ['rules', '矫正规则'],
   ['settings', '设置'],
 ];
-let activeTab = 'overview';
 
-// ---------- 基础工具 ----------
+const S = {
+  page: 'overview',
+  pool: { channels: [], keys: [], entries: [] },
+  health: { breakers: [], cooldowns: [] },
+  days: 7,
+  onlyErrors: false,
+  probes: {}, // entry_id -> 最近一次测试结果
+};
+
+// ── 工具 ────────────────────────────────────────────────────────────────
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const int = (n) => (n ?? 0).toLocaleString('zh-CN');
+const ms = (n) => (n == null ? '—' : n >= 1000 ? (n / 1000).toFixed(1) + 's' : n + 'ms');
+
+function stamp(msv) {
+  if (!msv) return '—';
+  const d = new Date(msv), p = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function remain(untilMs) {
+  const left = untilMs - Date.now();
+  if (left <= 0) return '已到期';
+  if (left > 3600_000) return `${(left / 3600_000).toFixed(1)} 小时后`;
+  return `${Math.ceil(left / 60000)} 分钟后`;
+}
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { 'content-type': 'application/json' },
-    credentials: 'same-origin',
-    ...opts,
-  });
-  if (res.status === 401) {
-    showLogin('登录已过期，请重新登录');
-    throw new Error('unauthorized');
-  }
+  const res = await fetch(path, { credentials: 'same-origin', ...opts });
+  if (res.status === 401) { gate('登录已过期，重新输入密码。'); throw new Error('unauthorized'); }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
@@ -33,662 +56,758 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-const fmtInt = (n) => (n ?? 0).toLocaleString('zh-CN');
-const fmtMs = (n) => (n == null ? '—' : n > 1000 ? (n / 1000).toFixed(1) + 's' : n + 'ms');
-
-function fmtTime(ms) {
-  if (!ms) return '—';
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+function toast(msg, bad = false) {
+  const el = document.createElement('div');
+  el.className = bad ? 'bad' : '';
+  el.textContent = msg;
+  $('#toasts').append(el);
+  setTimeout(() => el.remove(), 4200);
 }
 
-function fmtUntil(ms) {
-  if (!ms) return '—';
-  const left = ms - Date.now();
-  if (left <= 0) return '已过期';
-  if (left > 3600_000) return `${(left / 3600_000).toFixed(1)} 小时后`;
-  return `${Math.ceil(left / 60000)} 分钟后`;
+function dlg(html) { $('#dlg-body').innerHTML = html; $('#dlg').showModal(); }
+const closeDlg = () => $('#dlg').close();
+
+// 状态灯：熔断 > 冷却 > 在线。skip 只用于尝试色带。
+function stateOf(entryId) {
+  const entry = S.pool.entries.find((e) => e.id === entryId);
+  if (!entry) return 'skip';
+  const ch = S.pool.channels.find((c) => c.id === entry.channel_id);
+  const breaker = S.health.breakers.find((b) => b.channel_id === entry.channel_id && b.model === entry.upstream_model);
+  if (breaker && breaker.state !== 'closed') return 'fail';
+  const keys = S.pool.keys.filter((k) => k.channel_id === entry.channel_id && k.enabled);
+  if (!ch || !ch.enabled || keys.length === 0) return 'skip';
+  const cooling = S.health.cooldowns.filter((c) => c.model === entry.upstream_model && keys.some((k) => k.id === c.key_id));
+  if (cooling.length >= keys.length) return 'hold';
+  return 'live';
 }
 
-function toast(message, kind = 'ok') {
-  const box = document.createElement('div');
-  box.className = 'card ' + kind;
-  box.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:50;margin:0;max-width:420px';
-  box.textContent = message;
-  document.body.appendChild(box);
-  setTimeout(() => box.remove(), 4000);
+// ── 登录 ────────────────────────────────────────────────────────────────
+function gate(msg) {
+  $('.shell').hidden = true;
+  $('#gate').hidden = false;
+  $('#gate-msg').textContent = msg;
+  $('#pw').focus();
 }
-
-function openDialog(html) {
-  document.getElementById('dialog-body').innerHTML = html;
-  document.getElementById('dialog').showModal();
-}
-
-// ---------- 登录 ----------
-
-function showLogin(message = '') {
-  document.getElementById('app').hidden = true;
-  document.getElementById('login-card').hidden = false;
-  document.getElementById('login-error').textContent = message;
-  document.getElementById('password').focus();
-}
-
-async function checkAuth() {
+async function boot() {
   try {
     await api('/admin/api/overview');
-    document.getElementById('login-card').hidden = true;
-    document.getElementById('app').hidden = false;
-    renderTabs();
-    await refresh();
-  } catch (e) {
-    if (e.message !== 'unauthorized') showLogin(e.message);
-  }
+    $('#gate').hidden = true;
+    $('.shell').hidden = false;
+    await reload();
+  } catch (e) { if (e.message !== 'unauthorized') gate(e.message); }
 }
-
-document.getElementById('do-login').onclick = async () => {
-  const password = document.getElementById('password').value;
+$('#do-login').onclick = async () => {
   try {
-    await api('/admin/api/login', { method: 'POST', body: JSON.stringify({ password }) });
-    document.getElementById('password').value = '';
-    await checkAuth();
-  } catch (e) {
-    document.getElementById('login-error').textContent = e.message;
-  }
+    await api('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: $('#pw').value }) });
+    $('#pw').value = '';
+    await boot();
+  } catch (e) { $('#gate-msg').textContent = e.message; }
 };
-document.getElementById('password').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') document.getElementById('do-login').click();
-});
-document.getElementById('logout').onclick = async () => {
+$('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#do-login').click(); });
+$('#logout').onclick = async () => {
   await api('/admin/api/logout', { method: 'POST' });
-  showLogin();
+  gate('已退出。');
 };
-document.getElementById('refresh').onclick = () => refresh();
+$('#refresh').onclick = () => reload();
 
-// ---------- 标签与渲染 ----------
-
-function renderTabs() {
-  const nav = document.getElementById('tabs');
-  nav.innerHTML = TABS.map(([id, label]) =>
-    `<button data-tab="${id}" class="${id === activeTab ? 'active' : ''}">${label}</button>`).join('');
-  nav.onclick = (e) => {
-    const btn = e.target.closest('button[data-tab]');
-    if (!btn) return;
-    activeTab = btn.dataset.tab;
-    renderTabs();
-    document.querySelectorAll('section').forEach((s) => s.classList.remove('active'));
-    document.getElementById('tab-' + activeTab).classList.add('active');
-    refresh();
-  };
-  document.querySelectorAll('section').forEach((s) =>
-    s.classList.toggle('active', s.id === 'tab-' + activeTab));
+// ── 共享数据与外壳 ──────────────────────────────────────────────────────
+async function reload() {
+  const [pool, health] = await Promise.all([
+    api('/admin/api/channels'),
+    api('/admin/api/health'),
+  ]);
+  S.pool = pool;
+  S.health = health;
+  renderRail();
+  renderReadout();
+  await render();
 }
 
-async function refresh() {
-  const target = document.getElementById('tab-' + activeTab);
+function renderPages() {
+  const nav = $('#pages');
+  nav.innerHTML = PAGES.map(([id, label]) =>
+    `<button data-page="${id}" ${id === S.page ? 'aria-current="page"' : ''}>${label}</button>`).join('');
+  nav.onclick = (e) => {
+    const b = e.target.closest('button[data-page]');
+    if (!b) return;
+    S.page = b.dataset.page;
+    renderPages();
+    $$('section').forEach((s) => s.classList.toggle('on', s.id === 'p-' + S.page));
+    render();
+  };
+}
+
+const PAGE_FN = {
+  overview: pOverview, stats: pStats, requests: pRequests, pool: pPool, health: pHealth,
+  downstream: pDownstream, search: pSearch, rules: pRules, settings: pSettings,
+};
+
+async function render() {
+  renderPages();
+  const host = $('#p-' + S.page);
   try {
-    if (activeTab === 'overview') await renderOverview(target);
-    if (activeTab === 'stats') await renderStats(target);
-    if (activeTab === 'requests') await renderRequests(target);
-    if (activeTab === 'pool') await renderPool(target);
-    if (activeTab === 'health') await renderHealth(target);
-    if (activeTab === 'downstream') await renderDownstream(target);
-    if (activeTab === 'search') await renderSearch(target);
-    if (activeTab === 'rules') await renderRules(target);
-    if (activeTab === 'settings') await renderSettings(target);
+    await PAGE_FN[S.page](host);
   } catch (e) {
-    if (e.message !== 'unauthorized') target.innerHTML = `<div class="card err">加载失败：${esc(e.message)}</div>`;
+    if (e.message !== 'unauthorized') {
+      host.innerHTML = `<div class="sec"><p class="note">加载失败：${esc(e.message)}</p></div>`;
+    }
   }
 }
 
-// ---------- 概览 ----------
-
-async function renderOverview(target) {
-  const d = await api('/admin/api/overview');
-  const t = d.stats.today, p = d.pool, r = d.runtime, h = d.health;
-  document.getElementById('runtime').textContent =
-    `v${r.version} · 运行 ${(r.uptime_ms / 3600000).toFixed(1)} 小时 · 在途 ${r.inflight}/${r.max_inflight}` +
-    (r.dropped_writes ? ` · 丢弃写入 ${r.dropped_writes}` : '');
-  const kpi = (label, value, cls = '') =>
-    `<div class="kpi"><div class="v ${cls}">${value}</div><div class="l">${label}</div></div>`;
-  target.innerHTML = `
-    <div class="card"><h2>今天</h2><div class="grid">
-      ${kpi('请求数', fmtInt(t.requests))}
-      ${kpi('错误数', fmtInt(t.errors), t.errors > 0 ? 'err' : '')}
-      ${kpi('输入 token', fmtInt(t.input_tokens))}
-      ${kpi('输出 token', fmtInt(t.output_tokens))}
-      ${kpi('缓存读取 token', fmtInt(t.cache_read_tokens))}
-      ${kpi('网页搜索次数', fmtInt(t.search_requests))}
-      ${kpi('平均首内容延迟', fmtMs(t.avg_first_content_ms))}
-      ${kpi('近 1 小时错误', fmtInt(d.stats.recent_errors), d.stats.recent_errors ? 'err' : '')}
-    </div></div>
-    <div class="card"><h2>池与健康</h2><div class="grid">
-      ${kpi('渠道', p.channels)}
-      ${kpi('条目（渠道×模型）', p.entries)}
-      ${kpi('上游 key', p.upstream_keys)}
-      ${kpi('下游 key', p.downstream_keys)}
-      ${kpi('搜索后端', p.search_backends)}
-      ${kpi('熔断中', `${h.breakers_open}/${h.breakers}`, h.breakers_open ? 'warn' : '')}
-      ${kpi('冷却中', h.cooldowns, h.cooldowns ? 'warn' : '')}
-    </div></div>
-    <div class="card"><h2>下一步</h2>
-      <p class="muted">还没有条目？去「渠道与条目」添加上游渠道、key 与模型条目；
-      需要 WebSearch 就去「搜索后端」加一个 Tavily/Exa key。
-      然后在 Claude Code 里设置 <code>ANTHROPIC_BASE_URL</code> 与 <code>ANTHROPIC_AUTH_TOKEN</code>（下游 key）即可。</p>
-    </div>`;
+// 左侧机架：按层列出条目，每行一盏灯 + 冷却提示
+function renderRail() {
+  const rail = $('#rail');
+  const tiers = [...new Set(S.pool.entries.map((e) => e.tier))].sort((a, b) => a - b);
+  if (tiers.length === 0) {
+    rail.innerHTML = `<h2>池子</h2><p class="note">还没有条目。先在「渠道与条目」加一个渠道与模型。</p>`;
+    return;
+  }
+  rail.innerHTML = `<h2>池子 · ${S.pool.entries.length} 个条目</h2>` + tiers.map((tier) => {
+    const list = S.pool.entries.filter((e) => e.tier === tier);
+    return `<div class="tier"><div class="tier-head">第 ${tier} 层</div>` + list.map((e) => {
+      const st = stateOf(e.id);
+      const ch = S.pool.channels.find((c) => c.id === e.channel_id);
+      const keys = S.pool.keys.filter((k) => k.channel_id === e.channel_id && k.enabled);
+      const cooling = S.health.cooldowns.filter((c) => c.model === e.upstream_model);
+      const probe = S.probes[e.id];
+      const sub = st === 'fail' ? '熔断中，等半开探测'
+        : cooling.length ? `${cooling.length}/${keys.length} 把 key 冷却 · ${remain(cooling[0].until_ms)}`
+        : `${esc(ch ? ch.name : '渠道已删')} · ${keys.length} 把 key`;
+      return `<div class="slot" title="${esc(e.upstream_model)}">
+        <span class="lamp ${st}"></span>
+        <span class="name">${esc(e.upstream_model)}</span>
+        <button class="ghost tiny" data-probe="${e.id}" title="发一次最小请求测连通性">测</button>
+        <span class="sub">${probe ? probe : sub}</span>
+      </div>`;
+    }).join('') + `</div>`;
+  }).join('');
+  rail.onclick = (e) => {
+    const b = e.target.closest('button[data-probe]');
+    if (b) { probeEntry(Number(b.dataset.probe)); return; }
+    S.page = 'pool';
+    $$('section').forEach((s) => s.classList.toggle('on', s.id === 'p-pool'));
+    render();
+  };
 }
 
-// ---------- 统计 ----------
+// 顶部读数带：一行数字，不是卡片
+function renderReadout() {
+  const cooling = S.health.cooldowns.length;
+  const open = S.health.breakers.filter((b) => b.state !== 'closed').length;
+  $('#readout').innerHTML = [
+    `<span><b>${S.pool.entries.length}</b>条目</span>`,
+    `<span><b>${S.pool.keys.filter((k) => k.enabled).length}</b>上游 key</span>`,
+    `<span style="color:${cooling ? 'var(--hold)' : 'inherit'}"><b style="color:inherit">${cooling}</b>冷却</span>`,
+    `<span style="color:${open ? 'var(--fail)' : 'inherit'}"><b style="color:inherit">${open}</b>熔断</span>`,
+  ].join('');
+}
 
-async function renderStats(target) {
-  const d = await api('/admin/api/stats?days=' + (target.dataset.days || 7));
-  const rows = d.daily;
-  const max = Math.max(1, ...rows.map((r) => r.requests));
-  const bars = rows.map((r, i) => {
-    const h = Math.round((r.requests / max) * 120);
-    const x = i * 46 + 20;
-    const errH = Math.round((r.errors / max) * 120);
-    return `<rect x="${x}" y="${140 - h}" width="26" height="${h}" fill="#6ea8fe" rx="3"></rect>
-            <rect x="${x}" y="${140 - errH}" width="26" height="${errH}" fill="#f87171" rx="3"></rect>
-            <text x="${x + 13}" y="156" fill="#98a0b0" font-size="10" text-anchor="middle">${esc(r.date.slice(5))}</text>`;
+// ── 测试上游连通性 ──────────────────────────────────────────────────────
+async function probeEntry(entryId, host) {
+  const mark = (text, cls) => {
+    S.probes[entryId] = text;
+    if (host) host.innerHTML = `<span class="probe ${cls}">${esc(text)}</span>`;
+    const railSub = $(`#rail button[data-probe="${entryId}"]`);
+    if (railSub) railSub.parentElement.querySelector('.sub').textContent = text;
+  };
+  mark('测试中…', 'run');
+  try {
+    const r = await api('/admin/api/test_connection', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ entry_id: entryId }),
+    });
+    if (r.ok) mark(`${r.latency_ms}ms · ${r.reply ? r.reply.slice(0, 40) : '（空回话）'}`, 'ok');
+    else mark(`${r.status ?? r.error_type ?? '失败'} · ${(r.error || '').slice(0, 80)}`, 'bad');
+  } catch (e) { mark('测试失败：' + e.message, 'bad'); }
+}
+
+// ── 概览 ────────────────────────────────────────────────────────────────
+async function pOverview(host) {
+  const [ov, pulse] = await Promise.all([api('/admin/api/overview'), api('/admin/api/pulse?limit=80')]);
+  const t = ov.stats.today;
+  const bars = pulse.slice().reverse().map((a) => {
+    const cls = a.committed ? 'live'
+      : a.error_type === 'rate_limit' || a.error_type === 'quota' || a.status === 429 ? 'hold'
+      : a.error_type === 'context_too_long' || a.error_type === 'rectified' ? 'skip' : 'fail';
+    const h = Math.max(14, Math.min(46, 14 + Math.log2(Math.max(2, a.ms)) * 4));
+    return `<i class="${cls}" style="height:${h}px"
+      title="${esc(stamp(a.at))} ${esc(a.channel)}/${esc(a.key)} ${esc(a.model)} · ${a.status ?? '—'} · ${ms(a.ms)}${a.error_type ? ' · ' + esc(a.error_type) : ''}"></i>`;
   }).join('');
-  const table = (title, list, nameKey) => `
-    <div class="card"><h2>${title}</h2><table><thead><tr>
-      <th>名称</th><th>请求</th><th>错误</th><th>输入 token</th><th>输出 token</th></tr></thead><tbody>
-      ${list.map((r) => `<tr><td>${esc(r[nameKey] || r.name || r.model || '—')}</td>
-        <td>${fmtInt(r.requests)}</td><td class="${r.errors ? 'err' : ''}">${fmtInt(r.errors)}</td>
-        <td>${fmtInt(r.input_tokens)}</td><td>${fmtInt(r.output_tokens)}</td></tr>`).join('')
-      || '<tr><td colspan="5" class="muted">没有数据</td></tr>'}
+  host.innerHTML = `
+    <div class="sec">
+      <h2>池子心跳</h2>
+      <p class="note">最近 80 次上游尝试。高度是耗时，颜色是结果 —— 一整排琥珀色通常意味着一层 key 的额度同时见底。</p>
+      <div class="pulse">${bars || '<span class="empty">还没有请求</span>'}</div>
+      <div class="pulse-legend">
+        <span class="k live">成功</span><span class="k hold">限流/额度</span>
+        <span class="k fail">失败</span><span class="k skip">跳过/已矫正</span>
+      </div>
+    </div>
+    <div class="sec">
+      <h2>今天</h2>
+      <p class="note">${int(t.requests)} 次请求${t.errors ? `（${int(t.errors)} 次以错误收场）` : ''}，
+        烧掉 ${int(t.input_tokens)} 输入 / ${int(t.output_tokens)} 输出 token，
+        网页搜索 ${int(t.search_requests)} 次，首内容平均 ${ms(t.avg_first_content_ms)}。</p>
+      <div class="row">
+        <button data-go="requests">看请求明细</button>
+        <button data-go="stats">看用量趋势</button>
+        <button data-go="health">看冷却与熔断</button>
+      </div>
+    </div>
+    <div class="sec">
+      <h2>运行状态</h2>
+      <table><tbody>
+        <tr><td data-k="版本">v${esc(ov.runtime.version)}</td><td class="num" data-k="已运行">${(ov.runtime.uptime_ms / 3600000).toFixed(1)} 小时</td></tr>
+        <tr><td data-k="在途请求">${ov.runtime.inflight} / ${ov.runtime.max_inflight}</td>
+            <td class="num" data-k="丢弃的用量记录">${int(ov.runtime.dropped_writes)}</td></tr>
+        <tr><td data-k="下游 key">${ov.pool.downstream_keys}</td>
+            <td class="num" data-k="搜索后端">${ov.pool.search_backends}</td></tr>
+        <tr><td data-k="部署令牌">${ov.deploy.token_set ? '已配置' : '未配置（CI 无法部署）'}</td>
+            <td class="num" data-k="部署脚本">${esc(ov.deploy.apply_script)}</td></tr>
+      </tbody></table>
+    </div>`;
+  host.onclick = (e) => {
+    const b = e.target.closest('button[data-go]');
+    if (b) { S.page = b.dataset.go; render(); }
+  };
+}
+
+// ── 用量 ────────────────────────────────────────────────────────────────
+async function pStats(host) {
+  const d = await api('/admin/api/stats?days=' + S.days);
+  const max = Math.max(1, ...d.daily.map((r) => r.requests));
+  const trend = d.daily.map((r) => {
+    const ok = r.requests - r.errors;
+    return `<div class="d" title="${esc(r.date)} · ${int(r.requests)} 次 · ${int(r.errors)} 错">
+      ${r.errors ? `<i class="err" style="height:${Math.round((r.errors / max) * 100)}%"></i>` : ''}
+      <i style="height:${Math.round((ok / max) * 100)}%"></i></div>`;
+  }).join('');
+  const x = d.daily.map((r) => `<span>${esc(r.date.slice(5))}</span>`).join('');
+  const table = (title, rows, nameKey) => `<div class="sec"><h2>${title}</h2>
+    <table><thead><tr><th>名称</th><th class="num">请求</th><th class="num">错误</th>
+      <th class="num">输入</th><th class="num">输出</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr><td data-k="${title}">${esc(r[nameKey] || r.name || r.model || '—')}</td>
+        <td class="num" data-k="请求">${int(r.requests)}</td>
+        <td class="num" data-k="错误">${r.errors ? `<span class="tag fail">${int(r.errors)}</span>` : '0'}</td>
+        <td class="num" data-k="输入 token">${int(r.input_tokens)}</td>
+        <td class="num" data-k="输出 token">${int(r.output_tokens)}</td></tr>`).join('')
+      || '<tr><td class="empty" colspan="5">这段时间没有数据</td></tr>'}
     </tbody></table></div>`;
-  target.innerHTML = `
-    <div class="card"><h2>最近 ${d.days} 天（蓝=请求，红=错误）</h2>
-      <svg class="chart" viewBox="0 0 ${Math.max(340, rows.length * 46 + 40)} 165" preserveAspectRatio="xMinYMid meet">${bars}</svg>
+  host.innerHTML = `
+    <div class="sec">
+      <h2>最近 ${d.days} 天</h2>
+      <p class="note">每根竖条是一天：下半段是正常收场的请求，上半段（红）是出错的。</p>
+      <div class="trend">${trend || '<span class="empty">没有数据</span>'}</div>
+      <div class="trend-x">${x}</div>
+      <div class="row" style="margin-top:10px">
+        ${[1, 7, 30].map((n) => `<button class="tiny ${n === S.days ? 'primary' : ''}" data-days="${n}">${n} 天</button>`).join('')}
+      </div>
     </div>
     ${table('按下游 key', d.by_key, 'name')}
     ${table('按渠道', d.by_channel, 'name')}
-    ${table('按上游模型', d.by_model, 'model')}
-    <div class="row"><button class="ghost" data-days="1">1 天</button>
-      <button class="ghost" data-days="7">7 天</button>
-      <button class="ghost" data-days="30">30 天</button></div>`;
-  target.querySelectorAll('button[data-days]').forEach((b) => {
-    b.onclick = () => { target.dataset.days = b.dataset.days; renderStats(target); };
-  });
+    ${table('按上游模型', d.by_model, 'model')}`;
+  host.onclick = (e) => {
+    const b = e.target.closest('button[data-days]');
+    if (b) { S.days = Number(b.dataset.days); pStats(host); }
+  };
 }
 
-// ---------- 请求日志 ----------
-
-async function renderRequests(target) {
-  const onlyErrors = target.dataset.onlyErrors === '1';
-  const rows = await api('/admin/api/requests?limit=100' + (onlyErrors ? '&only_errors=true' : ''));
-  target.innerHTML = `
-    <div class="card">
-      <div class="row"><label><input type="checkbox" id="only-errors" ${onlyErrors ? 'checked' : ''}> 只看错误</label>
-        <span class="muted">点任意一行看每次尝试的明细</span></div>
+// ── 请求 ────────────────────────────────────────────────────────────────
+async function pRequests(host) {
+  const rows = await api('/admin/api/requests?limit=100' + (S.onlyErrors ? '&only_errors=true' : ''));
+  host.innerHTML = `
+    <div class="sec">
+      <h2>最近请求</h2>
+      <p class="note">点任意一行看这个请求换过哪些条目、每次是什么结果。</p>
+      <div class="row"><label><input type="checkbox" id="oe" ${S.onlyErrors ? 'checked' : ''} style="width:auto"> 只看出错的</label></div>
       <table><thead><tr>
-        <th>时间</th><th>下游 key</th><th>请求模型</th><th>实际模型</th><th>渠道 / 上游 key</th>
-        <th>状态</th><th>token（入/出/缓存读）</th><th>搜索</th><th>尝试</th><th>首内容</th><th>总耗时</th><th>错误</th>
+        <th>时间</th><th>下游 key</th><th>请求的模型</th><th>实际用的</th>
+        <th>渠道 / key</th><th>结果</th><th class="num">token 入/出</th>
+        <th class="num">搜索</th><th class="num">尝试</th><th class="num">首内容</th><th class="num">总耗时</th>
       </tr></thead><tbody>
       ${rows.map((r) => `<tr data-req="${esc(r.request_id)}" style="cursor:pointer">
-        <td>${fmtTime(r.created_ms)}</td><td>${esc(r.key_name)}</td>
-        <td class="muted">${esc(r.requested_model)}</td><td>${esc(r.upstream_model)}</td>
-        <td>${esc(r.channel)}<span class="muted"> / ${esc(r.upstream_key)}</span></td>
-        <td class="${r.status >= 400 ? 'err' : 'ok'}">${r.status}${r.stop_reason ? ' · ' + esc(r.stop_reason) : ''}</td>
-        <td>${fmtInt(r.input_tokens)} / ${fmtInt(r.output_tokens)} / ${fmtInt(r.cache_read_tokens)}</td>
-        <td>${r.search_requests || ''}</td><td>${r.attempts}</td>
-        <td>${fmtMs(r.first_content_ms)}</td><td>${fmtMs(r.total_ms)}</td>
-        <td class="err">${r.error_type ? esc(r.error_type) : ''}</td></tr>`).join('')
-      || '<tr><td colspan="12" class="muted">还没有请求</td></tr>'}
+        <td data-k="时间">${stamp(r.created_ms)}</td>
+        <td data-k="下游 key">${esc(r.key_name)}</td>
+        <td data-k="请求的模型" class="note" style="margin:0">${esc(r.requested_model)}</td>
+        <td data-k="实际用的">${esc(r.upstream_model)}</td>
+        <td data-k="渠道 / key">${esc(r.channel)}<span class="note"> / ${esc(r.upstream_key)}</span></td>
+        <td data-k="结果">${r.status >= 400
+          ? `<span class="tag fail">${r.status}</span>`
+          : `<span class="tag live">${r.status}</span>`}${r.stop_reason ? ` ${esc(r.stop_reason)}` : ''}</td>
+        <td class="num" data-k="token 入/出">${int(r.input_tokens)} / ${int(r.output_tokens)}</td>
+        <td class="num" data-k="搜索">${r.search_requests || ''}</td>
+        <td class="num" data-k="尝试">${r.attempts}</td>
+        <td class="num" data-k="首内容">${ms(r.first_content_ms)}</td>
+        <td class="num" data-k="总耗时">${ms(r.total_ms)}${r.error_type ? ` <span class="tag fail">${esc(r.error_type)}</span>` : ''}</td>
+      </tr>`).join('') || '<tr><td class="empty" colspan="11">没有请求</td></tr>'}
       </tbody></table>
     </div>`;
-  const cb = target.querySelector('#only-errors');
-  cb.onchange = () => { target.dataset.onlyErrors = cb.checked ? '1' : '0'; renderRequests(target); };
-  target.querySelectorAll('tr[data-req]').forEach((tr) => {
+  $('#oe').onchange = (e) => { S.onlyErrors = e.target.checked; pRequests(host); };
+  $$('tr[data-req]', host).forEach((tr) => {
     tr.onclick = async () => {
-      const attempts = await api('/admin/api/attempts?request_id=' + encodeURIComponent(tr.dataset.req));
-      openDialog(`<h2>请求 ${esc(tr.dataset.req)} 的尝试明细</h2>
-        <table><thead><tr><th>#</th><th>渠道</th><th>key</th><th>模型</th><th>协议</th><th>状态</th>
-        <th>耗时</th><th>提交</th><th>错误</th></tr></thead><tbody>
-        ${attempts.map((a) => `<tr><td>${a.attempt_no}</td><td>${esc(a.channel)}</td><td>${esc(a.upstream_key)}</td>
-          <td>${esc(a.upstream_model)}</td><td>${esc(a.protocol)}</td>
-          <td class="${a.status >= 400 ? 'err' : ''}">${a.status ?? '—'}</td><td>${fmtMs(a.total_ms)}</td>
-          <td>${a.committed ? '是' : ''}</td><td class="err">${esc(a.error_type || '')}
-          <div class="muted">${esc(a.error_message || '')}</div></td></tr>`).join('')}
+      const list = await api('/admin/api/attempts?request_id=' + encodeURIComponent(tr.dataset.req));
+      dlg(`<h2>这个请求换过的条目</h2>
+        <table><thead><tr><th class="num">#</th><th>渠道</th><th>key</th><th>模型</th><th>协议</th>
+        <th class="num">状态</th><th class="num">耗时</th><th>提交给了客户端</th><th>问题</th></tr></thead><tbody>
+        ${list.map((a) => `<tr><td class="num">${a.attempt_no}</td><td>${esc(a.channel)}</td>
+          <td>${esc(a.upstream_key)}</td><td>${esc(a.upstream_model)}</td><td>${esc(a.protocol)}</td>
+          <td class="num">${a.status >= 400 ? `<span class="tag fail">${a.status}</span>` : (a.status ?? '—')}</td>
+          <td class="num">${ms(a.total_ms)}</td><td>${a.committed ? '是' : ''}</td>
+          <td>${a.error_type ? `<span class="tag fail">${esc(a.error_type)}</span>` : ''}
+            <div class="note" style="margin:0">${esc(a.error_message || '')}</div></td></tr>`).join('')}
         </tbody></table>
-        <div class="row"><button class="primary" onclick="document.getElementById('dialog').close()">关闭</button></div>`);
+        <div class="row" style="margin-top:14px"><button class="primary" onclick="document.getElementById('dlg').close()">关闭</button></div>`);
     };
   });
 }
 
-// ---------- 渠道与条目 ----------
-
-async function renderPool(target) {
-  const d = await api('/admin/api/channels');
-  const keyRow = (k) => `<tr>
-    <td>${esc(k.label) || '—'}</td>
-    <td class="muted">${esc(k.api_key_masked)}</td>
-    <td>${k.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag err">停用</span>'}</td>
-    <td>${k.status === 'disabled' ? `<span class="err">${esc(k.status_reason || '被上游拒绝')}</span>` : ''}</td>
-    <td>
-      <button class="ghost" data-key-edit="${k.id}" data-label="${esc(k.label)}" data-enabled="${k.enabled}">改</button>
-      ${k.status === 'disabled' ? `<button class="ghost" data-key-enable="${k.id}">恢复</button>` : ''}
-      <button class="danger" data-key-del="${k.id}">删</button>
-    </td></tr>`;
-  const entryRow = (e) => `<tr>
-    <td>${esc(e.upstream_model)}</td><td>${e.tier}</td>
-    <td>${fmtInt(e.max_context)}</td>
-    <td>${e.vision ? '是' : '否'}${e.pdf ? ' / PDF' : ''}</td>
-    <td>${e.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag">停用</span>'}</td>
-    <td><button class="ghost" data-entry-del="${e.id}">删</button></td></tr>`;
-  target.innerHTML = `
-    <div class="card">
-      <div class="row"><button class="primary" id="add-channel">新增渠道</button>
-        <span class="muted">条目 = 渠道 × 上游模型；同一渠道的所有 key 共享这些条目</span></div>
+// ── 渠道与条目 ──────────────────────────────────────────────────────────
+async function pPool(host) {
+  const chans = S.pool.channels;
+  host.innerHTML = `
+    <div class="sec">
+      <h2>渠道与条目</h2>
+      <p class="note">条目 = 渠道 × 上游模型。同一渠道下的所有 key 共享这些条目；层级数字越小越优先，
+        只有整层不可用才会降级。每行右侧的「测」会拿真实配置发一次最小请求。</p>
+      <div class="row"><button class="primary" data-newch>新增渠道</button>
+        <button data-go="search">搜索后端</button></div>
     </div>
-    ${d.channels.map((c) => {
-      const keys = d.keys.filter((k) => k.channel_id === c.id);
-      const entries = d.entries.filter((e) => e.channel_id === c.id);
-      return `<div class="card">
+    ${chans.map((c) => {
+      const keys = S.pool.keys.filter((k) => k.channel_id === c.id);
+      const entries = S.pool.entries.filter((e) => e.channel_id === c.id);
+      return `<div class="sec">
         <h2>${esc(c.name)} <span class="tag">${esc(c.protocol)}</span>
-          ${c.enabled ? '' : '<span class="tag err">已停用</span>'}</h2>
-        <div class="muted">${esc(c.base_url)}${c.notes ? ' · ' + esc(c.notes) : ''}</div>
-        <div class="row" style="margin-top:8px">
-          <button class="ghost" data-add-key="${c.id}">加 key</button>
-          <button class="ghost" data-add-entry="${c.id}">加条目</button>
-          <button class="ghost" data-edit-channel="${c.id}">改渠道</button>
-          <button class="danger" data-del-channel="${c.id}">删渠道</button>
+          ${c.enabled ? '' : '<span class="tag fail">已停用</span>'}</h2>
+        <p class="note">${esc(c.base_url)}${c.notes ? ' — ' + esc(c.notes) : ''}</p>
+        <div class="row">
+          <button class="tiny" data-newkey="${c.id}">加 key</button>
+          <button class="tiny" data-newentry="${c.id}">加条目</button>
+          <button class="tiny" data-editchan="${c.id}">改渠道</button>
+          <button class="tiny" data-testchan="${c.id}">测试该渠道全部条目</button>
+          <button class="tiny danger" data-delchan="${c.id}">删除渠道</button>
         </div>
-        <table><thead><tr><th>key 备注</th><th>密钥</th><th>状态</th><th>说明</th><th></th></tr></thead>
-          <tbody>${keys.map(keyRow).join('') || '<tr><td colspan="5" class="muted">还没有 key</td></tr>'}</tbody></table>
-        <table style="margin-top:8px"><thead><tr><th>条目</th><th>层级</th><th>上下文</th><th>多模态</th><th>状态</th><th></th></tr></thead>
-          <tbody>${entries.map(entryRow).join('') || '<tr><td colspan="6" class="muted">还没有条目</td></tr>'}</tbody></table>
+        <table><thead><tr><th>key</th><th>密钥</th><th>状态</th><th>说明</th><th></th></tr></thead><tbody>
+        ${keys.map((k) => `<tr>
+          <td data-k="key">${esc(k.label) || '（未命名）'}</td>
+          <td data-k="密钥" class="mono">${esc(k.api_key_masked)}</td>
+          <td data-k="状态">${k.status === 'disabled'
+            ? '<span class="tag fail">被上游拒绝</span>'
+            : (k.enabled ? '<span class="tag live">启用</span>' : '<span class="tag">停用</span>')}</td>
+          <td data-k="说明">${esc(k.status_reason || '')}</td>
+          <td><button class="tiny ghost" data-editkey="${k.id}">改</button>
+            ${k.status === 'disabled' ? `<button class="tiny" data-enablekey="${k.id}">恢复</button>` : ''}
+            <button class="tiny danger" data-delkey="${k.id}">删</button></td></tr>`).join('')
+          || '<tr><td class="empty" colspan="5">还没有 key，这个渠道不会被选中</td></tr>'}
+        </tbody></table>
+        <table style="margin-top:10px"><thead><tr><th>上游模型</th><th class="num">层级</th>
+          <th class="num">上下文</th><th>图片/PDF</th><th>状态</th><th>连通性</th><th></th></tr></thead><tbody>
+        ${entries.map((e) => `<tr>
+          <td data-k="上游模型">${esc(e.upstream_model)}</td>
+          <td class="num" data-k="层级">${e.tier}</td>
+          <td class="num" data-k="上下文">${int(e.max_context)}</td>
+          <td data-k="图片/PDF">${e.vision ? '图片' : '纯文本'}${e.pdf ? ' + PDF' : ''}</td>
+          <td data-k="状态">${e.enabled ? '<span class="tag live">启用</span>' : '<span class="tag">停用</span>'}</td>
+          <td data-k="连通性"><span class="probe ${S.probes[e.id] && !S.probes[e.id].includes('ms') ? 'bad' : ''}">${esc(S.probes[e.id] || '')}</span></td>
+          <td><button class="tiny" data-probe="${e.id}">测</button>
+            <button class="tiny danger" data-delentry="${e.id}">删</button></td></tr>`).join('')
+          || '<tr><td class="empty" colspan="7">还没有条目，池子是空的</td></tr>'}
+        </tbody></table>
       </div>`;
-    }).join('') || '<div class="card muted">还没有渠道</div>'}`;
+    }).join('') || '<div class="sec"><p class="note">还没有渠道。点上面的「新增渠道」开始。</p></div>'}`;
 
-  const byId = (id) => d.channels.find((c) => c.id === Number(id));
-  target.querySelector('#add-channel').onclick = () => channelForm();
-  target.querySelectorAll('[data-add-key]').forEach((b) => b.onclick = () => keyForm(Number(b.dataset.addKey)));
-  target.querySelectorAll('[data-add-entry]').forEach((b) => b.onclick = () => entryForm(Number(b.dataset.addEntry)));
-  target.querySelectorAll('[data-edit-channel]').forEach((b) => b.onclick = () => channelForm(byId(b.dataset.editChannel)));
-  target.querySelectorAll('[data-del-channel]').forEach((b) => b.onclick = async () => {
-    if (!confirm('删除渠道会同时删掉它的 key、条目与冷却记录，确定？')) return;
-    await api('/admin/api/channels/' + b.dataset.delChannel, { method: 'DELETE' });
-    toast('已删除'); refresh();
-  });
-  target.querySelectorAll('[data-key-edit]').forEach((b) => b.onclick = async () => {
-    const label = prompt('key 备注：', b.dataset.label);
-    if (label === null) return;
-    const enabled = confirm('这个 key 现在要启用吗？（取消 = 停用）');
-    await api('/admin/api/keys/' + b.dataset.keyEdit, {
-      method: 'PATCH', body: JSON.stringify({ label, enabled }),
-    });
-    toast('已保存'); refresh();
-  });
-  target.querySelectorAll('[data-key-enable]').forEach((b) => b.onclick = async () => {
-    await api(`/admin/api/keys/${b.dataset.keyEnable}/enable`, { method: 'POST' });
-    toast('已恢复，请确认这把 key 确实可用'); refresh();
-  });
-  target.querySelectorAll('[data-key-del]').forEach((b) => b.onclick = async () => {
-    if (!confirm('删除这把上游 key？')) return;
-    await api('/admin/api/keys/' + b.dataset.keyDel, { method: 'DELETE' });
-    toast('已删除'); refresh();
-  });
-  target.querySelectorAll('[data-entry-del]').forEach((b) => b.onclick = async () => {
-    if (!confirm('删除这个条目？')) return;
-    await api('/admin/api/entries/' + b.dataset.entryDel, { method: 'DELETE' });
-    toast('已删除'); refresh();
-  });
+  host.onclick = async (e) => {
+    const g = (attr) => e.target.closest(`button[data-${attr}]`);
+    if (g('newch')) return channelForm(null);
+    if (g('go')) { S.page = g('go').dataset.go; return render(); }
+    const cid = (attr) => Number(g(attr).dataset[attr]);
+    if (g('newkey')) return keyForm(cid('newkey'));
+    if (g('newentry')) return entryForm(cid('newentry'));
+    if (g('editchan')) return channelForm(chans.find((c) => c.id === cid('editchan')));
+    if (g('testchan')) {
+      for (const en of S.pool.entries.filter((x) => x.channel_id === cid('testchan'))) await probeEntry(en.id);
+      return;
+    }
+    if (g('delchan')) {
+      if (!confirm('删除渠道会连它的 key、条目与冷却记录一起删掉，确定？')) return;
+      await api('/admin/api/channels/' + cid('delchan'), { method: 'DELETE' });
+      toast('渠道已删除'); return reload();
+    }
+    if (g('probe')) return probeEntry(cid('probe'));
+    if (g('delkey')) {
+      if (!confirm('删除这把上游 key？')) return;
+      await api('/admin/api/keys/' + cid('delkey'), { method: 'DELETE' });
+      toast('key 已删除'); return reload();
+    }
+    if (g('enablekey')) {
+      await api(`/admin/api/keys/${cid('enablekey')}/enable`, { method: 'POST' });
+      toast('已恢复。如果它真的失效，下一轮 401 会再把它停掉'); return reload();
+    }
+    if (g('editkey')) {
+      const k = S.pool.keys.find((x) => x.id === cid('editkey'));
+      const label = prompt('key 的备注：', k.label);
+      if (label === null) return;
+      const enabled = confirm('这个 key 要启用吗？（取消 = 停用）');
+      await api('/admin/api/keys/' + k.id, { method: 'PATCH', body: JSON.stringify({ label, enabled }) });
+      toast('已保存'); return reload();
+    }
+    if (g('delentry')) {
+      if (!confirm('删除这个条目？')) return;
+      await api('/admin/api/entries/' + cid('delentry'), { method: 'DELETE' });
+      toast('条目已删除'); return reload();
+    }
+  };
 }
 
-function channelForm(channel) {
-  const c = channel || { name: '', protocol: 'openai_chat', base_url: '', extra_headers: {}, enabled: true, notes: '' };
-  openDialog(`<h2>${channel ? '修改' : '新增'}渠道</h2>
-    <div class="row"><input id="f-name" placeholder="渠道名（如 gemini-free）" value="${esc(c.name)}" style="flex:1"></div>
-    <div class="row"><select id="f-proto">
-      ${['openai_chat', 'openai_responses', 'gemini', 'anthropic'].map((p) =>
-        `<option value="${p}" ${p === c.protocol ? 'selected' : ''}>${p}</option>`).join('')}
-    </select></div>
-    <div class="row"><input id="f-url" placeholder="base_url（粘到 /v1 或完整端点都行）" value="${esc(c.base_url)}" style="flex:1"></div>
-    <div class="row"><input id="f-headers" placeholder='附加请求头 JSON，如 {"x-foo":"bar"}' value="${esc(JSON.stringify(c.extra_headers || {}))}" style="flex:1"></div>
-    <div class="row"><input id="f-notes" placeholder="备注" value="${esc(c.notes)}" style="flex:1"></div>
-    <div class="row"><label><input type="checkbox" id="f-enabled" ${c.enabled ? 'checked' : ''}> 启用</label></div>
+function channelForm(c) {
+  const cur = c || { name: '', protocol: 'openai_chat', base_url: '', extra_headers: {}, enabled: true, notes: '' };
+  dlg(`<h2>${c ? '修改渠道' : '新增渠道'}</h2>
+    <label class="f"><span>名字</span><input id="f-name" value="${esc(cur.name)}" placeholder="比如 gemini-free"></label>
+    <div class="grid2">
+      <label class="f"><span>协议</span><select id="f-proto">
+        ${['openai_chat', 'openai_responses', 'gemini', 'anthropic'].map((p) =>
+          `<option value="${p}" ${p === cur.protocol ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
+      <label class="f"><span>base_url（粘到 /v1 或完整端点都行）</span>
+        <input id="f-url" value="${esc(cur.base_url)}" placeholder="https://api.example.com/v1"></label>
+    </div>
+    <label class="f"><span>附加请求头（JSON，可留空）</span>
+      <textarea id="f-headers" style="min-height:70px">${esc(JSON.stringify(cur.extra_headers || {}, null, 2))}</textarea></label>
+    <label class="f"><span>备注</span><input id="f-notes" value="${esc(cur.notes || '')}"></label>
+    <label class="f"><span><input type="checkbox" id="f-enabled" ${cur.enabled ? 'checked' : ''} style="width:auto"> 启用</span></label>
     <div class="row"><button class="primary" id="f-save">保存</button>
-      <button class="ghost" onclick="document.getElementById('dialog').close()">取消</button></div>`);
-  document.getElementById('f-save').onclick = async () => {
+      <button class="ghost" onclick="document.getElementById('dlg').close()">取消</button></div>`);
+  $('#f-save').onclick = async () => {
     let extra_headers = {};
-    try { extra_headers = JSON.parse(document.getElementById('f-headers').value || '{}'); } catch { return toast('附加头不是合法 JSON', 'err'); }
+    try { extra_headers = JSON.parse($('#f-headers').value || '{}'); }
+    catch { return toast('附加请求头不是合法 JSON', true); }
     const payload = {
-      name: document.getElementById('f-name').value.trim(),
-      protocol: document.getElementById('f-proto').value,
-      base_url: document.getElementById('f-url').value.trim(),
-      extra_headers,
-      enabled: document.getElementById('f-enabled').checked,
-      notes: document.getElementById('f-notes').value.trim(),
+      name: $('#f-name').value.trim(), protocol: $('#f-proto').value,
+      base_url: $('#f-url').value.trim(), extra_headers,
+      enabled: $('#f-enabled').checked, notes: $('#f-notes').value.trim(),
     };
-    if (!payload.name || !payload.base_url) return toast('名字和 base_url 必填', 'err');
+    if (!payload.name || !payload.base_url) return toast('名字和 base_url 必填', true);
     try {
-      if (channel) await api('/admin/api/channels/' + channel.id, { method: 'PATCH', body: JSON.stringify(payload) });
+      if (c) await api('/admin/api/channels/' + c.id, { method: 'PATCH', body: JSON.stringify(payload) });
       else await api('/admin/api/channels', { method: 'POST', body: JSON.stringify(payload) });
-      document.getElementById('dialog').close();
-      toast('已保存，立即生效'); refresh();
-    } catch (e) { toast(e.message, 'err'); }
+      closeDlg(); toast('已保存，立刻生效'); reload();
+    } catch (err) { toast(err.message, true); }
   };
 }
 
 function keyForm(channelId) {
-  openDialog(`<h2>新增上游 key</h2>
-    <div class="row"><input id="f-label" placeholder="备注（如 免费号 1）" style="flex:1"></div>
-    <div class="row"><input id="f-key" placeholder="api key" style="flex:1"></div>
-    <p class="muted">同一渠道可以放多把 key：额度是每把 key 各算一份，429 冷却也只针对单把 key。</p>
+  dlg(`<h2>加一把上游 key</h2>
+    <label class="f"><span>备注</span><input id="f-label" placeholder="比如 免费号 1"></label>
+    <label class="f"><span>api key</span><input id="f-key" placeholder="粘贴 key"></label>
+    <p class="note">同一渠道可以放多把 key：额度按每把各算一份，被限流时只冷却那一把，不影响同渠道的其他 key。</p>
     <div class="row"><button class="primary" id="f-save">保存</button>
-      <button class="ghost" onclick="document.getElementById('dialog').close()">取消</button></div>`);
-  document.getElementById('f-save').onclick = async () => {
-    const payload = {
-      label: document.getElementById('f-label').value.trim(),
-      api_key: document.getElementById('f-key').value.trim(),
-      enabled: true,
-    };
+      <button class="ghost" onclick="document.getElementById('dlg').close()">取消</button></div>`);
+  $('#f-save').onclick = async () => {
     try {
-      await api(`/admin/api/channels/${channelId}/keys`, { method: 'POST', body: JSON.stringify(payload) });
-      document.getElementById('dialog').close();
-      toast('已添加'); refresh();
-    } catch (e) { toast(e.message, 'err'); }
+      await api(`/admin/api/channels/${channelId}/keys`, {
+        method: 'POST',
+        body: JSON.stringify({ label: $('#f-label').value.trim(), api_key: $('#f-key').value.trim(), enabled: true }),
+      });
+      closeDlg(); toast('已添加'); reload();
+    } catch (e) { toast(e.message, true); }
   };
 }
 
 function entryForm(channelId) {
-  openDialog(`<h2>新增条目（渠道 × 上游模型）</h2>
-    <div class="row"><input id="f-model" placeholder="上游模型名（如 gemini-2.5-flash）" style="flex:1"></div>
-    <div class="row"><label>层级 <input id="f-tier" type="number" value="1" style="width:80px"></label>
-      <span class="muted">数字越小越优先；整层不可用才会降级</span></div>
-    <div class="row"><label>上下文窗口 <input id="f-ctx" type="number" value="200000" style="width:120px"></label>
-      <span class="muted">按 token 估算，放不下的请求会跳过这个条目</span></div>
-    <div class="row"><label><input type="checkbox" id="f-vision" checked> 支持图片</label>
-      <label><input type="checkbox" id="f-pdf"> 支持 PDF</label></div>
-    <div class="row"><input id="f-notes" placeholder="备注" style="flex:1"></div>
+  dlg(`<h2>加一个条目</h2>
+    <label class="f"><span>上游模型名</span><input id="f-model" placeholder="比如 gemini-2.5-flash"></label>
+    <div class="grid2">
+      <label class="f"><span>层级（越小越优先）</span><input id="f-tier" type="number" value="1"></label>
+      <label class="f"><span>上下文窗口（token）</span><input id="f-ctx" type="number" value="200000"></label>
+    </div>
+    <p class="note">上下文窗口和模态会参与路由：放不下或没有对应能力的请求会自动跳过这个条目。</p>
+    <label class="f"><span><input type="checkbox" id="f-vision" checked style="width:auto"> 支持图片</span></label>
+    <label class="f"><span><input type="checkbox" id="f-pdf" style="width:auto"> 支持 PDF</span></label>
+    <label class="f"><span>备注</span><input id="f-notes"></label>
     <div class="row"><button class="primary" id="f-save">保存</button>
-      <button class="ghost" onclick="document.getElementById('dialog').close()">取消</button></div>`);
-  document.getElementById('f-save').onclick = async () => {
+      <button class="ghost" onclick="document.getElementById('dlg').close()">取消</button></div>`);
+  $('#f-save').onclick = async () => {
     const payload = {
-      upstream_model: document.getElementById('f-model').value.trim(),
-      tier: Number(document.getElementById('f-tier').value || 1),
-      max_context: Number(document.getElementById('f-ctx').value || 200000),
-      vision: document.getElementById('f-vision').checked,
-      pdf: document.getElementById('f-pdf').checked,
-      enabled: true,
-      notes: document.getElementById('f-notes').value.trim(),
+      upstream_model: $('#f-model').value.trim(),
+      tier: Number($('#f-tier').value || 1),
+      max_context: Number($('#f-ctx').value || 200000),
+      vision: $('#f-vision').checked, pdf: $('#f-pdf').checked,
+      enabled: true, notes: $('#f-notes').value.trim(),
     };
-    if (!payload.upstream_model) return toast('模型名必填', 'err');
+    if (!payload.upstream_model) return toast('模型名必填', true);
     try {
       await api(`/admin/api/channels/${channelId}/entries`, { method: 'POST', body: JSON.stringify(payload) });
-      document.getElementById('dialog').close();
-      toast('已添加'); refresh();
-    } catch (e) { toast(e.message, 'err'); }
+      closeDlg(); toast('已添加'); reload();
+    } catch (e) { toast(e.message, true); }
   };
 }
 
-// ---------- 健康 ----------
-
-async function renderHealth(target) {
-  const d = await api('/admin/api/health');
-  target.innerHTML = `
-    <div class="card"><h2>熔断（渠道 × 模型）</h2>
-      <table><thead><tr><th>渠道</th><th>模型</th><th>状态</th><th>连续失败</th><th>样本</th><th>打开时间</th><th></th></tr></thead><tbody>
-      ${d.breakers.map((b) => `<tr>
-        <td>${esc(b.channel)}</td><td>${esc(b.model)}</td>
-        <td class="${b.state === 'closed' ? 'ok' : 'warn'}">${esc(b.state)}</td>
-        <td>${b.consecutive_failures}</td><td>${b.failed}/${b.total}</td>
-        <td>${b.opened_ms ? fmtTime(b.opened_ms) : '—'}</td>
-        <td><button class="ghost" data-reset-ch="${b.channel_id}" data-model="${esc(b.model)}">重置</button></td></tr>`).join('')
-      || '<tr><td colspan="7" class="muted">没有熔断记录</td></tr>'}
-      </tbody></table></div>
-    <div class="card"><h2>冷却（key × 模型）</h2>
-      <table><thead><tr><th>key id</th><th>模型</th><th>原因</th><th>剩余</th><th></th></tr></thead><tbody>
-      ${d.cooldowns.map((c) => `<tr><td>${c.key_id}</td><td>${esc(c.model)}</td>
-        <td>${esc(c.reason)}</td><td>${fmtUntil(c.until_ms)}</td>
-        <td><button class="ghost" data-reset-key="${c.key_id}" data-model="${esc(c.model)}">清除</button></td></tr>`).join('')
-      || '<tr><td colspan="5" class="muted">没有冷却中的 key</td></tr>'}
+// ── 健康 ────────────────────────────────────────────────────────────────
+async function pHealth(host) {
+  const { breakers, cooldowns } = S.health;
+  host.innerHTML = `
+    <div class="sec">
+      <h2>熔断（渠道 × 模型）</h2>
+      <p class="note">连续失败到阈值就打开，过一段时间放一次半开探测；探测成功才恢复。只有真故障会计入，
+        400 类错误与上下文超长不算。</p>
+      <table><thead><tr><th>渠道</th><th>模型</th><th>状态</th><th class="num">连续失败</th>
+        <th class="num">样本</th><th>打开于</th><th></th></tr></thead><tbody>
+      ${breakers.map((b) => `<tr>
+        <td data-k="渠道">${esc(b.channel)}</td><td data-k="模型">${esc(b.model)}</td>
+        <td data-k="状态">${b.state === 'closed' ? '<span class="tag live">正常</span>'
+          : b.state === 'half_open' ? '<span class="tag hold">半开探测</span>' : '<span class="tag fail">已打开</span>'}</td>
+        <td class="num" data-k="连续失败">${b.consecutive_failures}</td>
+        <td class="num" data-k="样本">${b.failed}/${b.total}</td>
+        <td data-k="打开于">${b.opened_ms ? stamp(b.opened_ms) : '—'}</td>
+        <td><button class="tiny" data-resetch="${b.channel_id}" data-model="${esc(b.model)}">重置</button></td></tr>`).join('')
+      || '<tr><td class="empty" colspan="7">没有失败记录，池子很健康</td></tr>'}
       </tbody></table>
-      <div class="row" style="margin-top:10px"><button class="primary" id="reset-all">全部重置（熔断 + 冷却）</button></div>
+    </div>
+    <div class="sec">
+      <h2>冷却（key × 模型）</h2>
+      <p class="note">额度类错误（429、余额不足、日配额用尽）只冷却那一把 key 的这个模型，
+        时长来自上游给的重试信号；日配额会一直冷到配额重置。</p>
+      <table><thead><tr><th class="num">key id</th><th>模型</th><th>原因</th><th>还剩</th><th></th></tr></thead><tbody>
+      ${cooldowns.map((c) => `<tr>
+        <td class="num" data-k="key id">${c.key_id}</td><td data-k="模型">${esc(c.model)}</td>
+        <td data-k="原因">${esc(c.reason)}</td><td data-k="还剩">${remain(c.until_ms)}</td>
+        <td><button class="tiny" data-resetkey="${c.key_id}" data-model="${esc(c.model)}">清除</button></td></tr>`).join('')
+      || '<tr><td class="empty" colspan="5">没有 key 在冷却</td></tr>'}
+      </tbody></table>
+      <div class="row" style="margin-top:12px"><button data-resetall>全部重置</button></div>
     </div>`;
-  target.querySelectorAll('[data-reset-ch]').forEach((b) => b.onclick = async () => {
-    await api('/admin/api/health/reset', {
-      method: 'POST',
-      body: JSON.stringify({ channel_id: Number(b.dataset.resetCh), model: b.dataset.model, clear_cooldowns: true }),
-    });
-    toast('已重置'); renderHealth(target);
-  });
-  target.querySelectorAll('[data-reset-key]').forEach((b) => b.onclick = async () => {
-    await api('/admin/api/health/reset', {
-      method: 'POST',
-      body: JSON.stringify({ key_id: Number(b.dataset.resetKey), model: b.dataset.model }),
-    });
-    toast('已清除'); renderHealth(target);
-  });
-  target.querySelector('#reset-all').onclick = async () => {
-    await api('/admin/api/health/reset', { method: 'POST', body: JSON.stringify({ clear_cooldowns: true }) });
-    toast('已全部重置'); renderHealth(target);
+  host.onclick = async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    try {
+      if (b.dataset.resetch) {
+        await api('/admin/api/health/reset', { method: 'POST', body: JSON.stringify({ channel_id: Number(b.dataset.resetch), model: b.dataset.model, clear_cooldowns: true }) });
+      } else if (b.dataset.resetkey) {
+        await api('/admin/api/health/reset', { method: 'POST', body: JSON.stringify({ key_id: Number(b.dataset.resetkey), model: b.dataset.model }) });
+      } else if (b.hasAttribute('data-resetall')) {
+        await api('/admin/api/health/reset', { method: 'POST', body: JSON.stringify({ clear_cooldowns: true }) });
+      } else return;
+      toast('已重置'); reload();
+    } catch (err) { toast(err.message, true); }
   };
 }
 
-// ---------- 下游 key ----------
-
-async function renderDownstream(target) {
+// ── 下游 key ────────────────────────────────────────────────────────────
+async function pDownstream(host) {
   const rows = await api('/admin/api/downstream_keys');
-  target.innerHTML = `
-    <div class="card">
-      <div class="row"><button class="primary" id="add-down">新建下游 key</button>
-        <span class="muted">明文只在创建时显示一次，库里只存 sha256</span></div>
+  host.innerHTML = `
+    <div class="sec">
+      <h2>下游 key</h2>
+      <p class="note">客户端用它连网关。明文只在创建时显示一次，库里只存 sha256。</p>
+      <div class="row"><button class="primary" id="newdown">新建下游 key</button></div>
       <table><thead><tr><th>名字</th><th>前缀</th><th>状态</th><th>创建</th><th>最近使用</th><th></th></tr></thead><tbody>
-      ${rows.map((r) => `<tr><td>${esc(r.name)}</td><td class="muted">${esc(r.key_prefix)}…</td>
-        <td>${r.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag err">停用</span>'}</td>
-        <td>${fmtTime(r.created_ms)}</td><td>${fmtTime(r.last_used_ms)}</td>
-        <td><button class="ghost" data-toggle="${r.id}" data-name="${esc(r.name)}" data-enabled="${r.enabled}">改</button>
-        <button class="danger" data-del="${r.id}">删</button></td></tr>`).join('')
-      || '<tr><td colspan="6" class="muted">还没有下游 key</td></tr>'}
-      </tbody></table></div>`;
-  target.querySelector('#add-down').onclick = async () => {
-    const name = prompt('给这把下游 key 起个名字（比如「我的笔记本」）：');
+      ${rows.map((r) => `<tr>
+        <td data-k="名字">${esc(r.name)}</td><td data-k="前缀" class="mono">${esc(r.key_prefix)}…</td>
+        <td data-k="状态">${r.enabled ? '<span class="tag live">启用</span>' : '<span class="tag">停用</span>'}</td>
+        <td data-k="创建">${stamp(r.created_ms)}</td><td data-k="最近使用">${stamp(r.last_used_ms)}</td>
+        <td><button class="tiny" data-toggle="${r.id}" data-name="${esc(r.name)}" data-on="${r.enabled}">改</button>
+          <button class="tiny danger" data-del="${r.id}">删</button></td></tr>`).join('')
+      || '<tr><td class="empty" colspan="6">还没有下游 key，Claude Code 现在连不上</td></tr>'}
+      </tbody></table>
+    </div>`;
+  $('#newdown').onclick = async () => {
+    const name = prompt('给这把 key 起个名字（比如「我的笔记本」）：');
     if (!name) return;
     const out = await api('/admin/api/downstream_keys', { method: 'POST', body: JSON.stringify({ name, enabled: true }) });
-    openDialog(`<h2>下游 key 已创建</h2>
-      <p>请立刻复制保存，之后不会再显示：</p>
-      <pre>${esc(out.key)}</pre>
-      <p class="muted">在 Claude Code 里这样用：<br>
-      <code>export ANTHROPIC_BASE_URL=https://你的域名</code><br>
-      <code>export ANTHROPIC_AUTH_TOKEN=${esc(out.key)}</code></p>
-      <button class="primary" onclick="document.getElementById('dialog').close()">我已保存</button>`);
-    renderDownstream(target);
+    dlg(`<h2>已创建，请立刻复制</h2>
+      <p class="note">只显示这一次。填进 Claude Code 的两个环境变量：</p>
+      <label class="f"><span>key</span><input class="mono" value="${esc(out.key)}" readonly onclick="this.select()"></label>
+      <label class="f"><span>环境变量</span><textarea class="mono" style="min-height:70px" readonly onclick="this.select()">export ANTHROPIC_BASE_URL=https://你的域名\nexport ANTHROPIC_AUTH_TOKEN=${esc(out.key)}</textarea></label>
+      <button class="primary" onclick="document.getElementById('dlg').close()">我已保存</button>`);
+    pDownstream(host);
   };
-  target.querySelectorAll('[data-toggle]').forEach((b) => b.onclick = async () => {
-    const name = prompt('名字：', b.dataset.name);
-    if (name === null) return;
-    const enabled = confirm('启用吗？（取消 = 停用）');
-    await api('/admin/api/downstream_keys/' + b.dataset.toggle, { method: 'PATCH', body: JSON.stringify({ name, enabled }) });
-    toast('已保存'); renderDownstream(target);
-  });
-  target.querySelectorAll('[data-del]').forEach((b) => b.onclick = async () => {
-    if (!confirm('删除后这把 key 立刻失效，确定？')) return;
-    await api('/admin/api/downstream_keys/' + b.dataset.del, { method: 'DELETE' });
-    toast('已删除'); renderDownstream(target);
-  });
+  host.onclick = async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.toggle) {
+      const name = prompt('名字：', b.dataset.name);
+      if (name === null) return;
+      const enabled = confirm('启用吗？（取消 = 停用）');
+      await api('/admin/api/downstream_keys/' + b.dataset.toggle, { method: 'PATCH', body: JSON.stringify({ name, enabled }) });
+      toast('已保存');
+    } else if (b.dataset.del) {
+      if (!confirm('删除后这把 key 立刻失效，确定？')) return;
+      await api('/admin/api/downstream_keys/' + b.dataset.del, { method: 'DELETE' });
+      toast('已删除');
+    } else return;
+    pDownstream(host);
+  };
 }
 
-// ---------- 搜索后端 ----------
-
-async function renderSearch(target) {
+// ── 搜索后端 ────────────────────────────────────────────────────────────
+async function pSearch(host) {
   const rows = await api('/admin/api/search_backends');
   const kinds = ['tavily', 'exa', 'firecrawl', 'parallel', 'jina'];
-  target.innerHTML = `
-    <div class="card">
-      <div class="row"><button class="primary" id="add-search">新增搜索后端</button>
-        <span class="muted">WebSearch 由网关自己执行：模型调用搜索 → 网关查后端 → 结果以标准块回给 Claude Code</span></div>
+  host.innerHTML = `
+    <div class="sec">
+      <h2>搜索后端</h2>
+      <p class="note">网关自己执行网页搜索：上游模型调用搜索 → 网关查这些后端 → 结果以标准块回给 Claude Code。
+        多个后端会依次尝试，被限流的那一个进入冷却。</p>
+      <div class="row"><button class="primary" id="add">新增搜索后端</button></div>
       <table><thead><tr><th>名字</th><th>类型</th><th>密钥</th><th>base_url</th><th>状态</th><th>冷却</th><th></th></tr></thead><tbody>
-      ${rows.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.kind)}</td>
-        <td class="muted">${esc(r.api_key_masked)}</td><td class="muted">${esc(r.base_url || '默认')}</td>
-        <td>${r.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag">停用</span>'}</td>
-        <td>${r.cooldown_until_ms ? fmtUntil(r.cooldown_until_ms) : ''}</td>
-        <td><button class="ghost" data-edit="${r.id}">改</button>
-        <button class="danger" data-del="${r.id}">删</button></td></tr>`).join('')
-      || '<tr><td colspan="7" class="muted">还没有搜索后端（WebSearch 会用不了，其它功能不受影响）</td></tr>'}
-      </tbody></table></div>`;
+      ${rows.map((r) => `<tr>
+        <td data-k="名字">${esc(r.name)}</td><td data-k="类型">${esc(r.kind)}</td>
+        <td data-k="密钥" class="mono">${esc(r.api_key_masked || '（无需密钥）')}</td>
+        <td data-k="base_url" class="note" style="margin:0">${esc(r.base_url || '默认')}</td>
+        <td data-k="状态">${r.enabled ? '<span class="tag live">启用</span>' : '<span class="tag">停用</span>'}</td>
+        <td data-k="冷却">${r.cooldown_until_ms ? `<span class="tag hold">${remain(r.cooldown_until_ms)}</span>` : ''}</td>
+        <td><button class="tiny" data-edit="${r.id}">改</button>
+          <button class="tiny danger" data-del="${r.id}">删</button></td></tr>`).join('')
+      || '<tr><td class="empty" colspan="7">还没有搜索后端 —— 不配的话 WebSearch 会用不了，其他功能不受影响</td></tr>'}
+      </tbody></table>
+    </div>`;
   const form = (row) => {
     const r = row || { name: '', kind: 'tavily', base_url: '', enabled: true, notes: '' };
-    openDialog(`<h2>${row ? '修改' : '新增'}搜索后端</h2>
-      <div class="row"><input id="s-name" placeholder="名字（如 tavily-1）" value="${esc(r.name)}" style="flex:1"></div>
-      <div class="row"><select id="s-kind">${kinds.map((k) =>
-        `<option ${k === r.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></div>
-      <div class="row"><input id="s-key" placeholder="${row ? '留空表示不修改' : 'api key'}" style="flex:1"></div>
-      <div class="row"><input id="s-url" placeholder="base_url（留空用默认）" value="${esc(r.base_url)}" style="flex:1"></div>
-      <div class="row"><input id="s-notes" placeholder="备注" value="${esc(r.notes || '')}" style="flex:1"></div>
-      <div class="row"><label><input type="checkbox" id="s-enabled" ${r.enabled ? 'checked' : ''}> 启用</label></div>
+    dlg(`<h2>${row ? '修改' : '新增'}搜索后端</h2>
+      <div class="grid2">
+        <label class="f"><span>名字</span><input id="s-name" value="${esc(r.name)}" placeholder="tavily-1"></label>
+        <label class="f"><span>类型</span><select id="s-kind">${kinds.map((k) =>
+          `<option ${k === r.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></label>
+      </div>
+      <label class="f"><span>api key</span><input id="s-key" placeholder="${row ? '留空表示不改' : '粘贴 key'}"></label>
+      <label class="f"><span>base_url（留空用默认）</span><input id="s-url" value="${esc(r.base_url || '')}"></label>
+      <label class="f"><span>备注</span><input id="s-notes" value="${esc(r.notes || '')}"></label>
+      <label class="f"><span><input type="checkbox" id="s-on" ${r.enabled ? 'checked' : ''} style="width:auto"> 启用</span></label>
       <div class="row"><button class="primary" id="s-save">保存</button>
-        <button class="ghost" onclick="document.getElementById('dialog').close()">取消</button></div>`);
-    document.getElementById('s-save').onclick = async () => {
+        <button class="ghost" onclick="document.getElementById('dlg').close()">取消</button></div>`);
+    $('#s-save').onclick = async () => {
       const payload = {
-        name: document.getElementById('s-name').value.trim(),
-        kind: document.getElementById('s-kind').value,
-        api_key: document.getElementById('s-key').value.trim(),
-        base_url: document.getElementById('s-url').value.trim(),
-        enabled: document.getElementById('s-enabled').checked,
-        notes: document.getElementById('s-notes').value.trim(),
+        name: $('#s-name').value.trim(), kind: $('#s-kind').value,
+        api_key: $('#s-key').value.trim(), base_url: $('#s-url').value.trim(),
+        enabled: $('#s-on').checked, notes: $('#s-notes').value.trim(),
       };
-      if (!payload.name) return toast('名字必填', 'err');
+      if (!payload.name) return toast('名字必填', true);
       try {
         if (row) await api('/admin/api/search_backends/' + row.id, { method: 'PATCH', body: JSON.stringify(payload) });
         else await api('/admin/api/search_backends', { method: 'POST', body: JSON.stringify(payload) });
-        document.getElementById('dialog').close();
-        toast('已保存'); renderSearch(target);
-      } catch (e) { toast(e.message, 'err'); }
+        closeDlg(); toast('已保存'); pSearch(host);
+      } catch (e) { toast(e.message, true); }
     };
   };
-  target.querySelector('#add-search').onclick = () => form(null);
-  target.querySelectorAll('[data-edit]').forEach((b) => b.onclick = () => form(rows.find((r) => r.id === Number(b.dataset.edit))));
-  target.querySelectorAll('[data-del]').forEach((b) => b.onclick = async () => {
-    if (!confirm('删除这个搜索后端？')) return;
-    await api('/admin/api/search_backends/' + b.dataset.del, { method: 'DELETE' });
-    toast('已删除'); renderSearch(target);
-  });
+  $('#add').onclick = () => form(null);
+  host.onclick = async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.edit) form(rows.find((r) => r.id === Number(b.dataset.edit)));
+    else if (b.dataset.del) {
+      if (!confirm('删除这个搜索后端？')) return;
+      await api('/admin/api/search_backends/' + b.dataset.del, { method: 'DELETE' });
+      toast('已删除'); pSearch(host);
+    }
+  };
 }
 
-// ---------- 矫正规则 ----------
-
-async function renderRules(target) {
+// ── 矫正规则 ────────────────────────────────────────────────────────────
+async function pRules(host) {
   const rows = await api('/admin/api/rules');
-  target.innerHTML = `
-    <div class="card">
-      <p class="muted">这些是网关在遇到 400/413/422 时用来改写请求的补丁。内置矫正器（思考签名、思考预算、
-      max_tokens 下夹、图片降级）不走这里；这张表是把「上游报错 → 请求骨架」交给指定分析条目分析后
-      沉淀下来的规则，命中会自动应用。</p>
-      <table><thead><tr><th>作用范围</th><th>错误特征</th><th>来源</th><th>补丁</th><th>命中</th><th>状态</th><th></th></tr></thead><tbody>
-      ${rows.map((r) => `<tr><td>${esc(r.scope) || '全局'}</td>
-        <td class="muted">${esc(r.error_fingerprint)}<div class="muted">${esc(r.error_sample || '')}</div></td>
-        <td>${esc(r.source)}</td>
-        <td><pre style="margin:0">${esc(r.patch_json)}</pre></td>
-        <td>${r.hits}</td>
-        <td>${r.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag">停用</span>'}</td>
-        <td><button class="ghost" data-toggle="${r.id}" data-enabled="${r.enabled}">${r.enabled ? '停用' : '启用'}</button>
-        <button class="danger" data-del="${r.id}">删</button></td></tr>`).join('')
-      || '<tr><td colspan="7" class="muted">还没有规则（遇到未知 400 时会自动分析并生成）</td></tr>'}
-      </tbody></table></div>`;
-  target.querySelectorAll('[data-toggle]').forEach((b) => b.onclick = async () => {
-    await api('/admin/api/rules/' + b.dataset.toggle, {
-      method: 'PATCH', body: JSON.stringify({ enabled: b.dataset.enabled !== 'true' }),
-    });
-    renderRules(target);
-  });
-  target.querySelectorAll('[data-del]').forEach((b) => b.onclick = async () => {
-    if (!confirm('删除这条规则？')) return;
-    await api('/admin/api/rules/' + b.dataset.del, { method: 'DELETE' });
-    renderRules(target);
-  });
+  host.innerHTML = `
+    <div class="sec">
+      <h2>矫正规则</h2>
+      <p class="note">上游用 400 拒绝请求时，网关先试内置矫正器（思考签名、预算、max_tokens 下夹、图片降级）；
+        仍不认识这个错误就把「错误 + 请求骨架（不含正文）」交给分析条目，只接受白名单内的改写补丁。
+        这里是被采纳过的补丁，命中会自动套用。</p>
+      <table><thead><tr><th>适用协议</th><th>错误特征</th><th class="num">命中</th><th>补丁</th><th>状态</th><th></th></tr></thead><tbody>
+      ${rows.map((r) => `<tr>
+        <td data-k="适用协议">${esc(r.scope) || '全局'}</td>
+        <td data-k="错误特征"><span class="mono">${esc(r.error_fingerprint)}</span>
+          <div class="note" style="margin:0">${esc(r.error_sample || '')}</div></td>
+        <td class="num" data-k="命中">${r.hits}</td>
+        <td data-k="补丁"><code>${esc(r.patch_json)}</code></td>
+        <td data-k="状态">${r.enabled ? '<span class="tag live">启用</span>' : '<span class="tag">停用</span>'}</td>
+        <td><button class="tiny" data-tog="${r.id}" data-on="${r.enabled}">${r.enabled ? '停用' : '启用'}</button>
+          <button class="tiny danger" data-del="${r.id}">删</button></td></tr>`).join('')
+      || '<tr><td class="empty" colspan="6">还没有规则。遇到没见过的 400 时会自动分析并生成。</td></tr>'}
+      </tbody></table>
+    </div>`;
+  host.onclick = async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.tog) {
+      await api('/admin/api/rules/' + b.dataset.tog, { method: 'PATCH', body: JSON.stringify({ enabled: b.dataset.on !== 'true' }) });
+    } else if (b.dataset.del) {
+      if (!confirm('删除这条规则？')) return;
+      await api('/admin/api/rules/' + b.dataset.del, { method: 'DELETE' });
+    } else return;
+    pRules(host);
+  };
 }
 
-// ---------- 设置 ----------
-
-async function renderSettings(target) {
+// ── 设置 ────────────────────────────────────────────────────────────────
+async function pSettings(host) {
   const settings = await api('/admin/api/settings');
-  target.innerHTML = `
-    <div class="card"><h2>运行期设置（保存后立即生效）</h2>
-      <textarea id="settings-json" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea>
-      <div class="row" style="margin-top:8px">
-        <button class="primary" id="save-settings">保存</button>
-        <span class="muted">常用项：publicModelId、modelEcho（upstream/request/fixed）、maxAttempts、
-          firstContentTimeoutMs、breaker.*、search.*、analysisEntryId、alerts.smtp</span>
-      </div></div>
-    <div class="card"><h2>备份与迁移</h2>
-      <div class="row"><button class="ghost" id="do-export">导出配置 JSON</button>
-        <button class="ghost" id="do-import">导入配置 JSON</button></div>
-      <p class="muted">导出包含渠道、上游 key、条目、搜索后端、规则与设置（不含下游 key 明文，
-      只保留哈希，导入后原密钥继续有效）。</p></div>
-    <div class="card"><h2>在线部署令牌</h2>
-      <p class="muted">CI 通过 <code>POST /admin/api/deploy</code> 推新版本时用的令牌
-      （和后台登录密码是两套）。留空表示关闭该接口。也可以先在服务器上运行
-      <code>ufp set-deploy-token</code>。</p>
-      <div class="row"><button class="ghost" id="rotate-token">生成 / 轮换令牌</button>
-        <span class="muted" id="deploy-state"></span></div></div>
-    <div class="card"><h2>改后台密码</h2>
-      <div class="row"><input id="old-pw" type="password" placeholder="当前密码">
-        <input id="new-pw" type="password" placeholder="新密码（至少 8 位）">
-        <button class="primary" id="save-pw">修改</button></div></div>`;
-
-  target.querySelector('#save-settings').onclick = async () => {
+  host.innerHTML = `
+    <div class="sec">
+      <h2>运行期设置</h2>
+      <p class="note">保存后立刻生效。常用项：publicModelId（对外模型名）、modelEcho（响应里回显哪个模型名）、
+        maxAttempts（一次请求最多试几个条目）、firstContentTimeoutMs、breaker.*、search.*、analysisEntryId
+        （「让另一个上游分析报错」用的条目）、alerts.smtp（邮件告警）。</p>
+      <textarea id="set" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea>
+      <div class="row" style="margin-top:10px"><button class="primary" id="save">保存</button></div>
+    </div>
+    <div class="sec">
+      <h2>在线部署令牌</h2>
+      <p class="note">CI 往 <code>/admin/api/deploy</code> 推新版本时用，和登录密码是两套。
+        ${settings.deployToken ? '当前已配置。' : '当前未配置，部署接口是关闭的。'}</p>
+      <div class="row"><button id="rotate">生成 / 轮换令牌</button>
+        <span class="note" style="margin:0">轮换后旧令牌立刻失效</span></div>
+    </div>
+    <div class="sec">
+      <h2>备份与迁移</h2>
+      <p class="note">导出包含渠道、上游 key、条目、搜索后端、规则与设置；不含下游 key 明文（只保留哈希，导入后原密钥继续有效）。</p>
+      <div class="row"><button id="export">导出配置</button><button id="import">导入配置</button></div>
+    </div>
+    <div class="sec">
+      <h2>后台密码</h2>
+      <div class="row">
+        <input id="old" type="password" placeholder="当前密码">
+        <input id="new" type="password" placeholder="新密码（至少 8 位）">
+        <button class="primary" id="savepw">修改</button>
+      </div>
+    </div>`;
+  $('#save').onclick = async () => {
     try {
-      const parsed = JSON.parse(target.querySelector('#settings-json').value);
-      await api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(parsed) });
-      toast('已保存并生效');
-    } catch (e) { toast('保存失败：' + e.message, 'err'); }
+      await api('/admin/api/settings', { method: 'PUT', body: $('#set').value });
+      toast('已保存并生效'); reload();
+    } catch (e) { toast('保存失败：' + e.message, true); }
   };
-  target.querySelector('#do-export').onclick = async () => {
+  $('#rotate').onclick = async () => {
+    if (!confirm('生成新令牌会让旧的立刻失效，确定？')) return;
+    const out = await api('/admin/api/deploy-token', { method: 'POST' });
+    dlg(`<h2>新的部署令牌</h2>
+      <p class="note">只显示这一次。填到仓库 Secret <code>DEPLOY_TOKEN</code>；也可以先复制到文件再
+        <code>gh secret set DEPLOY_TOKEN &lt; 文件</code>，避免经过剪贴板和聊天记录。</p>
+      <label class="f"><span>令牌</span><input class="mono" value="${esc(out.token)}" readonly onclick="this.select()"></label>
+      <button class="primary" onclick="document.getElementById('dlg').close()">我已保存</button>`);
+    pSettings(host);
+  };
+  $('#export').onclick = async () => {
     const data = await api('/admin/api/export');
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'ufp-config.json';
-    a.click();
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+    a.download = 'ufp-config.json'; a.click();
   };
-  target.querySelector('#do-import').onclick = () => {
+  $('#import').onclick = () => {
     const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json';
+    input.type = 'file'; input.accept = '.json';
     input.onchange = async () => {
-      const text = await input.files[0].text();
       try {
-        const out = await api('/admin/api/import', { method: 'POST', body: text });
-        toast('导入完成：' + JSON.stringify(out.imported));
-        refresh();
-      } catch (e) { toast('导入失败：' + e.message, 'err'); }
+        const out = await api('/admin/api/import', { method: 'POST', body: await input.files[0].text() });
+        toast('导入完成：' + JSON.stringify(out.imported)); reload();
+      } catch (e) { toast('导入失败：' + e.message, true); }
     };
     input.click();
   };
-  target.querySelector('#deploy-state').textContent = settings.deployToken
-    ? "当前已配置（轮换后旧令牌立刻失效）" : "当前未配置，部署接口关闭";
-  target.querySelector('#rotate-token').onclick = async () => {
-    if (!confirm('生成新令牌会让旧令牌立刻失效，确定？')) return;
-    const out = await api('/admin/api/deploy-token', { method: 'POST' });
-    openDialog(`<h2>部署令牌已生成</h2>
-      <p>只显示这一次，请填到仓库 Secret <code>DEPLOY_TOKEN</code>：</p>
-      <pre>${esc(out.token)}</pre>
-      <button class="primary" onclick="document.getElementById('dialog').close()">我已保存</button>`);
-    renderSettings(target);
-  };
-  target.querySelector('#save-pw').onclick = async () => {
+  $('#savepw').onclick = async () => {
     try {
-      await api('/admin/api/password', {
-        method: 'POST',
-        body: JSON.stringify({
-          old_password: target.querySelector('#old-pw').value,
-          new_password: target.querySelector('#new-pw').value,
-        }),
-      });
+      await api('/admin/api/password', { method: 'POST', body: JSON.stringify({ old_password: $('#old').value, new_password: $('#new').value }) });
       toast('密码已更新');
-    } catch (e) { toast('修改失败：' + e.message, 'err'); }
+    } catch (e) { toast('修改失败：' + e.message, true); }
   };
 }
 
-// ---------- 启动 ----------
-
-checkAuth();
-setInterval(() => { if (!document.getElementById('app').hidden) refresh(); }, 30000);
+// ── 启动 ────────────────────────────────────────────────────────────────
+boot();
+setInterval(() => { if (!$('.shell').hidden) reload(); }, 30000);

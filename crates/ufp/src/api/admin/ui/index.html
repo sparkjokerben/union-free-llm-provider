@@ -3,98 +3,218 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ufp 管理后台</title>
+<title>ufp 调度台</title>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #171a21; --panel-2: #1f232c; --line: #2a2f3a;
-    --fg: #e6e8ee; --muted: #98a0b0; --accent: #6ea8fe; --ok: #4ade80;
-    --warn: #fbbf24; --err: #f87171;
+/* ── 设计 token ─────────────────────────────────────────────────────────
+   主题：一台调度台。上游是一池不稳定的免费额度，界面要让人一眼看出
+   「谁在正常、谁在冷却、谁被熔断」。冷调纸面 + 三色状态语义，
+   颜色只承载状态，不做装饰。 */
+:root {
+  color-scheme: light;
+  --paper:  #edf0ed;   /* 纸面：微冷的灰绿白 */
+  --card:   #f7f9f7;
+  --ink:    #14201d;   /* 墨：偏绿的深黑 */
+  --ink-2:  #4a5a55;
+  --ink-3:  #7d8c87;
+  --line:   #ccd6d1;
+  --line-2: #e0e7e3;
+  --live:   #0d7a68;   /* 在线 */
+  --live-b: #d7ece6;
+  --hold:   #a35f00;   /* 冷却 / 等待 */
+  --hold-b: #f4e6cf;
+  --fail:   #9d2f28;   /* 熔断 / 失败 */
+  --fail-b: #f3dbd8;
+  --skip:   #6b7a86;   /* 跳过（超长 / 无能力） */
+  --skip-b: #e3e8eb;
+  --shadow: 0 1px 2px rgba(20,32,29,.06), 0 8px 24px -12px rgba(20,32,29,.18);
+  --serif: "Songti SC","Noto Serif CJK SC","Source Han Serif SC",Georgia,serif;
+  --sans: -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  --mono: ui-monospace,"SF Mono","JetBrains Mono",Menlo,"Cascadia Mono",monospace;
+  --r: 3px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --paper: #0f1513; --card: #161d1a; --ink: #e9eeec; --ink-2: #a7b3ae;
+    --ink-3: #78857f; --line: #2a3531; --line-2: #202925;
+    --live: #4fc3a8; --live-b: #16302a; --hold: #e0a458; --hold-b: #33260f;
+    --fail: #e0796f; --fail-b: #331a17; --skip: #9aa7b0; --skip-b: #1d2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
   }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.6 -apple-system, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif; }
-  a { color: var(--accent); }
-  header { display: flex; align-items: center; gap: 16px; padding: 14px 20px;
-           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  header .spacer { flex: 1; }
-  header .stat { color: var(--muted); font-size: 12px; }
-  nav { display: flex; gap: 6px; flex-wrap: wrap; padding: 12px 20px 0; }
-  nav button { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
-               border-radius: 999px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
-  nav button.active { background: var(--accent); color: #0b1020; border-color: var(--accent); font-weight: 600; }
-  main { padding: 16px 20px 60px; max-width: 1200px; }
-  section { display: none; }
-  section.active { display: block; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-          padding: 14px 16px; margin-bottom: 14px; }
-  .card h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; color: var(--muted); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-  .kpi { background: var(--panel-2); border-radius: 8px; padding: 10px 12px; }
-  .kpi .v { font-size: 20px; font-weight: 600; }
-  .kpi .l { color: var(--muted); font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--muted); font-weight: 500; }
-  tr:hover td { background: rgba(255,255,255,.02); }
-  input, select, textarea { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
-                            border-radius: 6px; padding: 6px 8px; font: inherit; }
-  textarea { width: 100%; min-height: 90px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-  button.primary { background: var(--accent); color: #0b1020; border: none; border-radius: 6px;
-                   padding: 7px 14px; font-weight: 600; cursor: pointer; }
-  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line);
-                 border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
-  button.danger { background: transparent; color: var(--err); border: 1px solid var(--line);
-                  border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-  .muted { color: var(--muted); }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
-  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
-         border: 1px solid var(--line); color: var(--muted); }
-  .tag.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
-  .tag.err { color: var(--err); border-color: rgba(248,113,113,.4); }
-  .tag.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
-  dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
-           border-radius: 10px; padding: 18px; max-width: 640px; width: 92%; }
-  dialog::backdrop { background: rgba(0,0,0,.6); }
-  .login { max-width: 360px; margin: 12vh auto; }
-  pre { background: var(--panel-2); padding: 10px; border-radius: 8px; overflow: auto; font-size: 12px; }
-  .chart { width: 100%; height: 180px; }
+}
+* { box-sizing: border-box }
+html, body { margin: 0; background: var(--paper); color: var(--ink) }
+body { font: 14px/1.65 var(--sans); -webkit-font-smoothing: antialiased }
+a { color: var(--live); text-underline-offset: 3px }
+code, .mono { font-family: var(--mono); font-size: .92em }
+:focus-visible { outline: 2px solid var(--live); outline-offset: 2px; border-radius: var(--r) }
+
+/* ── 骨架：顶部读数带 + 左机架 + 右工作台 ─────────────────────────── */
+.shell { display: grid; grid-template-columns: 268px minmax(0,1fr); min-height: 100vh }
+.top { grid-column: 1/-1; position: sticky; top: 0; z-index: 20;
+       display: flex; align-items: baseline; gap: 22px; flex-wrap: wrap;
+       padding: 10px 20px; border-bottom: 1px solid var(--line);
+       background: color-mix(in srgb, var(--paper) 88%, transparent); backdrop-filter: blur(6px) }
+.top .brand { font-family: var(--serif); font-size: 17px; letter-spacing: .01em }
+.readout { display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; color: var(--ink-2) }
+.readout b { font-family: var(--serif); font-size: 15px; color: var(--ink); font-weight: 600; margin-right: 4px }
+.top .grow { flex: 1 }
+.top button { margin-left: 0 }
+
+.rail { border-right: 1px solid var(--line); padding: 16px 14px 40px; align-self: start;
+        position: sticky; top: 45px; max-height: calc(100vh - 45px); overflow: auto }
+.rail h2, .sec h2 { font-family: var(--serif); font-size: 13px; font-weight: 600;
+                    color: var(--ink-2); margin: 0 0 8px }
+.tier { margin-bottom: 14px }
+.tier-head { display: flex; align-items: baseline; gap: 6px; font-size: 12px; color: var(--ink-3); margin-bottom: 4px }
+.tier-head::after { content: ""; flex: 1; border-top: 1px dotted var(--line) }
+.slot { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 8px;
+        padding: 5px 6px; border-radius: var(--r); cursor: default }
+.slot:hover { background: var(--card) }
+.slot .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px }
+.slot .sub { font-family: var(--mono); font-size: 11px; color: var(--ink-3); grid-column: 2/-1 }
+.lamp { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 3px var(--live-b) }
+.lamp.live { background: var(--live); box-shadow: 0 0 0 3px var(--live-b) }
+.lamp.hold { background: var(--hold); box-shadow: 0 0 0 3px var(--hold-b) }
+.lamp.fail { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-b) }
+.lamp.skip { background: var(--skip); box-shadow: 0 0 0 3px var(--skip-b) }
+
+.work { padding: 22px 26px 80px; min-width: 0 }
+nav.pages { display: flex; gap: 2px; flex-wrap: wrap; margin-bottom: 20px; border-bottom: 1px solid var(--line) }
+nav.pages button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--ink-2);
+                   padding: 7px 11px; font: inherit; cursor: pointer; margin-bottom: -1px }
+nav.pages button[aria-current="page"] { color: var(--ink); border-bottom-color: var(--live); font-weight: 600 }
+nav.pages button:hover { color: var(--ink) }
+section { display: none } section.on { display: block }
+
+/* ── 内容块：排班表式的密表，不用卡片堆 ───────────────────────────── */
+.sec { margin-bottom: 26px }
+.sec > h2 { font-size: 14px; color: var(--ink) }
+.note { color: var(--ink-2); font-size: 13px; max-width: 78ch; margin: 0 0 12px }
+table { width: 100%; border-collapse: collapse; font-size: 13px;
+        font-variant-numeric: tabular-nums }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line-2); vertical-align: top }
+th { color: var(--ink-3); font-weight: 500; font-size: 12px; white-space: nowrap;
+     position: sticky; top: 45px; background: var(--paper) }
+tbody tr:hover td { background: var(--card) }
+td.num, th.num { text-align: right; font-family: var(--mono) }
+.tag { display: inline-block; padding: 0 6px; border-radius: var(--r); font-size: 11px;
+       border: 1px solid var(--line); color: var(--ink-2) }
+.tag.live { color: var(--live); border-color: var(--live); background: var(--live-b) }
+.tag.hold { color: var(--hold); border-color: var(--hold); background: var(--hold-b) }
+.tag.fail { color: var(--fail); border-color: var(--fail); background: var(--fail-b) }
+.empty { color: var(--ink-3); padding: 14px 10px; font-size: 13px }
+
+/* ── 控件 ─────────────────────────────────────────────────────────── */
+button { font: inherit; cursor: pointer; border-radius: var(--r); border: 1px solid var(--line);
+         background: var(--card); color: var(--ink); padding: 5px 11px }
+button:hover { border-color: var(--ink-3) }
+button.primary { background: var(--ink); color: var(--paper); border-color: var(--ink) }
+button.ghost { background: none }
+button.danger { color: var(--fail); border-color: var(--fail-b); background: none }
+button.tiny { padding: 2px 7px; font-size: 12px }
+input, select, textarea { font: inherit; background: var(--card); color: var(--ink);
+                          border: 1px solid var(--line); border-radius: var(--r); padding: 5px 8px; width: 100% }
+textarea { min-height: 120px; font-family: var(--mono); font-size: 12px }
+label.f { display: block; margin-bottom: 10px }
+label.f span { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 3px }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px }
+.row > * { width: auto }
+.row input, .row textarea { width: auto; flex: 1; min-width: 140px }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 14px }
+
+/* ── 尝试色带：池子的心电图 ───────────────────────────────────────── */
+.pulse { display: flex; align-items: flex-end; gap: 2px; height: 46px; margin: 2px 0 6px }
+.pulse i { flex: 1; min-width: 2px; border-radius: 1px; background: var(--line); display: block }
+.pulse i.live { background: var(--live) } .pulse i.hold { background: var(--hold) }
+.pulse i.fail { background: var(--fail) } .pulse i.skip { background: var(--skip) }
+.pulse-legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); flex-wrap: wrap }
+.pulse-legend .k { display: inline-flex; align-items: center; gap: 5px }
+.pulse-legend .k::before { content: ""; width: 9px; height: 9px; border-radius: 1px; background: var(--line) }
+.pulse-legend .k.live::before { background: var(--live) } .pulse-legend .k.hold::before { background: var(--hold) }
+.pulse-legend .k.fail::before { background: var(--fail) } .pulse-legend .k.skip::before { background: var(--skip) }
+
+/* 趋势：一天一根竖条，成功在下、错误在上 */
+.trend { display: flex; align-items: flex-end; gap: 3px; height: 120px; padding-top: 6px }
+.trend .d { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; min-width: 6px }
+.trend .d i { display: block; background: var(--live); border-radius: 1px }
+.trend .d i.err { background: var(--fail) }
+.trend-x { display: flex; gap: 3px; font-family: var(--mono); font-size: 10px; color: var(--ink-3) }
+.trend-x span { flex: 1; min-width: 6px; text-align: center; overflow: hidden }
+
+/* ── 测试结果 ─────────────────────────────────────────────────────── */
+.probe { font-family: var(--mono); font-size: 12px; margin-top: 4px }
+.probe.ok { color: var(--live) } .probe.bad { color: var(--fail) } .probe.run { color: var(--ink-3) }
+
+/* ── 对话框与提示 ─────────────────────────────────────────────────── */
+dialog { border: 1px solid var(--line); border-radius: var(--r); background: var(--card); color: var(--ink);
+         padding: 20px 22px; width: min(680px, 92vw); box-shadow: var(--shadow) }
+dialog::backdrop { background: rgba(10,16,14,.5) }
+dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
+#toasts { position: fixed; right: 16px; bottom: 16px; z-index: 60; display: grid; gap: 8px; max-width: min(420px, 90vw) }
+#toasts div { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--live);
+              border-radius: var(--r); padding: 8px 12px; font-size: 13px; box-shadow: var(--shadow);
+              animation: rise .22s ease-out both }
+#toasts div.bad { border-left-color: var(--fail) }
+@keyframes rise { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: none } }
+@media (prefers-reduced-motion: reduce) { #toasts div { animation: none } }
+
+/* ── 登录 ─────────────────────────────────────────────────────────── */
+.gate { max-width: 340px; margin: 14vh auto; padding: 0 20px }
+.gate h1 { font-family: var(--serif); font-size: 20px; margin: 0 0 4px }
+.gate p { color: var(--ink-2); font-size: 13px }
+
+/* ── 窄屏：机架收成一条状态带，表格转成键值行 ─────────────────────── */
+@media (max-width: 860px) {
+  .shell { grid-template-columns: 1fr }
+  .rail { position: static; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); padding-bottom: 14px }
+  .rail .tier { display: inline-block; vertical-align: top; margin-right: 16px }
+  .work { padding: 16px 16px 60px }
+  th { position: static }
+  table, tbody, tr, td { display: block; width: 100% }
+  thead { display: none }
+  tbody tr { border-bottom: 1px solid var(--line); padding: 8px 0 }
+  td { border: 0; padding: 2px 0 }
+  td:not(.num)::before { content: attr(data-k) "　"; color: var(--ink-3); font-size: 11px }
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>ufp 管理后台</h1>
-  <span class="stat" id="runtime"></span>
-  <span class="spacer"></span>
-  <button class="ghost" id="refresh">刷新</button>
-  <button class="ghost" id="logout">退出</button>
-</header>
 
-<div class="login card" id="login-card" hidden>
-  <h2>登录</h2>
-  <div class="row"><input type="password" id="password" placeholder="后台密码" style="flex:1"></div>
-  <div class="row"><button class="primary" id="do-login">登录</button>
-    <span class="err" id="login-error"></span></div>
-  <p class="muted">还没设置密码？在服务器上运行 <code>ufp set-admin-password</code>。</p>
-</div>
+<div class="shell">
+  <header class="top">
+    <span class="brand">ufp 调度台</span>
+    <div class="readout" id="readout"></div>
+    <span class="grow"></span>
+    <button class="ghost tiny" id="refresh" hx-ignore>刷新</button>
+    <button class="ghost tiny" id="logout">退出</button>
+  </header>
 
-<div id="app" hidden>
-  <nav id="tabs"></nav>
-  <main>
-    <section id="tab-overview"></section>
-    <section id="tab-stats"></section>
-    <section id="tab-requests"></section>
-    <section id="tab-pool"></section>
-    <section id="tab-health"></section>
-    <section id="tab-downstream"></section>
-    <section id="tab-search"></section>
-    <section id="tab-rules"></section>
-    <section id="tab-settings"></section>
+  <aside class="rail" id="rail"></aside>
+
+  <main class="work">
+    <nav class="pages" id="pages"></nav>
+    <section id="p-overview" class="on"></section>
+    <section id="p-stats"></section>
+    <section id="p-requests"></section>
+    <section id="p-pool"></section>
+    <section id="p-health"></section>
+    <section id="p-downstream"></section>
+    <section id="p-search"></section>
+    <section id="p-rules"></section>
+    <section id="p-settings"></section>
   </main>
 </div>
 
-<dialog id="dialog"><div id="dialog-body"></div></dialog>
+<div class="gate" id="gate" hidden>
+  <h1>ufp 调度台</h1>
+  <p id="gate-msg">输入后台密码。</p>
+  <label class="f"><span>密码</span><input type="password" id="pw" autocomplete="current-password"></label>
+  <button class="primary" id="do-login">进入</button>
+</div>
+
+<dialog id="dlg"><div id="dlg-body"></div></dialog>
+<div id="toasts"></div>
 <script src="/admin/app.js"></script>
 </body>
 </html>

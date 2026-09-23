@@ -45,6 +45,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/admin/api/stats", get(stats))
         .route("/admin/api/requests", get(requests))
         .route("/admin/api/attempts", get(attempts))
+        .route("/admin/api/pulse", get(pulse))
         .route(
             "/admin/api/channels",
             get(list_channels).post(create_channel),
@@ -532,6 +533,56 @@ async fn requests(
                         "error_message": r.get::<_, Option<String>>(19)?,
                         "created_ms": r.get::<_, i64>(20)?,
                         "session_id": r.get::<_, Option<String>>(21)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Json(value).into_response())
+}
+
+#[derive(Deserialize)]
+struct PulseQuery {
+    #[serde(default = "default_pulse_limit")]
+    limit: i64,
+}
+
+fn default_pulse_limit() -> i64 {
+    80
+}
+
+/// 最近若干次上游尝试，给「尝试色带」用（池子的心电图）。
+async fn pulse(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<PulseQuery>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let limit = q.limit.clamp(10, 300);
+    let value = state
+        .db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.created_ms, a.upstream_model, COALESCE(c.name,''), COALESCE(k.label,''),
+                        a.http_status, a.error_type, a.total_ms, a.committed
+                 FROM attempt_logs a
+                 LEFT JOIN channels c ON c.id = a.channel_id
+                 LEFT JOIN upstream_keys k ON k.id = a.key_id
+                 ORDER BY a.id DESC LIMIT ?1",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map(params![limit], |r| {
+                    Ok(json!({
+                        "at": r.get::<_, i64>(0)?,
+                        "model": r.get::<_, String>(1)?,
+                        "channel": r.get::<_, String>(2)?,
+                        "key": r.get::<_, String>(3)?,
+                        "status": r.get::<_, Option<i64>>(4)?,
+                        "error_type": r.get::<_, Option<String>>(5)?,
+                        "ms": r.get::<_, i64>(6)?,
+                        "committed": r.get::<_, i64>(7)? != 0,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
