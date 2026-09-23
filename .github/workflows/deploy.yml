@@ -30,8 +30,18 @@ jobs:
           set -eu
           TAG="${{ inputs.tag }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
-            echo "未指定 tag，使用最近一次 Release：$TAG"
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+            if [ -z "$TAG" ]; then
+              if [ "${{ inputs.dry_run }}" = "true" ]; then
+                echo "::notice::仓库里还没有 Release；dry_run 不需要产物，继续探测"
+                TAG="dry-run"
+              else
+                echo "::error::还没有任何 Release：先打一个 tag 触发 release 工作流，或在输入里填 tag" >&2
+                exit 1
+              fi
+            else
+              echo "未指定 tag，使用最近一次 Release：$TAG"
+            fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
