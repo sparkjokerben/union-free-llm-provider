@@ -97,6 +97,16 @@ function stateOf(entryId) {
 
 // ── 登录 ────────────────────────────────────────────────────────────────
 function gate(msg) {
+  // 除了切显示，顺手把渲染出来的数据抹掉：会话没了，屏幕上就不该再留着池子的内容。
+  S.pool = { channels: [], keys: [], entries: [] };
+  S.health = { breakers: [], cooldowns: [] };
+  S.probes = {};
+  for (const sel of ['#rail', '#readout', '#pages']) {
+    const el = $(sel);
+    if (el) el.innerHTML = '';
+  }
+  // 清内容但保留 .on 归属：重新登录后 render() 会往当前这一页写，页面才是可见的
+  $$('section').forEach((s) => { s.innerHTML = ''; s.classList.toggle('on', s.id === 'p-' + S.page); });
   $('.shell').hidden = true;
   $('#gate').hidden = false;
   $('#gate-msg').textContent = msg;
@@ -230,7 +240,7 @@ async function probeEntry(entryId, host) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ entry_id: entryId }),
     });
-    if (r.ok) mark(`${r.latency_ms}ms · ${r.reply ? r.reply.slice(0, 40) : '（空回话）'}`, 'ok');
+    if (r.ok) mark(r.reply ? `${r.latency_ms}ms · ${r.reply.slice(0, 40)}` : `${r.latency_ms}ms · ${r.status} · 空回话`, 'ok');
     else mark(`${r.status ?? r.error_type ?? '失败'} · ${(r.error || '').slice(0, 80)}`, 'bad');
   } catch (e) { mark('测试失败：' + e.message, 'bad'); }
 }
@@ -823,5 +833,7 @@ async function pSettings(host) {
 }
 
 // ── 启动 ────────────────────────────────────────────────────────────────
+// 页面里的兜底脚本靠这个标记判断「我到底跑起来没有」
+window.__ufpBooted = true;
 boot();
 setInterval(() => { if (!$('.shell').hidden) reload(); }, 30000);

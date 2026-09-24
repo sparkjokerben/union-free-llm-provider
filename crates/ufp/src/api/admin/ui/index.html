@@ -43,6 +43,10 @@
   }
 }
 * { box-sizing: border-box }
+/* hidden 属性必须真的生效：作者样式里的 display:grid/flex 会盖掉浏览器默认的
+   [hidden]{display:none}（UA 样式永远输给作者样式，与权重无关），
+   于是 .shell.hidden = true 只是摆设 —— 退出登录后控制台还留在屏幕上。 */
+[hidden] { display: none !important }
 html, body { margin: 0; background: var(--paper); color: var(--ink) }
 body { font: 14px/1.65 var(--sans); -webkit-font-smoothing: antialiased }
 a { color: var(--live); text-underline-offset: 3px }
@@ -50,7 +54,10 @@ code, .mono { font-family: var(--mono); font-size: .92em }
 :focus-visible { outline: 2px solid var(--live); outline-offset: 2px; border-radius: var(--r) }
 
 /* ── 骨架：顶部读数带 + 左机架 + 右工作台 ─────────────────────────── */
-.shell { display: grid; grid-template-columns: 268px minmax(0,1fr); min-height: 100vh }
+/* align-content: start 不能省：min-height:100vh 多出来的空间默认会被分给各行
+   （align-content 默认 stretch），顶部读数带那一行于是被撑高，内容少的时候
+   （池子空着、页面稀疏）就在标题下面多出一条两百多像素的空白。 */
+.shell { display: grid; grid-template-columns: 268px minmax(0,1fr); align-content: start; min-height: 100vh }
 .top { grid-column: 1/-1; position: sticky; top: 0; z-index: 20;
        display: flex; align-items: baseline; gap: 22px; flex-wrap: wrap;
        padding: 10px 20px; border-bottom: 1px solid var(--line);
@@ -181,7 +188,7 @@ dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
 </head>
 <body>
 
-<div class="shell">
+<div class="shell" hidden>
   <header class="top">
     <span class="brand">ufp 调度台</span>
     <div class="readout" id="readout"></div>
@@ -213,19 +220,23 @@ dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
   <button class="primary" id="do-login">进入</button>
 </div>
 
+<!-- 脚本压根没跑起来时的兜底。它必须在 .shell 外面：脚本没跑，.shell 就一直是
+     hidden（现在 hidden 是真的生效了），写在里面的提示等于没写。 -->
+<div class="gate" id="bootfail" hidden>
+  <h1>界面脚本没有跑起来</h1>
+  <p>先强制刷新一次（Mac：Cmd+Shift+R，Windows：Ctrl+F5）；如果还不行，打开浏览器控制台看看报什么错。</p>
+</div>
+
 <dialog id="dlg"><div id="dlg-body"></div></dialog>
 <div id="toasts"></div>
 <noscript><p class="note" style="padding:20px">这个后台需要 JavaScript。</p></noscript>
 <script src="/admin/app.js?v=__UFP_VERSION__"></script>
 <script>
-// 兜底：脚本没跑起来（旧缓存、扩展拦截、报错）时别让人面对一片空白
+// 看 app.js 有没有真的跑起来（它一开始就把 __ufpBooted 置上）。
 setTimeout(function () {
-  var rail = document.getElementById('rail');
-  var gate = document.getElementById('gate');
-  if (rail && !rail.innerHTML.trim() && gate && gate.hidden) {
-    rail.innerHTML = '<p class="note">界面脚本没有跑起来。先强制刷新一次' +
-      '（Mac：Cmd+Shift+R，Windows：Ctrl+F5）；如果还不行，看一下控制台报错。</p>';
-  }
+  if (window.__ufpBooted) return;
+  var el = document.getElementById('bootfail');
+  if (el) el.hidden = false;
 }, 2500);
 </script>
 </body>

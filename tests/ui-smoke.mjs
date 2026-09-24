@@ -141,6 +141,8 @@ await send('Runtime.enable');
 await send('Page.enable');
 await send('Network.enable');
 await send('Network.setCacheDisabled', { cacheDisabled: true });
+// 固定成桌面尺寸：默认窗口是 800 宽，会落到窄屏那套布局上，测不到桌面版
+await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 860, deviceScaleFactor: 1, mobile: false });
 
 console.log(`· 浏览器：${browser}`);
 console.log(`· 目标：${BASE}/admin`);
@@ -152,6 +154,13 @@ collecting = true;
 await step('页面加载出脚本（没有白屏）',
   `!!document.querySelector('#rail') && !!document.querySelector('#pages') && !!document.querySelector('#do-login')`, 300);
 
+// 注意：这里看的是**算出来的** display，不是 hidden 属性 —— 曾经 CSS 里的
+// .shell{display:grid} 盖掉了 [hidden]，属性是对的、屏幕上一片照旧。
+await step('未登录时控制台不可见（hidden 真的生效）',
+  `getComputedStyle(document.querySelector('.shell')).display === 'none' &&
+   getComputedStyle(document.querySelector('#gate')).display !== 'none' &&
+   getComputedStyle(document.querySelector('#bootfail')).display === 'none'`, 200);
+
 await step('登录（这一步会发 POST，缺 content-type 就会 415）',
   `(async () => {
      document.querySelector('#pw').value = ${JSON.stringify(PW)};
@@ -160,10 +169,26 @@ await step('登录（这一步会发 POST，缺 content-type 就会 415）',
      return document.querySelector('#gate').hidden === true;
    })()`, 300);
 
+await step('登录后：控制台可见、登录框收起来',
+  `getComputedStyle(document.querySelector('.shell')).display !== 'none' &&
+   getComputedStyle(document.querySelector('#gate')).display === 'none'`, 200);
+
 await step('外壳渲染：机架 + 读数带 + 九个页签',
   `document.querySelector('#rail').innerHTML.length > 20 &&
    document.querySelector('#readout').textContent.trim().length > 0 &&
    document.querySelectorAll('#pages button').length === 9`, 200);
+
+// 网格默认 align-content:stretch 会把 100vh 的余量摊给各行，顶部读数带那一行
+// 于是被撑高，内容少的时候（池子空着、页面稀疏）标题下面就多出一大块空白。
+// 直接量标题行的高度：它应该贴着内容（约 45px），被撑高就是这个问题回来了。
+await step('版面没有异常空白（标题贴着内容，没有大缝）',
+  `(() => {
+     const top = document.querySelector('.top').getBoundingClientRect();
+     if (top.height > 80) return '顶部读数带被撑高到 ' + Math.round(top.height) + 'px';
+     const work = document.querySelector('.work').getBoundingClientRect();
+     const gap = work.top - top.bottom;
+     return gap < 80 ? true : '标题与内容之间空出了 ' + Math.round(gap) + 'px';
+   })()`, 200);
 
 const pages = await evaluate(`JSON.stringify([...document.querySelectorAll('#pages button')].map(b => b.dataset.page))`);
 for (const page of JSON.parse(pages)) {
@@ -210,6 +235,27 @@ await step('对话框：删除渠道（自己清理干净）',
      b.click();
      await new Promise(r => setTimeout(r, 1500));
      if (S.pool.channels.some(c => c.name === '__smoke_chan__')) return '渠道没删掉';
+     return true;
+   })()`, 300);
+
+await step('退出登录：控制台真的消失，数据不留在屏幕上',
+  `(async () => {
+     document.querySelector('#logout').click();
+     await new Promise(r => setTimeout(r, 1200));
+     const shell = document.querySelector('.shell'), gate = document.querySelector('#gate');
+     if (getComputedStyle(shell).display !== 'none') return '控制台还看得见';
+     if (getComputedStyle(gate).display === 'none') return '登录框没出来';
+     if (document.querySelector('#rail').textContent.trim()) return '池子的内容还留在屏幕上';
+     return true;
+   })()`, 300);
+
+await step('重新登录后照旧可用',
+  `(async () => {
+     document.querySelector('#pw').value = ${JSON.stringify(PW)};
+     document.querySelector('#do-login').click();
+     await new Promise(r => setTimeout(r, 1800));
+     if (getComputedStyle(document.querySelector('.shell')).display === 'none') return '控制台没回来';
+     if (!document.querySelector('#rail').textContent.trim()) return '机架是空的';
      return true;
    })()`, 300);
 
