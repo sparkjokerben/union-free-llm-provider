@@ -6,6 +6,7 @@
 //!
 //! 所有写操作都走 `mutate()`：写完立刻重载配置快照，改动即时生效，不需要重启。
 
+pub mod presets;
 pub mod session;
 
 use std::collections::HashMap;
@@ -85,6 +86,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/admin/api/search_backends/{id}",
             patch(update_search_backend).delete(delete_search_backend),
         )
+        .route("/admin/api/search_backends/test", post(test_search_backend))
+        .route("/admin/api/presets", get(presets::list))
+        .route("/admin/api/presets/{id}/models", post(presets::models))
+        .route("/admin/api/presets/{id}/apply", post(presets::apply))
         .route("/admin/api/settings", get(get_settings).put(put_settings))
         .route("/admin/api/test_connection", post(test_connection))
         .route("/admin/api/deploy", post(deploy))
@@ -921,11 +926,24 @@ async fn update_key(
                 params![id, key.trim()],
             )?;
         }
-        if let Some(enabled) = p.enabled {
-            conn.execute(
-                "UPDATE upstream_keys SET enabled = ?2, status = ?3, status_reason = '' WHERE id = ?1",
-                params![id, enabled as i64, if enabled { "ok" } else { "disabled" }],
-            )?;
+        match p.enabled {
+            // 手动启用：连带清掉「被上游拒绝」的标记
+            Some(true) => {
+                conn.execute(
+                    "UPDATE upstream_keys SET enabled = 1, status = 'ok', status_reason = '',
+                            disabled_ms = NULL WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            // 手动停用只动 enabled。status 专指「上游拒绝过这把 key」（401/403 自动禁用）；
+            // 以前这里也写成 disabled，手动停用的 key 于是在后台被标成「被上游拒绝」。
+            Some(false) => {
+                conn.execute(
+                    "UPDATE upstream_keys SET enabled = 0 WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            None => {}
         }
         Ok(())
     })
@@ -1361,7 +1379,8 @@ async fn list_search_backends(
                         "id": r.get::<_, i64>(0)?,
                         "name": r.get::<_, String>(1)?,
                         "kind": r.get::<_, String>(2)?,
-                        "api_key_masked": mask_key(&key),
+                        // 空 key（jina 可以不带）就回空串，界面显示「无需密钥」而不是一串圆点
+                        "api_key_masked": if key.is_empty() { String::new() } else { mask_key(&key) },
                         "base_url": r.get::<_, String>(4)?,
                         "enabled": r.get::<_, i64>(5)? != 0,
                         "cooldown_until_ms": r.get::<_, Option<i64>>(6)?,
@@ -1464,6 +1483,107 @@ async fn delete_search_backend(
     Ok(Json(json!({"ok": true})).into_response())
 }
 
+#[derive(Deserialize)]
+struct SearchTestPayload {
+    /// 已保存的后端；和下面的字段一起给时，非空字段覆盖库里的值（表单里「先测再存」）。
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// 后台「测试搜索后端」：拿真实配置搜一次，报耗时、条数和前几条标题。
+///
+/// 和条目的连通性测试一样，只读不写：失败不进冷却，成功也不清冷却——
+/// 测试是人在看，不该替流量做决定（换了 key 保存时会自动清冷却）。
+async fn test_search_backend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<SearchTestPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    use crate::websearch::backends::{self, SearchBackend, SearchKind};
+
+    let saved = match p.id {
+        Some(id) => state
+            .db
+            .read(move |conn| backends::load_backend(conn, id))
+            .await
+            .map_err(internal)?,
+        None => None,
+    };
+    if p.id.is_some() && saved.is_none() {
+        return Err(bad_request("这个搜索后端不存在（可能刚被删掉）"));
+    }
+    let nonempty = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let kind = match nonempty(&p.kind) {
+        Some(k) => SearchKind::parse(&k).ok_or_else(|| bad_request("不认识的搜索后端类型"))?,
+        None => match &saved {
+            Some(b) => b.kind,
+            None => return Err(bad_request("缺少搜索后端类型")),
+        },
+    };
+    let api_key = nonempty(&p.api_key)
+        .or_else(|| saved.as_ref().map(|b| b.api_key.clone()))
+        .unwrap_or_default();
+    // 换了类型就别沿用旧类型的默认地址
+    let base_url = nonempty(&p.base_url)
+        .or_else(|| {
+            saved
+                .as_ref()
+                .filter(|b| b.kind == kind)
+                .map(|b| b.base_url.clone())
+        })
+        .unwrap_or_else(|| kind.default_base_url().to_string());
+    let backend = SearchBackend {
+        id: saved.as_ref().map(|b| b.id).unwrap_or(0),
+        name: saved
+            .as_ref()
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| kind.as_str().to_string()),
+        kind,
+        api_key,
+        base_url,
+        enabled: true,
+        cooldown_until_ms: None,
+    };
+    let query = nonempty(&p.query).unwrap_or_else(|| "rust programming language".to_string());
+
+    let started = std::time::Instant::now();
+    let out = backends::search(&state.client, &backend, &query, 5, 300).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let body = match out {
+        Ok(items) => json!({
+            "ok": true,
+            "query": query,
+            "latency_ms": latency_ms,
+            "count": items.len(),
+            "items": items.iter().take(3).map(|i| json!({"title": i.title, "url": i.url})).collect::<Vec<_>>(),
+            "cooling_until_ms": saved.and_then(|b| b.cooldown_until_ms)
+                .filter(|&t| t > chrono::Utc::now().timestamp_millis()),
+        }),
+        Err(f) => json!({
+            "ok": false,
+            "query": query,
+            "latency_ms": latency_ms,
+            "error": f.message,
+            "hint": connect_hint(&backend.base_url).await,
+        }),
+    };
+    Ok(Json(body).into_response())
+}
+
 // ============================================================================
 // 运行期设置
 // ============================================================================
@@ -1486,9 +1606,15 @@ async fn get_settings(
         })
         .await
         .map_err(internal)?;
-    let value: Value = row
+    let mut value: Value = row
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::to_value(Settings::default()).unwrap_or(json!({})));
+    // 部署令牌不进设置编辑框：它只在生成时显示一次，是否已配置看概览的 deploy.token_set。
+    // 放进来的话明文就躺在编辑框里；而且在别处轮换过令牌后，这边把旧内容保存一次，
+    // 令牌就被悄悄改回去，CI 部署从此 401。
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("deployToken");
+    }
     Ok(Json(value).into_response())
 }
 
@@ -1498,9 +1624,11 @@ async fn put_settings(
     Json(payload): Json<Value>,
 ) -> Result<Response, Response> {
     require_auth(&state, &headers)?;
-    let settings: Settings =
+    let mut settings: Settings =
         serde_json::from_value(payload).map_err(|e| bad_request(&format!("设置格式不对：{e}")))?;
     mutate(&state, move |conn| {
+        // 部署令牌不经过设置编辑框（见 get_settings），保存时沿用库里现有的值。
+        settings.deploy_token = crate::store::load_settings(conn)?.deploy_token;
         save_settings(conn, &settings)?;
         Ok(())
     })
@@ -1595,6 +1723,7 @@ async fn test_connection(
             out["latency_ms"] = json!(started.elapsed().as_millis() as u64);
             out["error_type"] = json!(e.kind());
             out["error"] = json!(e.to_string());
+            out["hint"] = json!(connect_hint(&req.url).await);
             return Ok(Json(out).into_response());
         }
     };
@@ -2135,6 +2264,32 @@ fn internal<E: std::fmt::Display>(e: E) -> Response {
 
 fn bad_request(message: &str) -> Response {
     ApiError::invalid_request(message.to_string()).into_response()
+}
+
+/// 测试失败时补一句人话：目标只有 IPv4 地址、而本机没有 IPv4 出口时，原始报错只是一句
+/// 「error sending request」，看不出是网络层面根本到不了（这台 VPS 就是纯 IPv6）。
+async fn connect_hint(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(it) => it.collect(),
+            Err(_) => return Some(format!("{host} 解析不出地址（DNS 失败）")),
+        };
+    if addrs.is_empty() || addrs.iter().any(|a| !a.is_ipv4() || a.ip().is_loopback()) {
+        return None;
+    }
+    // UDP connect 不发包，只问路由表：连「文档保留地址」都没路由，就是没有 IPv4 出口。
+    // 有 IPv4 出口时不猜——原始报错（拒绝连接、超时……）比猜测准。
+    let v4_route = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("192.0.2.1:9"))
+        .is_ok();
+    (!v4_route).then(|| {
+        format!(
+            "{host} 只有 IPv4 地址，而这台服务器没有 IPv4 出口，根本连不上它——换一个有 IPv6 的服务"
+        )
+    })
 }
 
 /// 写完库立刻重载配置快照（改动即时生效，不用重启）。

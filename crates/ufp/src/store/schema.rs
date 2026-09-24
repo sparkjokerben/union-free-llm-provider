@@ -180,6 +180,15 @@ CREATE TABLE IF NOT EXISTS admin (
 );
 "#;
 
+/// 旧数据修正，每次启动执行（幂等）。
+///
+/// - 旧版手动停用 key 时也把 status 写成 `disabled`，后台于是把它显示成「被上游拒绝」。
+///   上游自动禁用一定会写 `disabled_ms`，据此把手动停用的那些还原成 `ok`。
+pub const DATA_FIXUPS: &str = r#"
+UPDATE upstream_keys SET status = 'ok', status_reason = ''
+ WHERE status = 'disabled' AND disabled_ms IS NULL;
+"#;
+
 /// 打开连接后统一设置的 pragma。
 pub const PRAGMAS: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -190,3 +199,43 @@ PRAGMA temp_store = MEMORY;
 "#;
 
 pub const SCHEMA_VERSION: i64 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 旧版手动停用的_key_被还原_上游拒绝的保持不动() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO channels (id, name, protocol, base_url, created_ms) VALUES (1, 'c', 'openai_chat', 'x', 0);
+             -- 旧版手动停用：status 也被写成 disabled，但没有 disabled_ms
+             INSERT INTO upstream_keys (id, channel_id, api_key, enabled, status, created_ms) VALUES (1, 1, 'a', 0, 'disabled', 0);
+             -- 真被上游拒绝：一定带 disabled_ms
+             INSERT INTO upstream_keys (id, channel_id, api_key, enabled, status, status_reason, created_ms, disabled_ms)
+               VALUES (2, 1, 'b', 0, 'disabled', '401', 0, 123);",
+        )
+        .unwrap();
+        conn.execute_batch(DATA_FIXUPS).unwrap();
+        conn.execute_batch(DATA_FIXUPS).unwrap(); // 幂等
+        let status = |id: i64| -> (String, i64) {
+            conn.query_row(
+                "SELECT status, enabled FROM upstream_keys WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            status(1),
+            ("ok".to_string(), 0),
+            "手动停用：状态还原，但仍然停用"
+        );
+        assert_eq!(
+            status(2),
+            ("disabled".to_string(), 0),
+            "上游拒绝的不能被洗白"
+        );
+    }
+}

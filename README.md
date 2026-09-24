@@ -62,7 +62,15 @@ claude
 
 后台是「调度台」形态：左侧常驻机架按层列出条目，每行一盏状态灯（在线 / 冷却 / 熔断）与冷却倒计时；
 概览页有一条「尝试色带」——最近 80 次上游尝试各画一根细线，颜色表示结果、高度表示耗时，
-池子出问题时一眼能看出来。每个条目右侧的「测」会拿真实配置发一次最小请求测连通性（纯诊断，不计熔断）。
+池子出问题时一眼能看出来。每个条目右侧的「测」会拿真实配置发一次最小请求测连通性（纯诊断，不计熔断）；
+搜索后端也有「测」，拿真实配置搜一次，报耗时、条数和前几条标题（同样不碰冷却）。
+
+「新增渠道」先给出预设：**OpenRouter**、**Google AI Studio**、**OpenCode Zen**，或自定义。选预设后填 key、
+拉取线上模型列表（标出免费的、以及不支持工具调用而 Claude Code 用不了的），勾选即建好渠道、key 与条目；
+再应用一次只补新 key 和新模型，不会重复建渠道。预设会把请求头写成该上游原生客户端的样子
+（OpenRouter 模仿 OpenCode，Google AI Studio 模仿 Gemini CLI），写在渠道的「附加请求头」里，可看可改；
+值里的 `{model}` 发请求时替换成条目的模型名。OpenCode Zen 的免费模型只允许在 OpenCode 里用，
+网关不伪装 OpenCode 去绕这个限制：Zen 预设只接你自己的 Zen key，免费模型列出但不能勾。
 
 ## 它替你处理的麻烦事
 
@@ -117,7 +125,7 @@ cargo run -p ufp -- set-admin-password
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| `ci.yml` | push 到 main、PR | `cargo fmt --check`、`clippy -D warnings`、全量测试（含端到端），不碰密钥 |
+| `ci.yml` | push 到 main、PR | `cargo fmt --check`、`clippy -D warnings`、全量测试（含端到端）；无头 Chrome 跑一遍后台（`tests/ui-smoke.mjs`）。不碰密钥 |
 | `release.yml` | 打 tag `v*` | 编 x86_64 / aarch64 两个 musl 静态二进制 → 发 Release → **自动部署** |
 | `deploy.yml` | 手动 | 下发指定 tag（默认最近一次 Release）；`dry_run` 只验证域名可达 |
 
@@ -182,6 +190,8 @@ wget <新版本> -O /usr/local/bin/ufp.new && rc-service ufp upgrade
 - Gemini 流式响应里工具调用仍在流的末尾输出（文本与工具调用的相对位置丢失），
   对 Claude Code 这类客户端没有影响。
 - 搜索后端的域名过滤（`allowed_domains`）暂未下发到后端。
+- 服务器只有 IPv6 时，没有 IPv6 地址的服务连不上：Tavily、Firecrawl、Parallel 目前都是这样
+  （Exa、Jina 可达）。后台的「测」遇到这种情况会直接说明，而不是只报一句连接失败。
 - 上游压缩响应只在非流式路径解压；流式路径强制 `accept-encoding: identity`。
 - Gemini 的思考回放（thought part）与 `thinkingBudget: 0` 的行为需要在真机
   免费额度上实测一遍（已按官方文档实现，但免费层各版本策略有差异）。

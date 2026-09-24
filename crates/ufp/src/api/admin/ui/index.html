@@ -128,6 +128,9 @@ label.f span { display: block; font-size: 12px; color: var(--ink-2); margin-bott
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px }
 .row > * { width: auto }
 .row input, .row textarea { width: auto; flex: 1; min-width: 140px }
+/* 上一条只该管文本框：勾选框也被拉到 140px 宽，和它的文字隔出一大段空白 */
+.row input[type="checkbox"], .row input[type="radio"] { flex: none; min-width: 0; margin: 0 4px 0 0; vertical-align: -1px }
+.row input.narrow { flex: none; min-width: 0; width: 72px }
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 14px }
 
 /* ── 尝试色带：池子的心电图 ───────────────────────────────────────── */
@@ -152,6 +155,26 @@ label.f span { display: block; font-size: 12px; color: var(--ink-2); margin-bott
 /* ── 测试结果 ─────────────────────────────────────────────────────── */
 .probe { font-family: var(--mono); font-size: 12px; margin-top: 4px }
 .probe.ok { color: var(--live) } .probe.bad { color: var(--fail) } .probe.run { color: var(--ink-3) }
+.probe.hold { color: var(--hold) }
+.probe .when { color: var(--ink-3) }
+.slot .sub:empty { display: none }
+
+/* ── 预设与模型列表 ───────────────────────────────────────────────────── */
+.presets { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; margin-top: 6px }
+.preset { display: grid; gap: 3px; text-align: left; padding: 10px 12px; background: var(--card) }
+.preset b { font-family: var(--serif); font-size: 14px; font-weight: 600 }
+.preset span { font-size: 12px; color: var(--ink-2); line-height: 1.5 }
+.preset:hover { border-color: var(--live) }
+.models { max-height: 44vh; overflow: auto; border: 1px solid var(--line-2); border-radius: var(--r) }
+.models label { display: grid; grid-template-columns: 18px minmax(0,1fr) auto; gap: 2px 8px; align-items: baseline;
+                padding: 6px 10px; border-bottom: 1px solid var(--line-2); cursor: pointer }
+.models label:hover { background: var(--paper) }
+.models label.off { cursor: default; color: var(--ink-3) }
+.models input { width: auto; margin: 0 }
+.models .mid { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere }
+.models .ctx { font-family: var(--mono); font-size: 11px; color: var(--ink-3); white-space: nowrap }
+.models .meta { grid-column: 2 / -1; font-size: 11px; color: var(--ink-3) }
+.models .meta:empty { display: none }
 
 /* ── 对话框与提示 ─────────────────────────────────────────────────── */
 dialog { border: 1px solid var(--line); border-radius: var(--r); background: var(--card); color: var(--ink);

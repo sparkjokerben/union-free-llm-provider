@@ -86,39 +86,51 @@ pub fn load_backends(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Search
         "SELECT id, name, kind, api_key, base_url, enabled, cooldown_until_ms
          FROM search_backends WHERE enabled = 1 ORDER BY id",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, i64>(5)?,
-            r.get::<_, Option<i64>>(6)?,
-        ))
-    })?;
+    let rows = stmt.query_map([], backend_row)?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, name, kind, api_key, base_url, enabled, cooldown_until_ms) = row?;
-        let Some(kind) = SearchKind::parse(&kind) else {
-            tracing::warn!(backend = %name, kind, "未知的搜索后端类型，已跳过");
-            continue;
-        };
-        out.push(SearchBackend {
-            id,
-            name,
-            kind,
-            api_key,
-            base_url: if base_url.trim().is_empty() {
-                kind.default_base_url().to_string()
-            } else {
-                base_url
-            },
-            enabled: enabled != 0,
-            cooldown_until_ms,
-        });
+        if let Some(b) = row? {
+            out.push(b);
+        }
     }
     Ok(out)
+}
+
+/// 按 id 读一个后端，不管是否启用（后台「测试」要能在启用之前先测）。
+pub fn load_backend(
+    conn: &rusqlite::Connection,
+    id: i64,
+) -> rusqlite::Result<Option<SearchBackend>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, kind, api_key, base_url, enabled, cooldown_until_ms
+         FROM search_backends WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map([id], backend_row)?;
+    Ok(rows.next().transpose()?.flatten())
+}
+
+/// 一行 → 后端；类型不认识的跳过（返回 None）。
+fn backend_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<SearchBackend>> {
+    let name: String = r.get(1)?;
+    let kind_raw: String = r.get(2)?;
+    let Some(kind) = SearchKind::parse(&kind_raw) else {
+        tracing::warn!(backend = %name, kind = %kind_raw, "未知的搜索后端类型，已跳过");
+        return Ok(None);
+    };
+    let base_url: String = r.get(4)?;
+    Ok(Some(SearchBackend {
+        id: r.get(0)?,
+        name,
+        kind,
+        api_key: r.get(3)?,
+        base_url: if base_url.trim().is_empty() {
+            kind.default_base_url().to_string()
+        } else {
+            base_url
+        },
+        enabled: r.get::<_, i64>(5)? != 0,
+        cooldown_until_ms: r.get(6)?,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +186,7 @@ pub async fn search(
             message: format!(
                 "{} 返回 {status}：{}",
                 backend.name,
-                truncate(&body_text, 300)
+                error_summary(&body_text)
             ),
             cooldown_until_ms: cooldown,
         });
@@ -192,6 +204,27 @@ pub async fn search(
         );
     }
     Ok(items)
+}
+
+/// 错误响应体里挑出人话：各家都爱把原因放在 message / error.message / detail 里，
+/// 找不到再退回截断的原文。
+fn error_summary(body: &str) -> String {
+    let pick = |v: &Value| -> Option<String> {
+        [
+            v.get("message"),
+            v.pointer("/error/message"),
+            v.get("error").filter(|e| e.is_string()),
+            v.get("detail"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|x| x.as_str().map(str::to_string))
+    };
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| pick(&v))
+        .map(|m| truncate(&m, 300))
+        .unwrap_or_else(|| truncate(body, 300))
 }
 
 fn now_ms() -> i64 {

@@ -255,6 +255,45 @@ for (const page of JSON.parse(pages)) {
      })()`, 150);
 }
 
+// 页面里的跳转按钮：页签高亮和显示的内容必须是同一页（曾经只换了高亮，内容还停在原页）
+await step('页内跳转：概览的「看请求明细」真的切到请求页',
+  `(async () => {
+     document.querySelector('#pages button[data-page="overview"]').click();
+     await new Promise(r => setTimeout(r, 900));
+     document.querySelector('#p-overview button[data-go="requests"]').click();
+     await new Promise(r => setTimeout(r, 900));
+     const tab = document.querySelector('#pages [aria-current]').dataset.page;
+     const shown = [...document.querySelectorAll('section')].filter(s => getComputedStyle(s).display !== 'none').map(s => s.id);
+     return tab === 'requests' && shown.join() === 'p-requests' ? true : '页签=' + tab + ' 可见=' + shown.join();
+   })()`, 200);
+
+await step('设置编辑框里没有部署令牌',
+  `(async () => {
+     document.querySelector('#pages button[data-page="settings"]').click();
+     await new Promise(r => setTimeout(r, 900));
+     return /deployToken/.test(document.querySelector('#set').value) ? '编辑框里出现了 deployToken' : true;
+   })()`, 200);
+
+await step('定时刷新不冲掉设置页里没保存的编辑',
+  `(async () => {
+     const box = document.querySelector('#set');
+     box.value = '{"__half_edited__": true}';
+     await tick();
+     return document.querySelector('#set').value.includes('__half_edited__') ? true : '编辑内容被刷新冲掉了';
+   })()`, 200);
+
+await step('新增渠道先给出预设（OpenRouter / Google AI Studio / OpenCode Zen / 自定义）',
+  `(async () => {
+     document.querySelector('#pages button[data-page="pool"]').click();
+     await new Promise(r => setTimeout(r, 900));
+     document.querySelector('button[data-newch]').click();
+     await new Promise(r => setTimeout(r, 600));
+     const names = [...document.querySelectorAll('#dlg .preset b')].map(b => b.textContent);
+     document.querySelector('#dlg').close();
+     const want = ['OpenRouter', 'Google AI Studio', 'OpenCode Zen', '自定义'];
+     return want.every(w => names.includes(w)) ? true : '预设不全：' + names.join('、');
+   })()`, 200);
+
 if (WRITES) {
   await step('写操作：设置项原样存回（同样走 POST/PUT）',
     `(async () => {
@@ -268,6 +307,8 @@ if (WRITES) {
        document.querySelector('#pages button[data-page="pool"]').click();
        await new Promise(r => setTimeout(r, 800));
        document.querySelector('button[data-newch]').click();
+       await new Promise(r => setTimeout(r, 600));
+       [...document.querySelectorAll('#dlg .preset')].find(b => b.textContent.includes('自定义')).click();
        await new Promise(r => setTimeout(r, 300));
        document.querySelector('#f-name').value = '__smoke_chan__';
        document.querySelector('#f-proto').value = 'openai_chat';
@@ -276,6 +317,25 @@ if (WRITES) {
        await new Promise(r => setTimeout(r, 1500));
        if (!S.pool.channels.some(c => c.name === '__smoke_chan__')) return '新渠道没进池子';
        return true;
+     })()`, 300);
+
+  await step('加 key → 停用：行内显示「停用」，不是「被上游拒绝」',
+    `(async () => {
+       const sec = () => [...document.querySelectorAll('#p-pool div.sec')].find(x => x.textContent.includes('__smoke_chan__'));
+       sec().querySelector('button[data-newkey]').click();
+       await new Promise(r => setTimeout(r, 300));
+       document.querySelector('#f-label').value = 'smoke-key';
+       document.querySelector('#f-key').value = 'sk-smoke-0000000000';
+       document.querySelector('#f-save').click();
+       await new Promise(r => setTimeout(r, 1200));
+       const tog = sec().querySelector('button[data-togkey]');
+       if (!tog) return '找不到停用按钮';
+       tog.click();
+       await new Promise(r => setTimeout(r, 1200));
+       const row = [...sec().querySelectorAll('tr')].find(tr => tr.textContent.includes('smoke-key'));
+       const txt = row ? row.textContent.replace(/\s+/g, ' ') : '';
+       if (/被上游拒绝/.test(txt)) return '手动停用被显示成被上游拒绝：' + txt;
+       return /停用/.test(txt) && /启用/.test(row.querySelector('button[data-togkey]').textContent) ? true : '状态没同步：' + txt;
      })()`, 300);
 
   await step('对话框：删除渠道（自己清理干净）',
@@ -290,7 +350,7 @@ if (WRITES) {
      })()`, 300);
 
 } else {
-  console.log('  · 跳过写操作（设置回存、新建/删除渠道）—— 只读模式');
+  console.log('  · 跳过写操作（设置回存、新建渠道 / 加 key / 停用 / 删除）—— 只读模式');
 }
 
 await step('退出登录：控制台真的消失，数据不留在屏幕上',

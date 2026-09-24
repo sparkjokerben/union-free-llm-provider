@@ -55,9 +55,11 @@ pub fn build(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, Co
         Protocol::Gemini => gemini::prepare(cand, ctx)?,
     };
     // 渠道配置的附加头放在最后，同名覆盖（大小写不敏感）。
+    // 值里的 {model} 换成这个条目的上游模型名（Gemini CLI 的 User-Agent 就带着模型名）。
     for (k, v) in &cand.channel.extra_headers {
         req.headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(k));
-        req.headers.push((k.clone(), v.clone()));
+        req.headers
+            .push((k.clone(), v.replace("{model}", &cand.entry.upstream_model)));
     }
     Ok(req)
 }

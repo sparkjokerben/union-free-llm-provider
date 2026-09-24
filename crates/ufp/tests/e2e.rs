@@ -1404,3 +1404,385 @@ async fn 部署接口_令牌与哈希校验() {
     let saved = body["file"].as_str().unwrap();
     assert!(std::path::Path::new(saved).exists(), "包应已落盘：{saved}");
 }
+
+// ============================================================================
+// 后台：同步修复、搜索后端测试、渠道预设
+// ============================================================================
+
+const ADMIN_PW: &str = "test-password-123";
+
+fn seed_admin(conn: &rusqlite::Connection) {
+    use argon2::password_hash::PasswordHasher;
+    let salt =
+        argon2::password_hash::SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    let hash = argon2::Argon2::default()
+        .hash_password(ADMIN_PW.as_bytes(), &salt)
+        .unwrap()
+        .to_string();
+    conn.execute(
+        "INSERT INTO admin (id, password_hash, updated_ms) VALUES (1, ?1, 0)",
+        rusqlite::params![hash],
+    )
+    .unwrap();
+}
+
+/// 登录后台，返回带会话 Cookie 的请求器。
+async fn admin(
+    gw: &Gateway,
+) -> impl Fn(reqwest::Method, &str, Option<Value>) -> reqwest::RequestBuilder {
+    let resp = client()
+        .post(format!("{}/admin/api/login", gw.base))
+        .json(&json!({"password": ADMIN_PW}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cookie = resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let base = gw.base.clone();
+    move |m, p, body| {
+        let mut rb = client()
+            .request(m, format!("{base}{p}"))
+            .header("cookie", &cookie);
+        if let Some(b) = body {
+            rb = rb.json(&b);
+        }
+        rb
+    }
+}
+
+async fn json_of(rb: reqwest::RequestBuilder) -> (u16, Value) {
+    let resp = rb.send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn 渠道附加请求头覆盖_ua_并替换模型占位() {
+    use wiremock::matchers::header;
+    let mock = MockServer::start().await;
+    // 只有带着「模仿客户端」的 UA、且 {model} 已换成条目模型名时才应答
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header(
+            "user-agent",
+            "GeminiCLI-tui/0.61.0/gpt-4o-mini (linux; x64; terminal)",
+        ))
+        .and(header("x-title", "opencode"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_body("gpt-4o-mini", "头对了")),
+        )
+        .mount(&mock)
+        .await;
+    let mock_uri = mock.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "ua",
+            "openai_chat",
+            &mock_uri,
+            "sk-x",
+            "gpt-4o-mini",
+            1,
+        );
+        conn.execute(
+            "UPDATE channels SET extra_headers = ?1",
+            rusqlite::params![json!({
+                "User-Agent": "GeminiCLI-tui/0.61.0/{model} (linux; x64; terminal)",
+                "X-Title": "opencode"
+            })
+            .to_string()],
+        )
+        .unwrap();
+    })
+    .await;
+    let resp = client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(&anthropic_body(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "上游没认出请求头：{}",
+        resp.text().await.unwrap()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "头对了");
+}
+
+#[tokio::test]
+async fn 后台_手动停用_key_不算上游拒绝_启用会清掉拒绝标记() {
+    let gw = spawn_gateway(|conn| {
+        seed_admin(conn);
+        seed_channel(conn, "c", "openai_chat", "http://127.0.0.1:9", "sk-a", "m", 1);
+        // 第二把 key 被上游拒绝过
+        conn.execute(
+            "INSERT INTO upstream_keys (channel_id, label, api_key, enabled, status, status_reason, disabled_ms, created_ms)
+             VALUES (1, 'k2', 'sk-b', 0, 'disabled', '401 invalid key', 5, 0)",
+            [],
+        )
+        .unwrap();
+    })
+    .await;
+    let a = admin(&gw).await;
+    let (s, _) = json_of(a(
+        reqwest::Method::PATCH,
+        "/admin/api/keys/1",
+        Some(json!({"enabled": false})),
+    ))
+    .await;
+    assert_eq!(s, 200);
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let k1 = &pool["keys"][0];
+    assert_eq!(k1["enabled"], false);
+    assert_eq!(k1["status"], "ok", "手动停用不能被显示成「被上游拒绝」");
+
+    let (s, _) = json_of(a(
+        reqwest::Method::PATCH,
+        "/admin/api/keys/2",
+        Some(json!({"enabled": true})),
+    ))
+    .await;
+    assert_eq!(s, 200);
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let k2 = &pool["keys"][1];
+    assert_eq!(k2["enabled"], true);
+    assert_eq!(k2["status"], "ok");
+    assert_eq!(k2["status_reason"], "");
+    assert!(k2["disabled_ms"].is_null());
+}
+
+#[tokio::test]
+async fn 后台_设置接口不回显部署令牌_保存设置不会改掉令牌() {
+    let gw = spawn_gateway(seed_admin).await;
+    let a = admin(&gw).await;
+    let (_, rotated) = json_of(a(reqwest::Method::POST, "/admin/api/deploy-token", None)).await;
+    let token = rotated["token"].as_str().unwrap().to_string();
+
+    let (_, settings) = json_of(a(reqwest::Method::GET, "/admin/api/settings", None)).await;
+    assert!(
+        settings.get("deployToken").is_none(),
+        "令牌不能出现在设置编辑框里"
+    );
+    assert!(!settings.to_string().contains(&token));
+
+    // 把拿到的设置原样存回（相当于在另一个页签里保存了旧内容）
+    let (s, _) = json_of(a(
+        reqwest::Method::PUT,
+        "/admin/api/settings",
+        Some(settings),
+    ))
+    .await;
+    assert_eq!(s, 200);
+    let stored = gw
+        .state
+        .db
+        .read(|conn| Ok(ufp::store::load_settings(conn)?.deploy_token))
+        .await
+        .unwrap();
+    assert_eq!(stored, token, "保存设置不能把部署令牌改掉");
+}
+
+#[tokio::test]
+async fn 后台_搜索后端测试_报结果_失败也不写冷却() {
+    let ok = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tavily_results()))
+        .mount(&ok)
+        .await;
+    let bad = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .mount(&bad)
+        .await;
+    let (ok_uri, bad_uri) = (ok.uri(), bad.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_admin(conn);
+        seed_search_backend(conn, "tavily", &ok_uri, "tvly-ok");
+        seed_search_backend(conn, "tavily", &bad_uri, "tvly-bad");
+        // 停用的也要能测
+        conn.execute("UPDATE search_backends SET enabled = 0 WHERE id = 1", [])
+            .unwrap();
+    })
+    .await;
+    let a = admin(&gw).await;
+
+    let (s, r) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/test",
+        Some(json!({"id": 1})),
+    ))
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["count"], 2);
+    assert_eq!(r["items"][0]["title"], "Rust 官网");
+
+    let (_, r) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/test",
+        Some(json!({"id": 2})),
+    ))
+    .await;
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().unwrap().contains("429"), "{r}");
+    let cooldown: Option<i64> = gw
+        .state
+        .db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT cooldown_until_ms FROM search_backends WHERE id = 2",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(cooldown.is_none(), "测试是人在看，不能替流量把后端打进冷却");
+
+    // 表单里「先测再存」：没有 id，直接给配置
+    let (_, r) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/test",
+        Some(json!({"kind": "tavily", "base_url": ok.uri(), "api_key": "tvly-new"})),
+    ))
+    .await;
+    assert_eq!(r["ok"], true, "{r}");
+}
+
+#[tokio::test]
+async fn 后台_预设应用_建渠道带客户端头_再应用只补差() {
+    let gw = spawn_gateway(|conn| {
+        seed_admin(conn);
+        // 用户手工建过一个 Gemini 渠道（地址与预设相同），头里有一个自定义值
+        conn.execute(
+            "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, created_ms)
+             VALUES ('我的 Gemini', 'gemini', 'https://generativelanguage.googleapis.com', ?1, 1, 0)",
+            rusqlite::params![json!({"User-Agent": "我自己设的"}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO upstream_keys (channel_id, label, api_key, enabled, created_ms) VALUES (1, 'k', 'AIza-x', 1, 0)",
+            [],
+        )
+        .unwrap();
+    })
+    .await;
+    let a = admin(&gw).await;
+    let apply = |id: &str, body: Value| {
+        a(
+            reqwest::Method::POST,
+            &format!("/admin/api/presets/{id}/apply"),
+            Some(body),
+        )
+    };
+    let m = |id: &str, proto: &str| json!({"id": id, "protocol": proto, "context": 131072, "vision": true});
+
+    // 第一次应用 OpenRouter：没 key 不行
+    let (s, r) = json_of(apply(
+        "openrouter",
+        json!({"models": [m("a:free", "openai_chat")]}),
+    ))
+    .await;
+    assert_eq!(s, 400, "{r}");
+
+    let (s, r) = json_of(apply(
+        "openrouter",
+        json!({"api_key": "sk-or-1", "key_label": "主号",
+        "models": [m("a:free", "openai_chat"), m("b:free", "openai_chat")]}),
+    ))
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["channels"][0]["created"], true);
+    assert_eq!(
+        (r["keys_added"].as_i64(), r["entries_added"].as_i64()),
+        (Some(1), Some(2))
+    );
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let or = pool["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "OpenRouter")
+        .unwrap();
+    assert_eq!(or["extra_headers"]["HTTP-Referer"], "https://opencode.ai/");
+    assert_eq!(or["extra_headers"]["X-Title"], "opencode");
+    assert!(or["extra_headers"]["User-Agent"]
+        .as_str()
+        .unwrap()
+        .starts_with("opencode/"));
+
+    // 再应用：同一把 key、一个旧模型一个新模型 → 不建新渠道、不加重复 key、只补新条目
+    let (_, r) = json_of(apply(
+        "openrouter",
+        json!({"api_key": "sk-or-1",
+        "models": [m("a:free", "openai_chat"), m("c:free", "openai_chat")]}),
+    ))
+    .await;
+    assert_eq!(r["channels"][0]["created"], false);
+    assert_eq!(
+        (
+            r["keys_added"].as_i64(),
+            r["entries_added"].as_i64(),
+            r["entries_existing"].as_i64()
+        ),
+        (Some(0), Some(1), Some(1))
+    );
+
+    // Zen：两个模型族 → 两个渠道，各自协议；不带任何伪装头
+    let (_, r) = json_of(apply(
+        "opencode-zen",
+        json!({"api_key": "zen-1",
+        "models": [m("claude-x", "anthropic"), m("glm-x", "openai_chat")]}),
+    ))
+    .await;
+    let names: Vec<&str> = r["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"OpenCode Zen · messages") && names.contains(&"OpenCode Zen · chat"),
+        "{names:?}"
+    );
+    // 预设不支持的协议要拒
+    let (s, _) = json_of(apply(
+        "opencode-zen",
+        json!({"api_key": "zen-1", "models": [m("g", "gemini")]}),
+    ))
+    .await;
+    assert_eq!(s, 400);
+
+    // Google：认领用户已有的渠道（沿用它的 key），只补缺的头，不动用户设的 UA
+    let (s, r) = json_of(apply(
+        "google-ai-studio",
+        json!({"models": [m("gemini-3.8-flash", "gemini")]}),
+    ))
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["channels"][0]["created"], false);
+    assert_eq!(r["headers_added"], 2, "{r}");
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let g = &pool["channels"][0];
+    assert_eq!(g["extra_headers"]["User-Agent"], "我自己设的");
+    assert!(g["extra_headers"]["x-goog-api-client"]
+        .as_str()
+        .unwrap()
+        .starts_with("google-genai-sdk/"));
+
+    // 这些改动立刻进池：应用完就能被路由选中
+    let entries = gw.state.pool.load().entries.len();
+    assert_eq!(entries, 3 + 2 + 1, "OpenRouter 3 + Zen 2 + Gemini 1");
+}
