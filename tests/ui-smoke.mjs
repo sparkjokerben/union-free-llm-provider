@@ -11,6 +11,13 @@
 //   UFP_DB=/tmp/smoke.db UFP_LISTEN=127.0.0.1:8787 ./target/debug/ufp serve &
 //   node tests/ui-smoke.mjs http://127.0.0.1:8787 ci-smoke-password
 //
+// 关于写操作：登录本身是 POST（会话），另外还会把设置原样存回、建一个渠道再删掉。
+// 这些写只允许落在**本机的一次性实例**上 —— 这个脚本能被随手指向任何地址，不能让它
+// 有机会改掉线上配置。指向非本机地址时自动只读（跳过写操作那几步），要对非本机实例
+// 写就必须显式加 --write。
+//   看判定结果（不连任何东西）：node tests/ui-smoke.mjs <地址> --selfcheck
+//   强制只读（用来验证只读那条路径）：UFP_SMOKE_RO=1 node tests/ui-smoke.mjs <地址> <密码>
+//
 // 依赖：Node 22+（用到全局 WebSocket）、本机的 Chrome / Chromium / Edge。
 // 退出码非 0 表示后台不可用，消息里会写明是哪一步坏、控制台报了什么。
 
@@ -22,6 +29,21 @@ import { join } from 'node:path';
 const BASE = process.argv[2] || 'http://127.0.0.1:8787';
 const PW = process.argv[3] || 'ci-smoke-password';
 const PORT = 9500 + Math.floor(Math.random() * 400);
+
+// 目标是不是「本机的一次性实例」——只看地址，写操作的全部许可都系在这上面
+const host = (() => { try { return new URL(BASE).hostname; } catch { return ''; } })();
+const isLoopback = host === 'localhost' || host === '::1' || host === '[::1]' || /^127\./.test(host);
+const forceRo = ['1', 'true', 'yes'].includes(String(process.env.UFP_SMOKE_RO || '').toLowerCase());
+const allowWrite = process.argv.includes('--write');
+const WRITES = !forceRo && (isLoopback || allowWrite);
+
+if (process.argv.includes('--selfcheck')) {
+  console.log(JSON.stringify({
+    地址: BASE, 主机: host, 本机: isLoopback,
+    强制只读: forceRo, 显式允许写: allowWrite, 会做写操作: WRITES,
+  }, null, 1));
+  process.exit(0);
+}
 
 const CANDIDATES = [
   process.env.CHROME,
@@ -169,6 +191,11 @@ await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 860, dev
 
 console.log(`· 浏览器：${browser}`);
 console.log(`· 目标：${BASE}/admin`);
+console.log(WRITES
+  ? '· 写操作：开（只写这个实例自己的库）'
+  : forceRo
+    ? '· 写操作：关 —— 强制只读（UFP_SMOKE_RO）'
+    : `· 写操作：关 —— 目标 ${host} 不是本机实例；确实要写就显式加 --write`);
 await send('Page.navigate', { url: `${BASE}/admin` });
 await sleep(2000);
 
@@ -228,38 +255,43 @@ for (const page of JSON.parse(pages)) {
      })()`, 150);
 }
 
-await step('写操作：设置项原样存回（同样走 POST/PUT）',
-  `(async () => {
-     const s = await api('/admin/api/settings');
-     await api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(s) });
-     return true;
-   })()`, 300);
+if (WRITES) {
+  await step('写操作：设置项原样存回（同样走 POST/PUT）',
+    `(async () => {
+       const s = await api('/admin/api/settings');
+       await api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(s) });
+       return true;
+     })()`, 300);
 
-await step('对话框：新建渠道 → 出现在池子里',
-  `(async () => {
-     document.querySelector('#pages button[data-page="pool"]').click();
-     await new Promise(r => setTimeout(r, 800));
-     document.querySelector('button[data-newch]').click();
-     await new Promise(r => setTimeout(r, 300));
-     document.querySelector('#f-name').value = '__smoke_chan__';
-     document.querySelector('#f-proto').value = 'openai_chat';
-     document.querySelector('#f-url').value = 'http://127.0.0.1:9/v1';
-     document.querySelector('#f-save').click();
-     await new Promise(r => setTimeout(r, 1500));
-     if (!S.pool.channels.some(c => c.name === '__smoke_chan__')) return '新渠道没进池子';
-     return true;
-   })()`, 300);
+  await step('对话框：新建渠道 → 出现在池子里',
+    `(async () => {
+       document.querySelector('#pages button[data-page="pool"]').click();
+       await new Promise(r => setTimeout(r, 800));
+       document.querySelector('button[data-newch]').click();
+       await new Promise(r => setTimeout(r, 300));
+       document.querySelector('#f-name').value = '__smoke_chan__';
+       document.querySelector('#f-proto').value = 'openai_chat';
+       document.querySelector('#f-url').value = 'http://127.0.0.1:9/v1';
+       document.querySelector('#f-save').click();
+       await new Promise(r => setTimeout(r, 1500));
+       if (!S.pool.channels.some(c => c.name === '__smoke_chan__')) return '新渠道没进池子';
+       return true;
+     })()`, 300);
 
-await step('对话框：删除渠道（自己清理干净）',
-  `(async () => {
-     const b = [...document.querySelectorAll('button[data-delchan]')]
-       .find(x => x.closest('div.sec').textContent.includes('__smoke_chan__'));
-     if (!b) return '找不到删除按钮';
-     b.click();
-     await new Promise(r => setTimeout(r, 1500));
-     if (S.pool.channels.some(c => c.name === '__smoke_chan__')) return '渠道没删掉';
-     return true;
-   })()`, 300);
+  await step('对话框：删除渠道（自己清理干净）',
+    `(async () => {
+       const b = [...document.querySelectorAll('button[data-delchan]')]
+         .find(x => x.closest('div.sec').textContent.includes('__smoke_chan__'));
+       if (!b) return '找不到删除按钮';
+       b.click();
+       await new Promise(r => setTimeout(r, 1500));
+       if (S.pool.channels.some(c => c.name === '__smoke_chan__')) return '渠道没删掉';
+       return true;
+     })()`, 300);
+
+} else {
+  console.log('  · 跳过写操作（设置回存、新建/删除渠道）—— 只读模式');
+}
 
 await step('退出登录：控制台真的消失，数据不留在屏幕上',
   `(async () => {
@@ -286,7 +318,7 @@ if (problems.length) {
   fail('页面控制台有报错：\n  ' + problems.join('\n  '));
 }
 
-console.log('\n✓ 后台冒烟测试通过：登录、九个页面、写操作、对话框都正常，控制台无异常。');
+console.log(`\n✓ 后台冒烟测试通过：登录、九个页面${WRITES ? '、写操作、对话框' : '（只读，未做写操作）'}都正常，控制台无异常。`);
 ws.close();
 child.kill('SIGKILL');
 process.exit(0);

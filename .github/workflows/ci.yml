@@ -11,6 +11,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# 这个工作流只需要读代码：它不发布、不部署、不碰任何密钥。
+# 显式写出来，免得哪天默认权限变了、或者有人往里加了需要写权限的步骤而没人注意。
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -60,13 +65,18 @@ jobs:
       - name: 起一个本地实例
         run: |
           set -euo pipefail
-          UFP_DB="$RUNNER_TEMP/smoke.db" ./target/debug/ufp set-admin-password 'ci-smoke-password'
-          UFP_DB="$RUNNER_TEMP/smoke.db" UFP_LISTEN=127.0.0.1:8787 UFP_LOG_DIR="$RUNNER_TEMP/logs" \
+          DB="$RUNNER_TEMP/smoke.db"
+          # 冒烟测试会做写操作（设置回存、建渠道再删掉），所以它必须跑在一个
+          # 一次性实例上：库在 runner 的临时目录里，进程只听本机回环地址。
+          # 这条断言是给以后改这个 job 的人看的：库一旦不在这里，就别往下跑。
+          case "$DB" in "$RUNNER_TEMP"/*) ;; *) echo "库不在 RUNNER_TEMP 下，拒绝继续"; exit 1 ;; esac
+          UFP_DB="$DB" ./target/debug/ufp set-admin-password 'ci-smoke-password'
+          UFP_DB="$DB" UFP_LISTEN=127.0.0.1:8787 UFP_LOG_DIR="$RUNNER_TEMP/logs" \
             ./target/debug/ufp serve &
           for _ in $(seq 1 60); do
             curl -fsS http://127.0.0.1:8787/healthz && break
             sleep 1
           done
 
-      - name: 后台冒烟（无头 Chrome）
+      - name: 后台冒烟（无头 Chrome，写操作只落在上面那个一次性实例上）
         run: node tests/ui-smoke.mjs http://127.0.0.1:8787 ci-smoke-password
