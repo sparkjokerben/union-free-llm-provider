@@ -19,7 +19,8 @@ use ufp_convert::ConvertError;
 
 pub fn prepare(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, ConvertError> {
     let body = with_model(ctx.client_body, &cand.entry.upstream_model);
-    let converted = anthropic_to_gemini_with_shadow(body, None, None, None)?;
+    let mut converted = anthropic_to_gemini_with_shadow(body, None, None, None)?;
+    super::shape_body(cand, ctx, &mut converted);
 
     let model = normalize_gemini_model_id(&cand.entry.upstream_model);
     let url = endpoint_url(&cand.channel.base_url, model, ctx.stream);

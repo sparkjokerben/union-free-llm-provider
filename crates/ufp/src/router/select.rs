@@ -263,6 +263,7 @@ mod tests {
                 base_url: "http://localhost".into(),
                 extra_headers: Vec::new(),
                 enabled: true,
+                client_profile: Default::default(),
             });
             let ks = keys.entry(channel_id).or_insert_with(Vec::new);
             if ks.is_empty() {

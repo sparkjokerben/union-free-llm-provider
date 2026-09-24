@@ -466,6 +466,7 @@ async function pPool(host) {
       const hdrs = Object.keys(c.extra_headers || {});
       return `<div class="sec">
         <h2>${esc(c.name)} <span class="tag">${esc(c.protocol)}</span>
+          ${c.client_profile === 'opencode' ? '<span class="tag">模仿 OpenCode</span>' : ''}
           ${c.enabled ? '' : '<span class="tag fail">已停用</span>'}</h2>
         <p class="note">${esc(c.base_url)}${c.notes ? ' — ' + esc(c.notes) : ''}${hdrs.length
           ? `<br>附加请求头：<span class="mono">${hdrs.map(esc).join('、')}</span>` : ''}</p>
@@ -582,7 +583,7 @@ function presetForm(p) {
   const st = { models: [], picked: new Map(), freeOnly: false, filter: '' };
   dlg(`<h2>${esc(p.name)}</h2>
     <p class="note">${esc(p.summary)}<br>${p.client
-      ? `请求头模仿 <b>${esc(p.client)}</b>（${p.headers.map(esc).join('、')}），建好后在「改渠道」里可以看、可以改。`
+      ? `${p.profile ? '请求头、请求体与会话 id' : '请求头'}模仿 <b>${esc(p.client)}</b>（${p.headers.map(esc).join('、')}），建好后在「改渠道」里可以看、可以改。`
       : '不模仿任何客户端，用网关自己的请求头。'}${p.notes.map((n) => '<br>' + esc(n)).join('')}</p>
     <div class="grid2">
       <label class="f"><span>api key（<a href="${esc(p.key_url)}" target="_blank" rel="noopener">去申请</a>）</span>
@@ -664,7 +665,7 @@ function presetForm(p) {
 }
 
 function channelForm(c) {
-  const cur = c || { name: '', protocol: 'openai_chat', base_url: '', extra_headers: {}, enabled: true, notes: '' };
+  const cur = c || { name: '', protocol: 'openai_chat', base_url: '', extra_headers: {}, enabled: true, notes: '', client_profile: '' };
   dlg(`<h2>${c ? '修改渠道' : '新增渠道'}</h2>
     <label class="f"><span>名字</span><input id="f-name" value="${esc(cur.name)}" placeholder="比如 gemini-free"></label>
     <div class="grid2">
@@ -674,7 +675,12 @@ function channelForm(c) {
       <label class="f"><span>base_url（粘到 /v1 或完整端点都行）</span>
         <input id="f-url" value="${esc(cur.base_url)}" placeholder="https://api.example.com/v1"></label>
     </div>
-    <label class="f"><span>附加请求头（JSON，可留空；值里的 {model} 发请求时换成条目的模型名）</span>
+    <label class="f"><span>请求体与会话 id 按谁的样子发</span><select id="f-profile">
+      <option value="" ${cur.client_profile ? '' : 'selected'}>不模仿（按转换结果原样发）</option>
+      <option value="opencode" ${cur.client_profile === 'opencode' ? 'selected' : ''}>OpenCode（访问 OpenCode Zen 用）</option>
+    </select></label>
+    <label class="f"><span>附加请求头（JSON，可留空；值里的 {model} 换成条目的模型名，
+      {opencode_session} / {opencode_request} 换成按会话生成的 OpenCode 会话 / 请求 id）</span>
       <textarea id="f-headers" style="min-height:70px">${esc(JSON.stringify(cur.extra_headers || {}, null, 2))}</textarea></label>
     <label class="f"><span>备注</span><input id="f-notes" value="${esc(cur.notes || '')}"></label>
     <label class="f"><span><input type="checkbox" id="f-enabled" ${cur.enabled ? 'checked' : ''} style="width:auto"> 启用</span></label>
@@ -687,6 +693,7 @@ function channelForm(c) {
       name: $('#f-name').value.trim(), protocol: $('#f-proto').value,
       base_url: $('#f-url').value.trim(), extra_headers,
       enabled: $('#f-enabled').checked, notes: $('#f-notes').value.trim(),
+      client_profile: $('#f-profile').value,
     };
     if (!payload.name || !payload.base_url) { toast('名字和 base_url 必填', true); return false; }
     if (c) await post('/admin/api/channels/' + c.id, payload, 'PATCH');

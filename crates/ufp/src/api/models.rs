@@ -123,6 +123,7 @@ mod tests {
             base_url: "http://localhost".into(),
             extra_headers: Vec::new(),
             enabled,
+            client_profile: Default::default(),
         };
         let key = |id: i64, channel_id: i64, enabled: bool| KeyCfg {
             id,

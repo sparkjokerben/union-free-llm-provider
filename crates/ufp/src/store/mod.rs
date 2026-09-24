@@ -51,6 +51,33 @@ impl Protocol {
     }
 }
 
+/// 渠道的请求按哪个客户端的样子发（请求头之外的那部分：请求体字段、会话级 id）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientProfile {
+    /// 不模仿：按转换器的产出原样发。
+    #[default]
+    None,
+    /// 照 OpenCode 访问 Zen 的样子发（`upstream/client_profile.rs`）。
+    OpenCode,
+}
+
+impl ClientProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientProfile::None => "",
+            ClientProfile::OpenCode => "opencode",
+        }
+    }
+
+    /// 不认识的值当作不模仿（旧库、手改的库都不至于让渠道加载失败）。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "opencode" => ClientProfile::OpenCode,
+            _ => ClientProfile::None,
+        }
+    }
+}
+
 /// 渠道：一个上游服务（协议 + base_url + 附加头），下面挂若干 key 与若干模型条目。
 #[derive(Debug, Clone)]
 pub struct ChannelCfg {
@@ -60,6 +87,7 @@ pub struct ChannelCfg {
     pub base_url: String,
     pub extra_headers: Vec<(String, String)>,
     pub enabled: bool,
+    pub client_profile: ClientProfile,
 }
 
 /// 上游 key。冷却按 (key, model) 记，熔断按 (channel, model) 记。
@@ -123,7 +151,7 @@ impl Pool {
         let mut channels = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT id, name, protocol, base_url, extra_headers, enabled FROM channels",
+                "SELECT id, name, protocol, base_url, extra_headers, enabled, client_profile FROM channels",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -133,10 +161,11 @@ impl Pool {
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })?;
             for row in rows {
-                let (id, name, protocol, base_url, extra_headers, enabled) = row?;
+                let (id, name, protocol, base_url, extra_headers, enabled, profile) = row?;
                 let Some(protocol) = Protocol::parse(&protocol) else {
                     tracing::warn!(channel = %name, protocol, "未知的上游协议，已跳过该渠道");
                     continue;
@@ -154,6 +183,7 @@ impl Pool {
                         base_url,
                         extra_headers,
                         enabled: enabled != 0,
+                        client_profile: ClientProfile::parse(&profile),
                     },
                 );
             }

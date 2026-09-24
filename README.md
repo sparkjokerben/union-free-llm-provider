@@ -73,15 +73,31 @@ claude
 「新增渠道」先给出预设：**OpenRouter**、**Google AI Studio**、**OpenCode Zen**，或自定义。选预设后填 key、
 拉取线上模型列表（标出免费的、以及不支持工具调用而 Claude Code 用不了的），勾选即建好渠道、key 与条目；
 再应用一次只补新 key 和新模型，不会重复建渠道。预设会把请求头写成该上游原生客户端的样子
-（OpenRouter 模仿 OpenCode，Google AI Studio 模仿 Gemini CLI），写在渠道的「附加请求头」里，可看可改；
-值里的 `{model}` 发请求时替换成条目的模型名。
+（OpenRouter 模仿 OpenCode，Google AI Studio 模仿 Gemini CLI，OpenCode Zen 模仿 OpenCode），
+写在渠道的「附加请求头」里，可看可改；值里的 `{model}` 发请求时替换成条目的模型名。
 
 OpenCode Zen 按官方端点表分协议：Claude/Qwen 走 `/zen/v1/messages`、GPT 与 Grok 走 `/zen/v1/responses`、
 其余走 `/zen/v1/chat/completions`，**Gemini 系列走 Google 原生协议但地址仍是 Zen**
 （`/zen/v1/models/<模型>:generateContent`）——和 Google AI Studio 是两套额度，不能互相代替，
-所以 Zen 的这条路由由预设自己建一个 gemini 协议的渠道。免费模型会照 OpenRouter 那样标出来，可以勾；
-不过 Zen 的免费额度是给 OpenCode 客户端的限时推广（官方文档原文 “free on OpenCode for a limited time”），
-网关不伪装成 OpenCode 去拿，被服务端拒绝时**只冷却这个「key × 模型」，不会停用整把 key**。
+所以 Zen 的这条路由由预设自己建一个 gemini 协议的渠道。
+
+Zen 的渠道**整体照 OpenCode 1.18.32 的样子发**（渠道上的「客户端模仿」= OpenCode，预设自动设好），
+依据是 OpenCode 源码（`session/llm/request.ts`、`provider/transform.ts`、`id/id.ts`）并用本机抓包逐项核对过：
+
+- 请求头：按协议不同的 `User-Agent`（`opencode/1.18.32 ai-sdk/provider-utils/<版本> runtime/bun/1.3.14`）、
+  `x-opencode-client: cli`、`x-opencode-project`（每次应用预设随机一个，像一个 git 仓库）、
+  `x-opencode-session` / `x-opencode-request`（占位 `{opencode_session}` / `{opencode_request}`），
+  Messages 协议另带 `anthropic-beta: structured-outputs-2025-11-13`；
+- 会话 id：同一个 Claude Code 会话对应同一个 `ses_…`，同一轮用户输入（含其中的工具循环）共用一个 `msg_…`，
+  新一轮换新的——Zen 的提示缓存因此能命中；映射只在内存里，重启后相当于开了新会话；
+- 请求体：Responses 上 `store:false`、system 放成 developer 消息、工具 `strict:false`，
+  GPT-5 系列补 `prompt_cache_key`（= 会话 id）、加密推理、`reasoning.summary:auto`、缺省思考强度 medium 等；
+  Messages 上去掉 Claude Code 的 `metadata`、工具开细粒度流式；Gemini 补 `thinkingConfig`。
+  **客户端明确给了的值一律不覆盖**。
+
+**免费模型用不了**：Zen 在服务端只许 OpenCode 客户端用免费额度，带着同样的请求头也会被拒
+（403 `FreeTierError`：“OpenCode's free tier can only be used from within OpenCode”），
+预设里标出来但不让勾；网关不去绕这道限制。万一手动加了、被拒，也**只冷却这个「key × 模型」，不停用整把 key**。
 
 ## 下游能点名模型
 

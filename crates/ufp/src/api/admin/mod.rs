@@ -678,6 +678,9 @@ struct ChannelPayload {
     enabled: bool,
     #[serde(default)]
     notes: String,
+    /// 客户端模仿（'' / 'opencode'）。编辑时不传 = 不改。
+    #[serde(default)]
+    client_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -725,7 +728,7 @@ async fn list_channels(
         .db
         .read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, protocol, base_url, extra_headers, enabled, notes, created_ms
+                "SELECT id, name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile
                  FROM channels ORDER BY id",
             )?;
             let channels: Vec<Value> = stmt
@@ -740,6 +743,7 @@ async fn list_channels(
                         "enabled": r.get::<_, i64>(5)? != 0,
                         "notes": r.get::<_, String>(6)?,
                         "created_ms": r.get::<_, i64>(7)?,
+                        "client_profile": r.get::<_, String>(8)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -821,10 +825,11 @@ async fn create_channel(
         ));
     }
     let headers_json = serde_json::to_string(&p.extra_headers).unwrap_or_else(|_| "{}".into());
+    let profile = crate::store::ClientProfile::parse(p.client_profile.as_deref().unwrap_or(""));
     let id = mutate(&state, move |conn| {
         conn.execute(
-            "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 p.name,
                 p.protocol,
@@ -832,7 +837,8 @@ async fn create_channel(
                 headers_json,
                 p.enabled as i64,
                 p.notes,
-                chrono::Utc::now().timestamp_millis()
+                chrono::Utc::now().timestamp_millis(),
+                profile.as_str()
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -849,10 +855,15 @@ async fn update_channel(
 ) -> Result<Response, Response> {
     require_auth(&state, &headers)?;
     let headers_json = serde_json::to_string(&p.extra_headers).unwrap_or_else(|_| "{}".into());
+    let profile = p
+        .client_profile
+        .as_deref()
+        .map(|v| crate::store::ClientProfile::parse(v).as_str());
     mutate(&state, move |conn| {
         conn.execute(
             "UPDATE channels SET name = ?2, protocol = ?3, base_url = ?4,
-                    extra_headers = ?5, enabled = ?6, notes = ?7 WHERE id = ?1",
+                    extra_headers = ?5, enabled = ?6, notes = ?7,
+                    client_profile = COALESCE(?8, client_profile) WHERE id = ?1",
             params![
                 id,
                 p.name,
@@ -860,7 +871,8 @@ async fn update_channel(
                 p.base_url.trim_end_matches('/'),
                 headers_json,
                 p.enabled as i64,
-                p.notes
+                p.notes,
+                profile
             ],
         )?;
         Ok(())
@@ -1854,6 +1866,7 @@ async fn test_connection(
             client_body: &body,
             client_anthropic_version: None,
             stream: false,
+            opencode: None,
         },
     );
     let req = match build {
@@ -2190,7 +2203,7 @@ fn export_all(conn: &Connection) -> rusqlite::Result<Value> {
     };
     Ok(json!({
         "version": 1,
-        "channels": dump("SELECT id, name, protocol, base_url, extra_headers, enabled, notes FROM channels", &["id","name","protocol","base_url","extra_headers","enabled","notes"])?,
+        "channels": dump("SELECT id, name, protocol, base_url, extra_headers, enabled, notes, client_profile FROM channels", &["id","name","protocol","base_url","extra_headers","enabled","notes","client_profile"])?,
         "upstream_keys": dump("SELECT id, channel_id, label, api_key, enabled, status, status_reason FROM upstream_keys", &["id","channel_id","label","api_key","enabled","status","status_reason"])?,
         "entries": dump("SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes FROM entries", &["id","channel_id","upstream_model","tier","max_context","vision","pdf","enabled","notes"])?,
         // 带 key_hash：恢复之后这些 key 还能继续用（明文不在备份里，界面上的提示照此为准）。
@@ -2241,9 +2254,9 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
             }
             let headers = ch.get("extra_headers").cloned().unwrap_or(json!({}));
             tx.execute(
-                "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(name) DO UPDATE SET protocol = ?2, base_url = ?3, extra_headers = ?4, enabled = ?5, notes = ?6",
+                "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(name) DO UPDATE SET protocol = ?2, base_url = ?3, extra_headers = ?4, enabled = ?5, notes = ?6, client_profile = ?8",
                 params![
                     name,
                     ch.get("protocol").and_then(|v| v.as_str()).unwrap_or("openai_chat"),
@@ -2251,7 +2264,11 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
                     serde_json::to_string(&headers).unwrap_or_else(|_| "{}".into()),
                     ch.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
                     ch.get("notes").and_then(|v| v.as_str()).unwrap_or(""),
-                    now
+                    now,
+                    crate::store::ClientProfile::parse(
+                        ch.get("client_profile").and_then(|v| v.as_str()).unwrap_or("")
+                    )
+                    .as_str()
                 ],
             )?;
             counts["channels"] = json!(counts["channels"].as_i64().unwrap_or(0) + 1);

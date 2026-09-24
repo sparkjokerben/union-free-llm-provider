@@ -7,6 +7,9 @@
 //! 模仿客户端请求头的做法参照 cc-switch `src/config/userAgentPresets.ts`（把转发请求伪装成
 //! 上游认得的客户端，由用户显式选择）。头都写进渠道的「附加请求头」，建好后在后台可见可改。
 //! 版本号取自各客户端 2026-09 的最新发布，过时了改渠道里的值即可。
+//!
+//! OpenCode Zen 除了头，还要按 OpenCode 的样子改请求体、按会话生成 id，这部分放在
+//! `upstream/client_profile.rs`，由渠道的「客户端模仿」字段打开（应用预设时自动设好）。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -23,7 +26,8 @@ use serde_json::{json, Value};
 use super::session::require_auth;
 use super::{bad_request, internal, mutate};
 use crate::api::AppState;
-use crate::store::Protocol;
+use crate::store::{ClientProfile, Protocol};
+use crate::upstream::client_profile::{has_placeholder, REQUEST_PLACEHOLDER, SESSION_PLACEHOLDER};
 
 /// 一个预设。
 pub struct Preset {
@@ -34,6 +38,8 @@ pub struct Preset {
     pub key_url: &'static str,
     /// 请求头模仿的是谁（界面上说明用）。
     pub client: Option<&'static str>,
+    /// 请求体与会话 id 也按哪个客户端的样子发（写进渠道的 client_profile）。
+    pub profile: ClientProfile,
     /// 按协议分的入口地址（Zen 按模型族分走不同协议）。
     pub routes: &'static [(Protocol, &'static str)],
     pub models: ModelSource,
@@ -57,6 +63,7 @@ pub const PRESETS: &[Preset] = &[
         summary: "聚合几百个模型，带 :free 的免费（按账号限速，充值过 10 美元的账号日额度更高）。",
         key_url: "https://openrouter.ai/keys",
         client: Some("OpenCode 1.18.32"),
+        profile: ClientProfile::None,
         routes: &[(Protocol::OpenAiChat, "https://openrouter.ai/api/v1")],
         models: ModelSource::OpenRouter,
         list_needs_key: false,
@@ -71,6 +78,7 @@ pub const PRESETS: &[Preset] = &[
         summary: "Gemini 原生接口。免费额度由 key 所在项目决定，接口本身看不出哪些免费。",
         key_url: "https://aistudio.google.com/apikey",
         client: Some("Gemini CLI 0.61.0"),
+        profile: ClientProfile::None,
         routes: &[(
             Protocol::Gemini,
             "https://generativelanguage.googleapis.com",
@@ -84,26 +92,23 @@ pub const PRESETS: &[Preset] = &[
         name: "OpenCode Zen",
         summary: "OpenCode 的精选模型网关，按量付费；不同模型族走不同协议，会按需建多个渠道。",
         key_url: "https://opencode.ai/auth",
-        // Zen 不需要伪装客户端：付费模型不认客户端身份，免费模型的额度是 Zen 给
-        // OpenCode 客户端的限时推广（官方文档原文「free on OpenCode for a limited time」），
-        // 伪造 OpenCode 的身份去拿它，就是绕开对方明确设的访问限制，这里不做。
-        client: None,
+        client: Some("OpenCode 1.18.32"),
+        profile: ClientProfile::OpenCode,
         routes: &[
             (Protocol::OpenAiChat, "https://opencode.ai/zen/v1"),
             (Protocol::OpenAiResponses, "https://opencode.ai/zen/v1"),
             (Protocol::Anthropic, "https://opencode.ai/zen/v1"),
-            // Zen 官方端点表：Gemini 系列走 Google 原生形态，但**域名仍是 Zen**
-            // （https://opencode.ai/zen/v1/models/<模型>:generateContent），
-            // 与 Google AI Studio 是两套额度，不能互相代替。
             (Protocol::Gemini, "https://opencode.ai/zen/v1"),
         ],
         models: ModelSource::Zen,
         list_needs_key: false,
         notes: &[
+            "请求头、请求体与会话 id 都照 OpenCode 1.18.32 访问 Zen 的样子发（按源码与本机抓包核对）：\
+             同一个 Claude Code 会话对应同一个 OpenCode 会话，Zen 的提示缓存因此能命中。",
+            "免费模型用不了：Zen 在服务端只许 OpenCode 客户端用免费额度（返回 403 FreeTierError），\
+             列表里标出来但不让勾。付费模型用自己的 key 正常计费。",
             "Gemini 系列在 Zen 上走 Google 原生接口，但地址是 Zen 自己的 \
              /zen/v1/models/<模型>:generateContent；额度也算 Zen 的，和 Google AI Studio 不是一回事。",
-            "带「免费」标记的是 Zen 给 OpenCode 客户端的限时推广。本网关不伪装成 OpenCode：\
-             如果被服务端拒绝，只冷却这个「key × 模型」，不会停用整把 key。",
         ],
     },
 ];
@@ -112,8 +117,49 @@ pub fn find(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
 
-/// 该预设在建渠道时写入的附加请求头（每次建渠道现生成：安装 id 之类要像一台真实的机器）。
-pub fn client_headers(preset: &Preset) -> BTreeMap<String, String> {
+/// 一次「应用预设」里共用的安装级标识：同一批渠道要像同一台机器上的同一个客户端。
+pub struct Install {
+    /// OpenCode 的项目 id（git 仓库的根提交哈希，40 位十六进制）。
+    opencode_project: String,
+    /// Gemini CLI 每次安装一个的 UUID。
+    gemini_user: String,
+}
+
+impl Install {
+    pub fn new() -> Self {
+        use rand::Rng;
+        let bytes: [u8; 20] = rand::thread_rng().gen();
+        Self {
+            opencode_project: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            gemini_user: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+impl Default for Install {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// OpenCode 1.18.32 在各协议上发出的 User-Agent（本机抓包）：`opencode/<版本>` 后面是 AI SDK 追加的
+/// `ai-sdk/provider-utils/<版本>` 与运行时。各 provider 包依赖的 provider-utils 版本不同，所以按协议分。
+fn opencode_user_agent(protocol: Protocol) -> String {
+    let utils = match protocol {
+        Protocol::OpenAiChat => "4.0.23",      // @ai-sdk/openai-compatible
+        Protocol::OpenAiResponses => "4.0.40", // @ai-sdk/openai
+        Protocol::Anthropic => "4.0.46",       // @ai-sdk/anthropic
+        Protocol::Gemini => "4.0.27",          // @ai-sdk/google
+    };
+    format!("opencode/1.18.32 ai-sdk/provider-utils/{utils} runtime/bun/1.3.14")
+}
+
+/// 该预设在建渠道时写入的附加请求头。
+pub fn client_headers(
+    preset: &Preset,
+    protocol: Protocol,
+    install: &Install,
+) -> BTreeMap<String, String> {
     let mut h = BTreeMap::new();
     match preset.id {
         // OpenCode 访问 OpenRouter 时的头：provider.ts 的 HTTP-Referer / X-Title，
@@ -139,8 +185,31 @@ pub fn client_headers(preset: &Preset) -> BTreeMap<String, String> {
             );
             h.insert(
                 "x-gemini-api-privileged-user-id".into(),
-                uuid::Uuid::new_v4().to_string(),
+                install.gemini_user.clone(),
             );
+        }
+        // OpenCode 访问 Zen 时的头（session/llm/request.ts 里 providerID 以 opencode 开头的分支，
+        // 本机抓包核对）。没有 HTTP-Referer / X-Title：那两个只发给 OpenRouter 这类 provider。
+        // 会话与请求 id 是占位，发请求时按会话换成 ses_… / msg_…（upstream/client_profile.rs）。
+        "opencode-zen" => {
+            h.insert("User-Agent".into(), opencode_user_agent(protocol));
+            h.insert("x-opencode-client".into(), "cli".into());
+            h.insert(
+                "x-opencode-project".into(),
+                install.opencode_project.clone(),
+            );
+            h.insert("x-opencode-session".into(), SESSION_PLACEHOLDER.into());
+            h.insert("x-opencode-request".into(), REQUEST_PLACEHOLDER.into());
+            // Bun 的 fetch 默认值
+            h.insert("Accept".into(), "*/*".into());
+            h.insert("Accept-Encoding".into(), "gzip, deflate, br, zstd".into());
+            if protocol == Protocol::Anthropic {
+                // @ai-sdk/anthropic 3.x 默认带的 beta
+                h.insert(
+                    "anthropic-beta".into(),
+                    "structured-outputs-2025-11-13".into(),
+                );
+            }
         }
         _ => {}
     }
@@ -207,6 +276,8 @@ impl ModelCandidate {
 }
 
 const NO_TOOLS: &str = "不支持工具调用，Claude Code 用不了";
+const FREE_TIER_OPENCODE_ONLY: &str =
+    "Zen 的免费额度只许 OpenCode 客户端用（服务端返回 403 FreeTierError），网关不绕这道限制";
 
 #[derive(Deserialize)]
 struct OrList {
@@ -466,6 +537,11 @@ pub fn parse_zen(zen_body: &str, dev_body: &str) -> Result<Vec<ModelCandidate>, 
             if blocked.is_empty() && tools == Some(false) {
                 blocked = NO_TOOLS.into();
             }
+            if blocked.is_empty() && free == Some(true) {
+                // 实测：`Bearer public` 与自己的 key 都一样，带不带 OpenCode 的头都一样，
+                // 服务端回 403 FreeTierError「OpenCode's free tier can only be used from within OpenCode」。
+                blocked = FREE_TIER_OPENCODE_ONLY.into();
+            }
             Some(ModelCandidate {
                 name: meta
                     .map(|m| m.name.clone())
@@ -517,10 +593,17 @@ async fn fetch_text(
     Ok(text)
 }
 
-/// 拉模型列表时带上该预设的客户端头（和真实请求一致；{model} 这类占位没有具体模型可填，去掉）。
+/// 拉模型列表时带上该预设的客户端头（和真实请求一致；{model} 这类占位没有具体模型可填，去掉；
+/// 会话 id 这类只在对话请求里才有的头整个不带）。
 fn listing_headers(preset: &Preset) -> Vec<(String, String)> {
-    client_headers(preset)
+    let protocol = preset
+        .routes
+        .first()
+        .map(|(p, _)| *p)
+        .unwrap_or(Protocol::OpenAiChat);
+    client_headers(preset, protocol, &Install::new())
         .into_iter()
+        .filter(|(_, v)| !has_placeholder(v))
         .map(|(k, v)| (k, v.replace("/{model}", "").replace("{model}", "")))
         .collect()
 }
@@ -577,6 +660,19 @@ pub async fn discover(
 // 接口
 // ============================================================================
 
+/// 界面上列出「会写进渠道的头」用（各协议的并集）。
+fn header_names(p: &Preset) -> Vec<String> {
+    let install = Install::new();
+    let mut names: Vec<String> = p
+        .routes
+        .iter()
+        .flat_map(|(proto, _)| client_headers(p, *proto, &install).into_keys())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 pub async fn list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -588,7 +684,8 @@ pub async fn list(
             json!({
                 "id": p.id, "name": p.name, "summary": p.summary, "key_url": p.key_url,
                 "client": p.client, "list_needs_key": p.list_needs_key, "notes": p.notes,
-                "headers": client_headers(p).keys().collect::<Vec<_>>(),
+                "headers": header_names(p),
+                "profile": p.profile.as_str(),
                 "routes": p.routes.iter().map(|(proto, base)| json!({
                     "protocol": proto.as_str(), "base_url": base, "channel": channel_name(p, *proto),
                 })).collect::<Vec<_>>(),
@@ -753,6 +850,7 @@ pub async fn apply(
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp_millis();
         let mut channels = Vec::new();
+        let install = Install::new();
         let (mut keys_added, mut entries_added, mut entries_existing, mut headers_added) = (0, 0, 0, 0);
         for (protocol, base, models) in groups.into_values() {
             let name = channel_name(preset, protocol);
@@ -775,7 +873,7 @@ pub async fn apply(
                     let mut have: BTreeMap<String, String> =
                         serde_json::from_str(&raw).unwrap_or_default();
                     let mut added = 0;
-                    for (k, v) in client_headers(preset) {
+                    for (k, v) in client_headers(preset, protocol, &install) {
                         if !have.keys().any(|h| h.eq_ignore_ascii_case(&k)) {
                             have.insert(k, v);
                             added += 1;
@@ -788,19 +886,27 @@ pub async fn apply(
                         )?;
                         headers_added += added;
                     }
+                    // 客户端模仿同理：还没设过的补上，用户明确设过的不动
+                    if preset.profile != ClientProfile::None {
+                        tx.execute(
+                            "UPDATE channels SET client_profile = ?2 WHERE id = ?1 AND client_profile = ''",
+                            params![id, preset.profile.as_str()],
+                        )?;
+                    }
                     (id, false)
                 }
                 None => {
-                    let headers_json = serde_json::to_string(&client_headers(preset))
-                        .unwrap_or_else(|_| "{}".into());
+                    let headers_json =
+                        serde_json::to_string(&client_headers(preset, protocol, &install))
+                            .unwrap_or_else(|_| "{}".into());
                     let notes = match preset.client {
                         Some(c) => format!("预设：{}；请求头模仿 {c}", preset.name),
                         None => format!("预设：{}", preset.name),
                     };
                     tx.execute(
-                        "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms)
-                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
-                        params![name, protocol.as_str(), base, headers_json, notes, now],
+                        "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+                        params![name, protocol.as_str(), base, headers_json, notes, now, preset.profile.as_str()],
                     )?;
                     (tx.last_insert_rowid(), true)
                 }
@@ -956,8 +1062,8 @@ mod tests {
         );
         assert_eq!(get("big-pickle").free, Some(true));
         assert!(
-            get("big-pickle").blocked.is_empty(),
-            "免费模型照样列出来、可以勾（是否被服务端接受是另一回事）"
+            get("big-pickle").blocked.contains("FreeTierError"),
+            "免费模型列出来但不让勾：Zen 服务端只许 OpenCode 客户端用免费额度"
         );
         assert!(
             get("jev-1.13").blocked.contains("System One"),
@@ -981,20 +1087,62 @@ mod tests {
 
     #[test]
     fn 每个预设的协议都有入口且头只在该有的预设上() {
+        let install = Install::new();
         for p in PRESETS {
             assert!(!p.routes.is_empty(), "{} 没有入口", p.id);
-            let h = client_headers(p);
-            match p.id {
-                "opencode-zen" => assert!(h.is_empty(), "Zen 不伪装 OpenCode"),
-                "google-ai-studio" => assert!(h["User-Agent"].contains("{model}")),
-                _ => assert!(h.contains_key("User-Agent")),
+            for (proto, _) in p.routes {
+                let h = client_headers(p, *proto, &install);
+                match p.id {
+                    "google-ai-studio" => assert!(h["User-Agent"].contains("{model}")),
+                    _ => assert!(h.contains_key("User-Agent")),
+                }
             }
         }
-        // 每次建渠道生成新的安装 id
+        // 每次应用预设生成新的安装 id；同一次应用里的各渠道共用
         let g = find("google-ai-studio").unwrap();
+        let (a, b) = (Install::new(), Install::new());
         assert_ne!(
-            client_headers(g)["x-gemini-api-privileged-user-id"],
-            client_headers(g)["x-gemini-api-privileged-user-id"]
+            client_headers(g, Protocol::Gemini, &a)["x-gemini-api-privileged-user-id"],
+            client_headers(g, Protocol::Gemini, &b)["x-gemini-api-privileged-user-id"]
         );
+    }
+
+    #[test]
+    fn zen_的头照_opencode_抓包_按协议分_user_agent() {
+        // 抓包：OpenCode 1.18.32 → 本地记录服务，四种协议各一次
+        let p = find("opencode-zen").unwrap();
+        assert_eq!(p.profile, ClientProfile::OpenCode);
+        let install = Install::new();
+        let ua = |proto| client_headers(p, proto, &install)["User-Agent"].clone();
+        assert_eq!(
+            ua(Protocol::OpenAiChat),
+            "opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+        );
+        assert!(ua(Protocol::OpenAiResponses).contains("provider-utils/4.0.40"));
+        assert!(ua(Protocol::Anthropic).contains("provider-utils/4.0.46"));
+        assert!(ua(Protocol::Gemini).contains("provider-utils/4.0.27"));
+
+        let h = client_headers(p, Protocol::Anthropic, &install);
+        assert_eq!(h["x-opencode-client"], "cli");
+        assert_eq!(h["x-opencode-session"], SESSION_PLACEHOLDER);
+        assert_eq!(h["x-opencode-request"], REQUEST_PLACEHOLDER);
+        assert_eq!(h["anthropic-beta"], "structured-outputs-2025-11-13");
+        let project = &h["x-opencode-project"];
+        assert!(project.len() == 40 && project.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            !h.contains_key("HTTP-Referer") && !h.contains_key("X-Title"),
+            "OpenCode 只对 OpenRouter 这类 provider 发这两个头，对 Zen 不发"
+        );
+        // 同一次应用里的各渠道是同一个项目
+        assert_eq!(
+            client_headers(p, Protocol::OpenAiChat, &install)["x-opencode-project"],
+            *project
+        );
+        assert!(!client_headers(p, Protocol::OpenAiChat, &install).contains_key("anthropic-beta"));
+        // 拉模型列表不带会话级的头
+        assert!(listing_headers(p)
+            .iter()
+            .all(|(k, _)| !k.starts_with("x-opencode-session")
+                && !k.starts_with("x-opencode-request")));
     }
 }

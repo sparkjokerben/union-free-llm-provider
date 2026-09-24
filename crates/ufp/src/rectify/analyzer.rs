@@ -82,6 +82,7 @@ pub async fn analyze(
         client_body: &analyzer_body,
         client_anthropic_version: None,
         stream: false,
+        opencode: None,
     };
     let req = upstream::build(&cand, &build_ctx).map_err(|e| format!("构造分析请求失败：{e}"))?;
     let resp = upstream::send(&state.client, &req, ANALYZE_TIMEOUT, false)

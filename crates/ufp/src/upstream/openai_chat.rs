@@ -18,6 +18,7 @@ pub fn prepare(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, 
     let body = with_model(ctx.client_body, &cand.entry.upstream_model);
     let mut converted = anthropic_to_openai_with_reasoning_content(body, true)?;
     inject_openai_stream_include_usage(&mut converted);
+    super::shape_body(cand, ctx, &mut converted);
     Ok(UpstreamRequest {
         url: join_endpoint(
             &cand.channel.base_url,

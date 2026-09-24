@@ -13,7 +13,8 @@ use ufp_convert::ConvertError;
 
 pub fn prepare(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, ConvertError> {
     let body = with_model(ctx.client_body, &cand.entry.upstream_model);
-    let converted = anthropic_to_responses(body, None, false, false)?;
+    let mut converted = anthropic_to_responses(body, None, false, false)?;
+    super::shape_body(cand, ctx, &mut converted);
     Ok(UpstreamRequest {
         url: join_endpoint(&cand.channel.base_url, "/v1/responses", &["/responses"]),
         headers: vec![(

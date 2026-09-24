@@ -11,7 +11,8 @@ use crate::store::Candidate;
 use ufp_convert::ConvertError;
 
 pub fn prepare(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, ConvertError> {
-    let body = with_model(ctx.client_body, &cand.entry.upstream_model);
+    let mut body = with_model(ctx.client_body, &cand.entry.upstream_model);
+    super::shape_body(cand, ctx, &mut body);
     let version = ctx.client_anthropic_version.unwrap_or("2023-06-01");
     Ok(UpstreamRequest {
         url: join_endpoint(&cand.channel.base_url, "/v1/messages", &["/v1/messages"]),

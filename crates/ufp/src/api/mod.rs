@@ -36,6 +36,8 @@ pub struct AppState {
     pub cooldowns: Arc<Cooldowns>,
     /// 会话粘性映射（落库）。
     pub sessions: Arc<Sessions>,
+    /// 模仿 OpenCode 的渠道用：Claude Code 会话 → OpenCode 会话 / 请求 id（内存）。
+    pub opencode_ids: crate::upstream::OpencodeBook,
     /// 后台登录会话（内存，重启失效）。
     pub admin_sessions: Arc<admin::session::Sessions>,
     /// 邮件告警（限频）。
@@ -77,6 +79,7 @@ impl AppState {
             breakers: Arc::new(Breakers::new()),
             cooldowns,
             sessions,
+            opencode_ids: Default::default(),
             admin_sessions: Arc::new(admin::session::Sessions::new()),
             alerter: Arc::new(crate::alert::Alerter::new()),
             backup_dir: cfg_backup_dir,

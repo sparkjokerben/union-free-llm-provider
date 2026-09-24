@@ -1884,11 +1884,35 @@ async fn 后台_预设应用_建渠道带客户端头_再应用只补差() {
         .expect("Zen 应该有一个 gemini 渠道");
     assert_eq!(zen_gemini["protocol"], "gemini");
     assert_eq!(zen_gemini["base_url"], "https://opencode.ai/zen/v1");
+    // Zen 的渠道照 OpenCode 的样子发：头里有 x-opencode-*（会话级的是占位），请求体按 OpenCode 调整
+    assert_eq!(zen_gemini["client_profile"], "opencode");
+    let hz = &zen_gemini["extra_headers"];
+    assert_eq!(hz["x-opencode-session"], "{opencode_session}");
+    assert_eq!(hz["x-opencode-request"], "{opencode_request}");
+    assert_eq!(hz["x-opencode-client"], "cli");
+    assert!(hz["User-Agent"]
+        .as_str()
+        .unwrap()
+        .contains("ai-sdk/provider-utils/4.0.27"));
+    assert!(hz.get("HTTP-Referer").is_none());
+    // 同一次应用建出来的 Zen 渠道是同一个「项目」；OpenRouter 渠道没有客户端模仿
+    let zen_msgs = pool["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "OpenCode Zen · messages")
+        .unwrap();
     assert_eq!(
-        zen_gemini["extra_headers"],
-        json!({}),
-        "Zen 不伪装成 OpenCode 客户端"
+        zen_msgs["extra_headers"]["anthropic-beta"],
+        "structured-outputs-2025-11-13"
     );
+    let or = pool["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "OpenRouter")
+        .unwrap();
+    assert_eq!(or["client_profile"], "");
 
     // 不认识的协议、一个模型都不勾：都要拒
     let (s, _) = json_of(apply(
@@ -2022,4 +2046,162 @@ async fn 后台_下游_key_能一键生成_ccswitch_导入链接() {
         .as_str()
         .unwrap()
         .contains(&format!("apiKey={fresh}")));
+}
+
+/// 一个 Anthropic 非流式响应。
+fn anthropic_message(text: &str) -> Value {
+    json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-x",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {"input_tokens": 3, "output_tokens": 1}
+    })
+}
+
+#[tokio::test]
+async fn 模仿_opencode_的渠道_按会话发身份_工具循环共用请求_id_请求体照_opencode() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message("ok")))
+        .mount(&mock)
+        .await;
+    let mock_uri = mock.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "zen",
+            "anthropic",
+            &mock_uri,
+            "zen-key",
+            "claude-x",
+            1,
+        );
+        conn.execute(
+            "UPDATE channels SET client_profile = 'opencode', extra_headers = ?1",
+            rusqlite::params![json!({
+                "User-Agent": "opencode/1.18.32 ai-sdk/provider-utils/4.0.46 runtime/bun/1.3.14",
+                "x-opencode-client": "cli",
+                "x-opencode-session": "{opencode_session}",
+                "x-opencode-request": "{opencode_request}",
+                "Accept": "*/*"
+            })
+            .to_string()],
+        )
+        .unwrap();
+    })
+    .await;
+
+    let tools =
+        json!([{"name": "Read", "description": "读文件", "input_schema": {"type": "object"}}]);
+    let turn1 = json!([{"role": "user", "content": [{"type": "text", "text": "读一下 README"}]}]);
+    let mut turn1_tool = turn1.as_array().unwrap().clone();
+    turn1_tool.push(json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "README.md"}}]}));
+    turn1_tool.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "# demo"}]}));
+    let mut turn2 = turn1_tool.clone();
+    turn2.push(json!({"role": "assistant", "content": [{"type": "text", "text": "读完了"}]}));
+    turn2.push(json!({"role": "user", "content": [{"type": "text", "text": "总结一下"}]}));
+
+    let send = |session: &'static str, messages: Value| {
+        let body = json!({
+            "model": "claude-x", "max_tokens": 64, "stream": false,
+            "metadata": {"user_id": format!("user_abc_account__session_{session}")},
+            "tools": tools.clone(), "messages": messages,
+        });
+        let base = gw.base.clone();
+        async move {
+            let resp = client()
+                .post(format!("{base}/v1/messages"))
+                .header("x-api-key", DOWNSTREAM_KEY)
+                .header("x-claude-code-session-id", session)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        }
+    };
+    send("cc-1", turn1).await;
+    send("cc-1", Value::Array(turn1_tool)).await;
+    send("cc-1", Value::Array(turn2)).await;
+    send("cc-2", json!([{"role": "user", "content": "hi"}])).await;
+
+    let reqs = mock.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 4);
+    let h = |i: usize, name: &str| {
+        reqs[i]
+            .headers
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    let (s0, s1, s2, s3) = (
+        h(0, "x-opencode-session"),
+        h(1, "x-opencode-session"),
+        h(2, "x-opencode-session"),
+        h(3, "x-opencode-session"),
+    );
+    assert!(s0.starts_with("ses_") && s0.len() == 30, "{s0}");
+    assert_eq!(s0, s1);
+    assert_eq!(s0, s2, "同一个 Claude Code 会话 = 同一个 OpenCode 会话");
+    assert_ne!(s0, s3, "另一个会话");
+    let (r0, r1, r2) = (
+        h(0, "x-opencode-request"),
+        h(1, "x-opencode-request"),
+        h(2, "x-opencode-request"),
+    );
+    assert!(r0.starts_with("msg_") && r0.len() == 30, "{r0}");
+    assert_eq!(r0, r1, "工具结果续写还是同一轮，request id 不变");
+    assert_ne!(r0, r2, "新一轮用户输入换新的 request id");
+    // 只有一个 Accept（渠道的覆盖了网关默认的 text/event-stream 那种），UA 是 OpenCode 的
+    assert_eq!(reqs[0].headers.get_all("accept").iter().count(), 1);
+    assert_eq!(h(0, "accept"), "*/*");
+    assert!(h(0, "user-agent").starts_with("opencode/1.18.32"));
+    assert_eq!(h(0, "x-api-key"), "zen-key");
+
+    let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(
+        body.get("metadata").is_none(),
+        "Claude Code 的 user_id 不外发"
+    );
+    assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+    assert_eq!(body["tool_choice"], json!({"type": "auto"}));
+}
+
+#[tokio::test]
+async fn 不模仿的渠道_请求体与头都不动() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message("ok")))
+        .mount(&mock)
+        .await;
+    let mock_uri = mock.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "plain", "anthropic", &mock_uri, "k", "claude-x", 1);
+    })
+    .await;
+    let mut body = anthropic_body(false);
+    body["metadata"] = json!({"user_id": "u"});
+    let resp = client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let reqs = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["metadata"]["user_id"], "u");
+    assert!(reqs[0].headers.get("x-opencode-session").is_none());
+    assert_eq!(
+        reqs[0].headers.get("accept-encoding").unwrap(),
+        "identity",
+        "默认仍然不要压缩"
+    );
 }

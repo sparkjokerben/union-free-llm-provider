@@ -28,8 +28,10 @@ use crate::api::AppState;
 use crate::health::cooldown::cooldown_from_response;
 use crate::pipeline::{truncate_error, Pipeline, PipelineCfg, Usage};
 use crate::router::select::Plan;
-use crate::store::{AttemptLogRow, Candidate, ModelEcho, RequestLogRow, Settings, Write};
-use crate::upstream::{self, AnthropicToolSchemaHints, BuildCtx};
+use crate::store::{
+    AttemptLogRow, Candidate, ClientProfile, ModelEcho, RequestLogRow, Settings, Write,
+};
+use crate::upstream::{self, AnthropicToolSchemaHints, BuildCtx, OpencodeIds};
 
 /// 一次调用的上下文。
 #[derive(Clone)]
@@ -86,6 +88,8 @@ struct AttemptInput {
     show_thinking: bool,
     hints: Arc<AnthropicToolSchemaHints>,
     log_template: Option<RequestLogRow>,
+    /// 模仿 OpenCode 的候选用的会话身份（一次客户端请求里的各次尝试共用）。
+    opencode: Option<OpencodeIds>,
 }
 
 /// 每次尝试的结果分类。
@@ -147,6 +151,11 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
     };
     let breaker_cfg = settings.breaker.clone();
     let hints = Arc::new(upstream::tool_schema_hints(&ctx.body));
+    // 只要候选里有模仿 OpenCode 的渠道，就先把这次请求的 OpenCode 身份算好（同一轮工具循环共用一个 request id）
+    let opencode = candidates
+        .iter()
+        .any(|c| c.channel.client_profile == ClientProfile::OpenCode)
+        .then(|| state.opencode_ids.ids(ctx.session_id.as_deref(), &ctx.body));
     let mut meta = Meta {
         degraded_from_tier: ctx.plan.degraded_from_tier,
         ..Default::default()
@@ -184,6 +193,7 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             show_thinking: ctx.show_thinking,
             hints: Arc::clone(&hints),
             log_template: ctx.log_template.clone(),
+            opencode: opencode.clone(),
         };
         let attempt_started = Instant::now();
         let mut rectifier = crate::rectify::RectifierState::new();
@@ -455,6 +465,7 @@ async fn try_once(state: &Arc<AppState>, cand: &Candidate, input: &AttemptInput)
         client_body: &input.body,
         client_anthropic_version: input.client_anthropic_version.as_deref(),
         stream: input.streaming,
+        opencode: input.opencode.as_ref(),
     };
     let req = match upstream::build(cand, &build_ctx) {
         Ok(r) => r,

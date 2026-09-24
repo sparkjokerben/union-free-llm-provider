@@ -11,6 +11,7 @@
 //!   （Gemini 走 URL，其余协议由转换器带上）。
 
 pub mod anthropic;
+pub mod client_profile;
 pub mod gemini;
 pub mod openai_chat;
 pub mod openai_responses;
@@ -23,7 +24,9 @@ use serde_json::{json, Value};
 
 use ufp_convert::ConvertError;
 
-use crate::store::{Candidate, Protocol};
+use crate::store::{Candidate, ClientProfile, Protocol};
+
+pub use client_profile::{OpencodeBook, OpencodeIds};
 
 pub use ufp_convert::providers::transform_gemini::AnthropicToolSchemaHints;
 
@@ -38,6 +41,7 @@ pub struct UpstreamRequest {
 }
 
 /// 构造请求需要的上下文。
+#[derive(Clone, Copy)]
 pub struct BuildCtx<'a> {
     /// 客户端原始请求体（Anthropic 形态）。
     pub client_body: &'a Value,
@@ -45,9 +49,25 @@ pub struct BuildCtx<'a> {
     pub client_anthropic_version: Option<&'a str>,
     /// 客户端是否要求流式。
     pub stream: bool,
+    /// 模仿 OpenCode 的渠道用的会话身份（转发时按会话算好传进来；没传就现生成一组）。
+    pub opencode: Option<&'a OpencodeIds>,
 }
 
 pub fn build(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, ConvertError> {
+    // 连通性测试、矫正分析这类没有会话的调用，也要像一次真的 OpenCode 请求
+    let fresh;
+    let mut ctx = *ctx;
+    let wants_ids = cand.channel.client_profile == ClientProfile::OpenCode
+        || cand
+            .channel
+            .extra_headers
+            .iter()
+            .any(|(_, v)| client_profile::has_placeholder(v));
+    if wants_ids && ctx.opencode.is_none() {
+        fresh = OpencodeIds::fresh();
+        ctx.opencode = Some(&fresh);
+    }
+    let ctx = &ctx;
     let mut req = match cand.channel.protocol {
         Protocol::Anthropic => anthropic::prepare(cand, ctx)?,
         Protocol::OpenAiChat => openai_chat::prepare(cand, ctx)?,
@@ -55,13 +75,32 @@ pub fn build(cand: &Candidate, ctx: &BuildCtx<'_>) -> Result<UpstreamRequest, Co
         Protocol::Gemini => gemini::prepare(cand, ctx)?,
     };
     // 渠道配置的附加头放在最后，同名覆盖（大小写不敏感）。
-    // 值里的 {model} 换成这个条目的上游模型名（Gemini CLI 的 User-Agent 就带着模型名）。
+    // 值里的 {model} 换成这个条目的上游模型名（Gemini CLI 的 User-Agent 就带着模型名），
+    // {opencode_session} / {opencode_request} 换成这次请求的 OpenCode 身份。
     for (k, v) in &cand.channel.extra_headers {
         req.headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(k));
-        req.headers
-            .push((k.clone(), v.replace("{model}", &cand.entry.upstream_model)));
+        let v = v.replace("{model}", &cand.entry.upstream_model);
+        req.headers.push((
+            k.clone(),
+            client_profile::fill_placeholders(&v, ctx.opencode),
+        ));
     }
     Ok(req)
+}
+
+/// 按渠道的客户端模仿调整转换后的请求体（各协议的 `prepare` 在序列化前调用）。
+pub(crate) fn shape_body(cand: &Candidate, ctx: &BuildCtx<'_>, body: &mut Value) {
+    if cand.channel.client_profile != ClientProfile::OpenCode {
+        return;
+    }
+    if let Some(ids) = ctx.opencode {
+        client_profile::shape_opencode(
+            cand.channel.protocol,
+            &cand.entry.upstream_model,
+            body,
+            ids,
+        );
+    }
 }
 
 /// 把请求体里的 `model` 换成条目的上游模型名（转换器会带上它）。
@@ -140,12 +179,21 @@ pub async fn send(
     timeout: std::time::Duration,
     accept_sse: bool,
 ) -> Result<reqwest::Response, SendError> {
-    let mut builder = client
-        .post(&req.url)
-        .header("content-type", "application/json")
-        // 强制 identity：网关自己按块处理字节流，压缩只会白耗 CPU。
-        .header("accept-encoding", "identity");
-    if accept_sse {
+    let has = |name: &str| {
+        req.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    };
+    let mut builder = client.post(&req.url);
+    if !has("content-type") {
+        builder = builder.header("content-type", "application/json");
+    }
+    // 默认 identity：网关自己按块处理字节流，压缩只会白耗 CPU。
+    // 渠道附加头里写了 Accept-Encoding（模仿客户端）就照它发，reqwest 会自动解压。
+    if !has("accept-encoding") {
+        builder = builder.header("accept-encoding", "identity");
+    }
+    if accept_sse && !has("accept") {
         builder = builder.header("accept", "text/event-stream");
     }
     for (k, v) in &req.headers {

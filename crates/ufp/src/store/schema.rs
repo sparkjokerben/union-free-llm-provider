@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS channels (
     extra_headers TEXT NOT NULL DEFAULT '{}', -- JSON 对象，逐条附加到上游请求
     enabled       INTEGER NOT NULL DEFAULT 1,
     notes         TEXT NOT NULL DEFAULT '',
-    created_ms    INTEGER NOT NULL
+    created_ms    INTEGER NOT NULL,
+    -- 请求体按哪个客户端的样子发：'' = 不模仿；'opencode' = 照 OpenCode（见 upstream/client_profile.rs）
+    client_profile TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS upstream_keys (
@@ -197,11 +199,33 @@ UPDATE upstream_keys SET status = 'ok', status_reason = ''
 /// SQLite 没有 `ADD COLUMN IF NOT EXISTS`，所以先查表结构再加。
 /// 只做「加列」这种无损操作，不动已有数据。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let has_secret: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('downstream_keys') WHERE name = 'secret'")?
-        .exists([])?;
-    if !has_secret {
-        conn.execute_batch("ALTER TABLE downstream_keys ADD COLUMN secret TEXT")?;
+    add_column(conn, "downstream_keys", "secret", "TEXT")?;
+    add_column(
+        conn,
+        "channels",
+        "client_profile",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    Ok(())
+}
+
+/// 表在、列不在时补列（幂等）。表不在就什么也不做：那是 SCHEMA 的事。
+fn add_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let has_table: bool = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .exists([table])?;
+    let has_column: bool = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))?
+        .exists([column])?;
+    if has_table && !has_column {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
     }
     Ok(())
 }
@@ -244,6 +268,29 @@ mod tests {
             .unwrap();
         assert_eq!(name, "老 key");
         assert_eq!(secret, None, "老行没有明文，等后台轮换时补上");
+    }
+
+    #[test]
+    fn 老库的渠道补上_client_profile_列_默认不模仿() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                 protocol TEXT NOT NULL, base_url TEXT NOT NULL,
+                 extra_headers TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1,
+                 notes TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL);
+             INSERT INTO channels (name, protocol, base_url, created_ms) VALUES ('老渠道', 'openai_chat', 'x', 0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let (name, profile): (String, String) = conn
+            .query_row("SELECT name, client_profile FROM channels", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(name, "老渠道");
+        assert_eq!(profile, "");
     }
 
     #[test]
