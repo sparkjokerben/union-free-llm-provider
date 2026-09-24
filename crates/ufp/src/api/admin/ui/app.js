@@ -801,12 +801,74 @@ async function pHealth(host) {
 }
 
 // ── 下游 key ────────────────────────────────────────────────────────────
+// 池子里现在能用的上游模型名（与 /v1/models 报的一致：条目启用 + 渠道启用 +
+// 该渠道至少一把启用的 key）。请求里写这些名字，路由就优先走它；写不出来，
+// 或者那个模型正好不可用，照样回落到整个池子。
+function usableModels() {
+  const out = new Set();
+  for (const e of S.pool.entries) {
+    if (!e.enabled) continue;
+    const ch = S.pool.channels.find((c) => c.id === e.channel_id);
+    if (!ch || !ch.enabled) continue;
+    if (!S.pool.keys.some((k) => k.channel_id === e.channel_id && k.enabled)) continue;
+    out.add(e.upstream_model);
+  }
+  return [...out].sort();
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch { /* 非 https 或旧浏览器：走下面的兜底 */ }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.append(ta);
+  ta.select();
+  try { document.execCommand('copy'); } finally { ta.remove(); }
+}
+
+/// 一键导入 cc-switch：链接由服务端拼（协议细节在 admin/mod.rs 的 ccswitch_link）。
+async function importLink(keyId) {
+  return api(`/admin/api/downstream_keys/${keyId}/import_link?base=${encodeURIComponent(location.origin)}`);
+}
+
+function importDlgHtml(name, key, out) {
+  const env = `export ANTHROPIC_BASE_URL=${out.origin}\nexport ANTHROPIC_AUTH_TOKEN=${key}`;
+  return `<h2>一键导入 cc-switch</h2>
+    <p class="note">链接里装的是「网关地址 + ${esc(name)} 的 key + 模型名 ${esc(out.model)}」，
+      cc-switch 收到后会弹确认框；确认后只是多出一条供应商，不会动你现在正在用的那条。</p>
+    <div class="row">
+      <a class="btn primary" href="${esc(out.link)}">在 cc-switch 里打开</a>
+      <button type="button" data-copy="${esc(out.link)}">复制链接</button>
+    </div>
+    <label class="f"><span>链接</span><textarea class="mono" id="f-link" readonly onclick="this.select()">${esc(out.link)}</textarea></label>
+    <p class="note">链接里带着这把 key 的明文——cc-switch 的协议就是这么定的，别把它贴到公开的地方，
+      浏览器历史里也会留一份。不想用它就手动填下面两行，效果一样。</p>
+    <label class="f"><span>或者手动填</span><textarea class="mono" readonly onclick="this.select()">${esc(env)}</textarea></label>
+    <div class="row"><button class="ghost" type="button" onclick="document.getElementById('dlg').close()">关闭</button></div>`;
+}
+
+// 对话框里的「复制链接」按钮（链接放在 data-copy 里，不经过任何表单提交）
+function wireImportDlg() {
+  $('#dlg-body').onclick = guard(async (e) => {
+    const b = e.target.closest('button[data-copy]');
+    if (!b) return;
+    await copyText(b.dataset.copy);
+    toast('链接已复制');
+  });
+}
+
 async function pDownstream(host) {
   const rows = await api('/admin/api/downstream_keys');
+  const models = usableModels();
   host.innerHTML = `
     <div class="sec">
       <h2>下游 key</h2>
-      <p class="note">客户端用它连网关。明文只在创建时显示一次，库里只存 sha256。</p>
+      <p class="note">客户端用它连网关。明文存在库里（鉴权只认哈希），所以随时能再抄一次，
+        也才能生成 cc-switch 的导入链接；老库里建的那些没有明文，点「轮换」换一把新的即可。</p>
       <div class="row"><button class="primary" data-new>新建下游 key</button></div>
       <table><thead><tr><th>名字</th><th>前缀</th><th>状态</th><th>创建</th><th>最近使用</th><th></th></tr></thead><tbody>
       ${rows.map((r) => `<tr>
@@ -814,10 +876,20 @@ async function pDownstream(host) {
         <td data-k="状态">${r.enabled ? '<span class="tag live">启用</span>' : '<span class="tag">停用</span>'}</td>
         <td data-k="创建">${stamp(r.created_ms)}</td><td data-k="最近使用">${stamp(r.last_used_ms)}</td>
         <td><button class="tiny ghost" data-rename="${r.id}">改名</button>
+          ${r.secret
+            ? `<button class="tiny" data-import="${r.id}">导入 cc-switch</button>`
+            : `<button class="tiny" data-rotate="${r.id}" title="这把 key 建得早，明文没留下；换一把新的才能生成导入链接">轮换</button>`}
           <button class="tiny" data-tog="${r.id}">${r.enabled ? '停用' : '启用'}</button>
           <button class="tiny danger" data-del="${r.id}">删</button></td></tr>`).join('')
       || '<tr><td class="empty" colspan="6">还没有下游 key，Claude Code 现在连不上</td></tr>'}
       </tbody></table>
+    </div>
+    <div class="sec">
+      <h2>对下游可用的模型</h2>
+      <p class="note">写「自动路由」那个名字 = 不点名，整个池子分摊；写下面任意一个上游模型名，
+        路由就优先走它——那个模型不可用时自动换别的，不会因此失败。</p>
+      <p class="mono">自动路由：${esc(S.pool.public_model_id || 'ufp')}</p>
+      <p class="mono">${models.map(esc).join('　') || '（池子里还没有可用模型）'}</p>
     </div>`;
   const row = (b, attr) => rows.find((r) => r.id === Number(b.dataset[attr]));
   host.onclick = guard(async (e) => {
@@ -832,6 +904,28 @@ async function pDownstream(host) {
         if (!name) { toast('名字不能为空', true); return false; }
         await post('/admin/api/downstream_keys/' + r.id, { name, enabled: r.enabled }, 'PATCH');
         toast('已保存');
+        await reload();
+      });
+    }
+    if (b.dataset.import) {
+      const r = row(b, 'import');
+      const out = await importLink(r.id);
+      dlg(importDlgHtml(r.name, r.secret, out));
+      wireImportDlg();
+      return;
+    }
+    if (b.dataset.rotate) {
+      const r = row(b, 'rotate');
+      dlg(`<h2>轮换「${esc(r.name)}」</h2>
+        <p class="note">换一把新 key：旧的立刻失效，用它的客户端要马上换成新的（下面的导入链接可以直接用）。</p>
+        ${dlgButtons('换一把')}`);
+      return onSave(async () => {
+        const out = await post(`/admin/api/downstream_keys/${r.id}/rotate`);
+        const info = await importLink(r.id);
+        dlg(`<h2>已换新 key</h2>
+          <p class="note">旧 key 已经失效。新 key 只在这里显示这一次（库里也有，随时能再看）。</p>
+          ${importDlgHtml(r.name, out.key, info)}`);
+        wireImportDlg();
         await reload();
       });
     }
@@ -853,16 +947,14 @@ function newDownstreamKey() {
     <label class="f"><span>名字</span><input id="f-name" placeholder="比如「我的笔记本」"></label>
     ${dlgButtons('创建')}`);
   $('#f-name').focus();
-  // 这里成功后不关对话框：换成「只显示一次」的明文
+  // 这里成功后不关对话框：换成「只显示一次」的明文与导入链接
   $('#f-save').onclick = guard(async () => {
     const name = $('#f-name').value.trim();
     if (!name) return toast('名字不能为空', true);
     const out = await post('/admin/api/downstream_keys', { name, enabled: true });
-    dlg(`<h2>已创建，请立刻复制</h2>
-      <p class="note">只显示这一次。填进 Claude Code 的两个环境变量：</p>
-      <label class="f"><span>key</span><input class="mono" value="${esc(out.key)}" readonly onclick="this.select()"></label>
-      <label class="f"><span>环境变量</span><textarea class="mono" style="min-height:70px" readonly onclick="this.select()">export ANTHROPIC_BASE_URL=${esc(location.origin)}\nexport ANTHROPIC_AUTH_TOKEN=${esc(out.key)}</textarea></label>
-      <button class="primary" onclick="document.getElementById('dlg').close()">我已保存</button>`);
+    const info = await importLink(out.id);
+    dlg(importDlgHtml(name, out.key, info));
+    wireImportDlg();
     await reload();
   });
 }
@@ -995,7 +1087,8 @@ async function pSettings(host) {
   host.innerHTML = `
     <div class="sec">
       <h2>运行期设置</h2>
-      <p class="note">保存后立刻生效。常用项：publicModelId（对外模型名）、modelEcho（响应里回显哪个模型名）、
+      <p class="note">保存后立刻生效。常用项：publicModelId（不点名时的对外模型名，即「全池自动路由」那个名字）、
+        modelEcho（响应里回显哪个模型名）、
         maxAttempts（一次请求最多试几个条目）、firstContentTimeoutMs、breaker.*、search.*、analysisEntryId
         （「让另一个上游分析报错」用的条目）、alerts.smtp（邮件告警）。部署令牌不在这里，见下一节。</p>
       <textarea id="set" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea>

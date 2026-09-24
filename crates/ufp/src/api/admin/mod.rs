@@ -22,7 +22,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
@@ -70,6 +70,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/admin/api/downstream_keys/{id}",
             patch(update_downstream_key).delete(delete_downstream_key),
+        )
+        .route(
+            "/admin/api/downstream_keys/{id}/rotate",
+            post(rotate_downstream_key),
+        )
+        .route(
+            "/admin/api/downstream_keys/{id}/import_link",
+            get(downstream_import_link),
         )
         .route("/admin/api/health", get(health))
         .route("/admin/api/health/reset", post(reset_health))
@@ -776,7 +784,14 @@ async fn list_channels(
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            Ok(json!({"channels": channels, "keys": keys, "entries": entries}))
+            // public_model_id 一起带出去：界面上要显示「写哪个名字是全池自动路由」，
+            // 以及下游页把可用模型列给人看。
+            Ok(json!({
+                "channels": channels,
+                "keys": keys,
+                "entries": entries,
+                "public_model_id": crate::store::load_settings(conn)?.public_model_id,
+            }))
         })
         .await
         .map_err(internal)?;
@@ -1078,7 +1093,7 @@ async fn list_downstream_keys(
         .db
         .read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, key_prefix, enabled, created_ms, last_used_ms
+                "SELECT id, name, key_prefix, enabled, created_ms, last_used_ms, secret
                  FROM downstream_keys ORDER BY id",
             )?;
             let rows: Vec<Value> = stmt
@@ -1090,6 +1105,8 @@ async fn list_downstream_keys(
                         "enabled": r.get::<_, i64>(3)? != 0,
                         "created_ms": r.get::<_, i64>(4)?,
                         "last_used_ms": r.get::<_, Option<i64>>(5)?,
+                        // 明文只给后台用来生成导入链接 / 再抄一次；老库的行是 null。
+                        "secret": r.get::<_, Option<String>>(6)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1106,27 +1123,167 @@ async fn create_downstream_key(
     Json(p): Json<DownstreamPayload>,
 ) -> Result<Response, Response> {
     require_auth(&state, &headers)?;
-    // 生成明文：只在这次响应里返回一次，库里只存哈希
+    // 明文存一份（鉴权仍然只认 key_hash）：后台要拿它生成 cc-switch 导入链接，
+    // 也要能让你过几个月后再抄一次。
     let plaintext = format!("ufp-{}", random_token(32));
     let hash = crate::api::auth::hash_key(&plaintext);
     let prefix: String = plaintext.chars().take(12).collect();
     let name = p.name.clone();
-    mutate(&state, move |conn| {
+    let secret = plaintext.clone();
+    // 返回 id 是为了让界面能紧接着取一次导入链接
+    let id = mutate(&state, move |conn| {
         conn.execute(
-            "INSERT INTO downstream_keys (name, key_hash, key_prefix, enabled, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO downstream_keys (name, key_hash, secret, key_prefix, enabled, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 name,
                 hash,
+                secret,
                 prefix,
                 p.enabled as i64,
                 chrono::Utc::now().timestamp_millis()
             ],
         )?;
+        Ok(conn.last_insert_rowid())
+    })
+    .await?;
+    Ok(Json(json!({"key": plaintext, "id": id})).into_response())
+}
+
+/// 换一把新 key（旧的立刻失效）。老库里没有明文的行，靠这个补上明文。
+async fn rotate_downstream_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let plaintext = format!("ufp-{}", random_token(32));
+    let hash = crate::api::auth::hash_key(&plaintext);
+    let prefix: String = plaintext.chars().take(12).collect();
+    let secret = plaintext.clone();
+    mutate(&state, move |conn| {
+        let n = conn.execute(
+            "UPDATE downstream_keys SET key_hash = ?2, secret = ?3, key_prefix = ?4 WHERE id = ?1",
+            params![id, hash, secret, prefix],
+        )?;
+        if n == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     })
     .await?;
     Ok(Json(json!({"key": plaintext})).into_response())
+}
+
+/// cc-switch 的一键导入链接。
+///
+/// 协议以 cc-switch 的解析器为准（`src-tauri/src/deeplink/parser.rs:11-68`）：
+/// scheme 是 `ccswitch`，**host 位置是协议版本号**（必须恰好是 `v1`），
+/// path 必须是 `/import`，`resource=provider`、`app=claude` 与 `name` 必填。
+/// `endpoint` / `apiKey` / `model` 这几个 query 参数由解析端填进
+/// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
+/// （`src-tauri/src/deeplink/provider.rs:311-357`），URL 参数优先于 config。
+///
+/// 不带 `enabled=true`：那会把用户当前正用的供应商直接切走，导入只该是「多一个选项」。
+fn ccswitch_link(origin: &str, name: &str, key: &str, model: &str) -> String {
+    format!(
+        "ccswitch://v1/import?resource=provider&app=claude&name={}&endpoint={}&apiKey={}&model={}",
+        url_encode(name),
+        url_encode(origin),
+        url_encode(key),
+        url_encode(model),
+    )
+}
+
+/// RFC 3986 的 unreserved 之外一律百分号编码（`application/x-www-form-urlencoded`
+/// 那条「空格变 +」的规矩不适用：`+` 在 query 里会被解析成空格）。
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 网关对外的地址（导入链接里的 endpoint）。
+///
+/// nginx 会把 `Host` 与 `X-Forwarded-Proto` 带过来（deploy/nginx/ufp.conf），
+/// 有就用它；都没有（例如直连回环口调试）再退回请求里的 `?base=`。
+fn public_origin(headers: &HeaderMap, base: Option<&str>) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|h| !h.is_empty() && !h.contains('/'));
+    if let Some(host) = host {
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| v == "http" || v == "https")
+            .unwrap_or_else(|| {
+                let local = host.starts_with("localhost")
+                    || host.starts_with("127.0.0.1")
+                    || host.starts_with("[::1]");
+                if local { "http" } else { "https" }.into()
+            });
+        return Some(format!("{scheme}://{host}"));
+    }
+    base.map(str::trim)
+        .filter(|b| b.starts_with("http://") || b.starts_with("https://"))
+        .map(|b| b.trim_end_matches('/').to_string())
+}
+
+#[derive(Deserialize)]
+struct ImportLinkQuery {
+    #[serde(default)]
+    base: Option<String>,
+}
+
+/// 给某把下游 key 生成 cc-switch 导入链接。
+async fn downstream_import_link(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<ImportLinkQuery>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let Some(origin) = public_origin(&headers, q.base.as_deref()) else {
+        return Err(bad_request("看不出这个网关的对外地址，导入链接拼不出来"));
+    };
+    let row: Option<(String, Option<String>)> = state
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT name, secret FROM downstream_keys WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })
+        .await
+        .map_err(internal)?;
+    let Some((name, secret)) = row else {
+        return Err(bad_request("没有这把下游 key"));
+    };
+    let Some(key) = secret else {
+        return Err(bad_request(
+            "这把 key 建得比 secret 字段早，明文没留下；轮换一次就能生成导入链接",
+        ));
+    };
+    let model = state.pool.load().settings.public_model_id.clone();
+    Ok(Json(json!({
+        "link": ccswitch_link(&origin, &format!("ufp 网关（{name}）"), &key, &model),
+        "origin": origin,
+        "model": model,
+    }))
+    .into_response())
 }
 
 fn random_token(len: usize) -> String {
@@ -2036,7 +2193,8 @@ fn export_all(conn: &Connection) -> rusqlite::Result<Value> {
         "channels": dump("SELECT id, name, protocol, base_url, extra_headers, enabled, notes FROM channels", &["id","name","protocol","base_url","extra_headers","enabled","notes"])?,
         "upstream_keys": dump("SELECT id, channel_id, label, api_key, enabled, status, status_reason FROM upstream_keys", &["id","channel_id","label","api_key","enabled","status","status_reason"])?,
         "entries": dump("SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes FROM entries", &["id","channel_id","upstream_model","tier","max_context","vision","pdf","enabled","notes"])?,
-        "downstream_keys": dump("SELECT id, name, key_prefix, enabled FROM downstream_keys", &["id","name","key_prefix","enabled"])?,
+        // 带 key_hash：恢复之后这些 key 还能继续用（明文不在备份里，界面上的提示照此为准）。
+        "downstream_keys": dump("SELECT id, name, key_hash, key_prefix, enabled FROM downstream_keys", &["id","name","key_hash","key_prefix","enabled"])?,
         "rectify_rules": dump("SELECT id, scope, error_fingerprint, error_sample, patch_json, source, enabled FROM rectify_rules", &["id","scope","error_fingerprint","error_sample","patch_json","source","enabled"])?,
         "search_backends": dump("SELECT id, name, kind, api_key, base_url, enabled, notes FROM search_backends", &["id","name","kind","api_key","base_url","enabled","notes"])?,
         "settings": conn.query_row("SELECT value FROM settings WHERE key = 'runtime'", [], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!({})),
@@ -2222,6 +2380,37 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
         }
     }
 
+    // 下游 key：按名字认领，恢复出来的 key 照旧能用（备份里只有哈希）。
+    if let Some(rows) = payload.get("downstream_keys").and_then(|c| c.as_array()) {
+        for row in rows {
+            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let hash = row.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() || hash.is_empty() {
+                continue;
+            }
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM downstream_keys WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )?;
+            if exists > 0 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO downstream_keys (name, key_hash, key_prefix, enabled, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    name,
+                    hash,
+                    row.get("key_prefix").and_then(|v| v.as_str()).unwrap_or(""),
+                    row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
+                    now
+                ],
+            )?;
+            counts["downstream_keys"] = json!(counts["downstream_keys"].as_i64().unwrap_or(0) + 1);
+        }
+    }
+
     if let Some(rows) = payload.get("rectify_rules").and_then(|c| c.as_array()) {
         for row in rows {
             tx.execute(
@@ -2323,4 +2512,117 @@ pub fn note_search_cooldown(state: &AppState, backend_id: i64, until_ms: i64) {
         backend_id,
         until_ms,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 导入链接按_cc_switch_的协议拼() {
+        let link = ccswitch_link(
+            "https://api.jokerben.top",
+            "ufp 网关（我的笔记本）",
+            "ufp-abc123",
+            "ufp",
+        );
+        // scheme / host(版本号) / path 三者缺一不可，解析器逐字比对（parser.rs:11-68）
+        assert!(link.starts_with("ccswitch://v1/import?"), "{link}");
+        assert!(link.contains("resource=provider"));
+        assert!(link.contains("app=claude"));
+        assert!(
+            link.contains("endpoint=https%3A%2F%2Fapi.jokerben.top"),
+            "{link}"
+        );
+        assert!(link.contains("apiKey=ufp-abc123"));
+        assert!(link.contains("model=ufp"));
+        assert!(!link.contains("enabled=true"), "别把用户当前用的供应商切走");
+        // 中文与括号必须编码，空格要编成 %20（不能是 +，query 里 + 会被解成空格）
+        assert!(link.contains("%20"), "{link}");
+        assert!(!link.contains(' '), "{link}");
+        assert!(!link.contains('（'), "{link}");
+    }
+
+    #[test]
+    fn 百分号编码只放过_unreserved() {
+        assert_eq!(url_encode("aZ0-._~"), "aZ0-._~");
+        assert_eq!(url_encode("a b+c/d?e=f&g"), "a%20b%2Bc%2Fd%3Fe%3Df%26g");
+        assert_eq!(url_encode("网关"), "%E7%BD%91%E5%85%B3");
+    }
+
+    #[test]
+    fn 对外地址优先用代理头_本地调试退回请求里的_base() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            h
+        };
+        let h = mk(&[
+            ("host", "127.0.0.1:8787"),
+            ("x-forwarded-host", "api.jokerben.top"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(
+            public_origin(&h, None).as_deref(),
+            Some("https://api.jokerben.top")
+        );
+        // 没有代理头、直连回环口：按 http，且优先用它，不是 base
+        let h = mk(&[("host", "127.0.0.1:8787")]);
+        assert_eq!(
+            public_origin(&h, None).as_deref(),
+            Some("http://127.0.0.1:8787")
+        );
+        // 连 Host 都没有才用 ?base=
+        let h = mk(&[]);
+        assert_eq!(
+            public_origin(&h, Some("https://x.example/")).as_deref(),
+            Some("https://x.example")
+        );
+        assert_eq!(public_origin(&h, Some("file:///etc/passwd")), None);
+        assert_eq!(public_origin(&h, None), None);
+    }
+
+    #[test]
+    fn 导出带上下游_key_的哈希_导入后照旧能用() {
+        // 导出 → 导入：名字不重复，哈希一致。
+        let src = rusqlite::Connection::open_in_memory().unwrap();
+        src.execute_batch(crate::store::schema::SCHEMA).unwrap();
+        src.execute(
+            "INSERT INTO downstream_keys (name, key_hash, secret, key_prefix, enabled, created_ms)
+             VALUES ('笔记本', 'hash1', 'ufp-明文', 'ufp-明文ab', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let dump = export_all(&src).unwrap();
+        assert_eq!(dump["downstream_keys"][0]["key_hash"], "hash1");
+        assert!(
+            dump["downstream_keys"][0].get("secret").is_none(),
+            "备份里不该有明文"
+        );
+
+        let dst = rusqlite::Connection::open_in_memory().unwrap();
+        dst.execute_batch(crate::store::schema::SCHEMA).unwrap();
+        let counts = import_all(&dst, &dump).unwrap();
+        assert_eq!(counts["downstream_keys"], 1);
+        let (name, hash, secret): (String, String, Option<String>) = dst
+            .query_row(
+                "SELECT name, key_hash, secret FROM downstream_keys",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((name.as_str(), hash.as_str()), ("笔记本", "hash1"));
+        assert_eq!(secret, None, "恢复后没有明文，导入链接要轮换一次才生成");
+        // 再导入一次不重复建
+        assert_eq!(import_all(&dst, &dump).unwrap()["downstream_keys"], 0);
+        let n: i64 = dst
+            .query_row("SELECT COUNT(*) FROM downstream_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
 }

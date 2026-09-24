@@ -319,6 +319,15 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             } => {
                 let (until, reason) = match hint {
                     Some(h) => h,
+                    None if kind == "forbidden" => (
+                        state.cooldowns.set_backoff(
+                            &state.db,
+                            cand.key.id,
+                            &cand.entry.upstream_model,
+                            "上游不让这把 key 用这个模型",
+                        ),
+                        "上游不让这把 key 用这个模型".to_string(),
+                    ),
                     None => (
                         state.cooldowns.set_backoff(
                             &state.db,
@@ -342,7 +351,7 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
                     key = %cand.key.label,
                     kind,
                     reason = %reason,
-                    "额度类错误，冷却该 key×模型"
+                    "这个 key×模型暂时不能用，已冷却"
                 );
                 last_error = Some(translate_upstream_error(Some(status), &message, kind));
             }
@@ -690,6 +699,39 @@ fn translate_upstream_error(status: Option<u16>, message: &str, kind: &str) -> A
     }
 }
 
+/// 403 的两种意思：`true` = 「这把 key 不能用这个模型」，
+/// `false` = 「这把 key 本身不被接受」（吊销、封号）。
+///
+/// 判据是上游错误体里的类型名 / 错误码 / 话术。认不出来时返回 `false`：
+/// 停用 key 会亮红灯让人看一眼，比默默把一把好 key 当成「只是这个模型不行」更安全。
+fn model_scoped_forbidden(body: &Value, lower_message: &str) -> bool {
+    let err = body.get("error");
+    let field = |k: &str| -> String {
+        err.and_then(|e| e.get(k))
+            .or_else(|| body.get(k))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let hay = format!("{} {} {}", field("type"), field("code"), lower_message);
+    const MARKS: &[&str] = &[
+        // Zen：免费额度只给 OpenCode 客户端
+        "freetier",
+        "free_tier",
+        "free tier",
+        "from within opencode",
+        // 各家对「模型级权限不足」的常见说法
+        "model_not_allowed",
+        "not available for this model",
+        "no access to this model",
+        "does not have access",
+        "permission_error",
+        "insufficient permission",
+        "not entitled",
+    ];
+    MARKS.iter().any(|m| hay.contains(m))
+}
+
 /// 错误分类（对应文件头的表格）。
 fn classify_error(
     status: u16,
@@ -714,7 +756,23 @@ fn classify_error(
     }
 
     match status {
-        401 | 403 => AttemptResult::DisableKey {
+        401 => AttemptResult::DisableKey {
+            kind: "auth",
+            message,
+            status,
+        },
+        // 403 有两种意思，代价完全不同：
+        //   「这把 key 不被接受」（吊销、封号）→ 停用 key，人工恢复；
+        //   「这把 key 不能用这个模型」（免费额度只开放给某个客户端、模型没开通权限）
+        //     → 只冷却这个 key×模型。当成前者处理的话，勾一个免费模型就会把整把 key
+        //     停掉，连带打断同一把 key 上的付费模型。
+        403 if model_scoped_forbidden(&body, &lower) => AttemptResult::CoolKey {
+            kind: "forbidden",
+            message,
+            status,
+            hint: None,
+        },
+        403 => AttemptResult::DisableKey {
             kind: "auth",
             message,
             status,
@@ -843,4 +901,84 @@ fn log_attempt(
         committed,
         created_ms: chrono::Utc::now().timestamp_millis(),
     })));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 把分类结果压成一个字符串，测试里好读。
+    fn classify(status: u16, body: Value) -> String {
+        match classify_error(status, body, String::new(), None) {
+            AttemptResult::DisableKey { kind, .. } => format!("停用 key（{kind}）"),
+            AttemptResult::CoolKey { kind, .. } => format!("冷却 key×模型（{kind}）"),
+            AttemptResult::Retryable { kind, .. } => format!("换候选（{kind}）"),
+            AttemptResult::TooLong { .. } => "超长".into(),
+            AttemptResult::Rectifiable { .. } => "可矫正".into(),
+            AttemptResult::Fatal { .. } => "致命".into(),
+            _ => "其他".into(),
+        }
+    }
+
+    #[test]
+    fn zen_的免费额度_403_只冷却这个模型_不停用整把_key() {
+        // 原文（实测）：FreeTierError / "OpenCode's free tier can only be used from within OpenCode"
+        let out = classify(
+            403,
+            json!({"type":"error","error":{"type":"FreeTierError",
+                "message":"OpenCode's free tier can only be used from within OpenCode"}}),
+        );
+        assert_eq!(out, "冷却 key×模型（forbidden）");
+    }
+
+    #[test]
+    fn anthropic_的权限_403_也只冷却() {
+        let out = classify(
+            403,
+            json!({"type":"error","error":{"type":"permission_error",
+                "message":"your key does not have access to this model"}}),
+        );
+        assert_eq!(out, "冷却 key×模型（forbidden）");
+    }
+
+    #[test]
+    fn key_被吊销的_403_仍然停用_key() {
+        let out = classify(
+            403,
+            json!({"error":{"type":"invalid_request_error","message":"API key revoked"}}),
+        );
+        assert_eq!(out, "停用 key（auth）");
+    }
+
+    #[test]
+    fn 认不出来的_403_按停用_key_处理() {
+        let out = classify(403, json!({"error":{"message":"Forbidden"}}));
+        assert_eq!(out, "停用 key（auth）");
+    }
+
+    #[test]
+    fn 未授权限流欠费的分类不变() {
+        assert_eq!(
+            classify(401, json!({"error":{"message":"invalid api key"}})),
+            "停用 key（auth）"
+        );
+        assert_eq!(
+            classify(429, json!({"error":{"message":"rate limit exceeded"}})),
+            "冷却 key×模型（rate_limit）"
+        );
+        assert_eq!(
+            classify(402, json!({"error":{"message":"Insufficient credits"}})),
+            "冷却 key×模型（quota）"
+        );
+    }
+
+    #[test]
+    fn 上下文超长仍然是超长() {
+        let out = classify(
+            400,
+            json!({"error":{"message":"This model's maximum context length is 128000 tokens"}}),
+        );
+        assert_eq!(out, "超长");
+    }
 }

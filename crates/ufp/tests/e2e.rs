@@ -508,6 +508,117 @@ async fn 模型列表返回对外_id() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["data"][0]["id"], "ufp");
+    assert_eq!(
+        body["data"].as_array().unwrap().len(),
+        1,
+        "池子是空的，只剩对外那个名字"
+    );
+}
+
+#[tokio::test]
+async fn 模型列表列出池子里所有能用的模型() {
+    let gw = spawn_gateway(|conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "a", "openai_chat", "http://127.0.0.1:9", "sk-a", "model-a", 1);
+        seed_channel(conn, "b", "openai_chat", "http://127.0.0.1:9", "sk-b", "model-b", 2);
+        // 停用的条目、停用的渠道、没有 key 的渠道都不算「能用」
+        conn.execute(
+            "INSERT INTO entries (channel_id, upstream_model, tier, max_context, vision, pdf, enabled, created_ms)
+             VALUES (1, 'model-off', 1, 200000, 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE channels SET enabled = 0 WHERE id = 2",
+            [],
+        )
+        .unwrap();
+    })
+    .await;
+    let body: Value = client()
+        .get(format!("{}/v1/models", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["ufp", "model-a"], "{body}");
+    assert_eq!(body["first_id"], "ufp");
+    assert_eq!(body["last_id"], "model-a");
+}
+
+#[tokio::test]
+async fn 点名要的模型优先_不可用时自动回落() {
+    let a = MockServer::start().await; // 层 1，服务 model-a
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_body("model-a", "甲")),
+        )
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await; // 层 2，服务 model-b
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_body("model-b", "乙")),
+        )
+        .mount(&b)
+        .await;
+    let (a_uri, b_uri) = (a.uri(), b.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "a", "openai_chat", &a_uri, "sk-a", "model-a", 1);
+        seed_channel(conn, "b", "openai_chat", &b_uri, "sk-b", "model-b", 2);
+    })
+    .await;
+    let ask = |model: &str| {
+        let mut body = anthropic_body(false);
+        body["model"] = json!(model);
+        client()
+            .post(format!("{}/v1/messages", gw.base))
+            .header("x-api-key", DOWNSTREAM_KEY)
+            .json(&body)
+    };
+
+    // 写 model-b：虽然它在层 2，也该优先走它
+    let body: Value = ask("model-b").send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["model"], "model-b");
+    assert_eq!(body["content"][0]["text"], "乙");
+
+    // 写对外名字：不点名，还是层 1 优先
+    let body: Value = ask("ufp").send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["model"], "model-a");
+
+    // model-b 的条目停用后，点名它也要能回落，不能报错
+    gw.state
+        .db
+        .admin(|conn| {
+            conn.execute(
+                "UPDATE entries SET enabled = 0 WHERE upstream_model = 'model-b'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    gw.state
+        .pool
+        .reload(&gw.state.db)
+        .await
+        .expect("重载快照失败");
+    let out = ask("model-b").send().await.unwrap();
+    assert_eq!(out.status(), 200, "点名的模型没了要回落，不是失败");
+    let body: Value = out.json().await.unwrap();
+    assert_eq!(body["model"], "model-a");
 }
 
 // ============================================================================
@@ -1757,10 +1868,38 @@ async fn 后台_预设应用_建渠道带客户端头_再应用只补差() {
         names.contains(&"OpenCode Zen · messages") && names.contains(&"OpenCode Zen · chat"),
         "{names:?}"
     );
-    // 预设不支持的协议要拒
+    // Zen 的 Gemini 模型：Google 原生协议 + Zen 自己的地址（两套额度，不能互相代替）
+    let (s, r) = json_of(apply(
+        "opencode-zen",
+        json!({"api_key": "zen-1", "models": [m("gemini-x", "gemini")]}),
+    ))
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let zen_gemini = pool["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "OpenCode Zen · gemini")
+        .expect("Zen 应该有一个 gemini 渠道");
+    assert_eq!(zen_gemini["protocol"], "gemini");
+    assert_eq!(zen_gemini["base_url"], "https://opencode.ai/zen/v1");
+    assert_eq!(
+        zen_gemini["extra_headers"],
+        json!({}),
+        "Zen 不伪装成 OpenCode 客户端"
+    );
+
+    // 不认识的协议、一个模型都不勾：都要拒
     let (s, _) = json_of(apply(
         "opencode-zen",
-        json!({"api_key": "zen-1", "models": [m("g", "gemini")]}),
+        json!({"api_key": "zen-1", "models": [m("g", "warp_drive")]}),
+    ))
+    .await;
+    assert_eq!(s, 400);
+    let (s, _) = json_of(apply(
+        "opencode-zen",
+        json!({"api_key": "zen-1", "models": []}),
     ))
     .await;
     assert_eq!(s, 400);
@@ -1784,5 +1923,103 @@ async fn 后台_预设应用_建渠道带客户端头_再应用只补差() {
 
     // 这些改动立刻进池：应用完就能被路由选中
     let entries = gw.state.pool.load().entries.len();
-    assert_eq!(entries, 3 + 2 + 1, "OpenRouter 3 + Zen 2 + Gemini 1");
+    assert_eq!(
+        entries,
+        3 + 2 + 1 + 1,
+        "OpenRouter 3 + Zen 2 + Zen Gemini 1 + Google 1"
+    );
+}
+
+#[tokio::test]
+async fn 后台_下游_key_能一键生成_ccswitch_导入链接() {
+    let gw = spawn_gateway(|conn| {
+        seed_admin(conn);
+        // 老库里建的下游 key：没有明文列，链接生成不了，只能轮换
+        seed_downstream_key(conn);
+    })
+    .await;
+    let a = admin(&gw).await;
+
+    let (s, r) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/downstream_keys",
+        Some(json!({"name": "笔记本", "enabled": true})),
+    ))
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let id = r["id"].as_i64().expect("创建要返回 id");
+    let key = r["key"].as_str().unwrap().to_string();
+
+    let (s, r) = json_of(a(
+        reqwest::Method::GET,
+        &format!("/admin/api/downstream_keys/{id}/import_link"),
+        None,
+    ))
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let link = r["link"].as_str().unwrap().to_string();
+    // cc-switch 的解析器要求 scheme/host/path 三者精确（parser.rs:11-68）
+    assert!(
+        link.starts_with("ccswitch://v1/import?resource=provider&app=claude&"),
+        "{link}"
+    );
+    assert!(link.contains(&format!("apiKey={key}")), "{link}");
+    assert!(link.contains("model=ufp"), "{link}");
+    assert!(link.contains("endpoint=http%3A%2F%2F127.0.0.1"), "{link}");
+    assert!(
+        !link.contains("enabled=true"),
+        "不该顺手切走用户的当前供应商"
+    );
+
+    // 列表里带着明文：界面靠它生成链接
+    let (_, rows) = json_of(a(reqwest::Method::GET, "/admin/api/downstream_keys", None)).await;
+    let mine = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap();
+    assert_eq!(mine["secret"], key);
+
+    // 老 key（库里没有明文）→ 明确报错，指引轮换，而不是拼一条假链接
+    let (s, r) = json_of(a(
+        reqwest::Method::GET,
+        "/admin/api/downstream_keys/1/import_link",
+        None,
+    ))
+    .await;
+    assert_eq!(s, 400, "{r}");
+    assert!(
+        r["error"]["message"].as_str().unwrap().contains("轮换"),
+        "{r}"
+    );
+
+    // 轮换：新 key 能过鉴权，旧 key 立刻失效，链接跟着换
+    let (s, r) = json_of(a(
+        reqwest::Method::POST,
+        &format!("/admin/api/downstream_keys/{id}/rotate"),
+        None,
+    ))
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let fresh = r["key"].as_str().unwrap().to_string();
+    assert_ne!(fresh, key);
+    let status = |k: &str| {
+        client()
+            .get(format!("{}/v1/models", gw.base))
+            .header("x-api-key", k)
+            .send()
+    };
+    assert_eq!(status(&fresh).await.unwrap().status(), 200);
+    assert_eq!(status(&key).await.unwrap().status(), 401);
+    let (_, r) = json_of(a(
+        reqwest::Method::GET,
+        &format!("/admin/api/downstream_keys/{id}/import_link"),
+        None,
+    ))
+    .await;
+    assert!(r["link"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("apiKey={fresh}")));
 }

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use super::schema::{DATA_FIXUPS, PRAGMAS, SCHEMA};
+use super::schema::{migrate, DATA_FIXUPS, PRAGMAS, SCHEMA};
 
 /// 写队列容量。满了就丢日志，只计数。
 const WRITE_QUEUE: usize = 8192;
@@ -141,6 +141,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch(PRAGMAS)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         conn.execute_batch(DATA_FIXUPS)?;
         drop(conn);
 

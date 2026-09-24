@@ -41,12 +41,16 @@ rc-service nginx start
 
 ```sh
 export ANTHROPIC_BASE_URL=https://your.domain
-export ANTHROPIC_AUTH_TOKEN=ufp-xxxx        # 在「下游 key」页新建，明文只显示一次
+export ANTHROPIC_AUTH_TOKEN=ufp-xxxx        # 在「下游 key」页新建
 claude
 ```
 
 > 不要设 `CLAUDE_CODE_USE_GATEWAY`：那会让 Claude Code 自己关掉 WebSearch，
 > 用 `ANTHROPIC_BASE_URL` 即可。
+
+装了 [cc-switch](https://github.com/farion1231/cc-switch) 的话，不用手抄：「下游 key」页每把 key 都有
+**导入 cc-switch** 按钮，生成一条 `ccswitch://v1/import?...` 链接，点一下确认就多出一条指向本网关的供应商。
+链接里带着这把 key 的明文（cc-switch 的协议就是这么定的），别贴到公开的地方。
 
 ## 概念
 
@@ -58,7 +62,8 @@ claude
 | **层级**（tier） | 数字越小越优先。只在最小可用层里挑；整层都被冷却/熔断才降级 |
 | **会话粘性** | 同一 Claude Code 会话固定在同一个条目上，保住上游的隐式前缀缓存；条目不可用才迁移 |
 | **熔断 / 冷却** | 真故障（5xx/超时/空流）按「渠道 × 模型」熔断；额度问题（429/402）按「key × 模型」冷却，时长取 Retry-After / Gemini retryDelay / 日配额重置 |
-| **下游 key** | 客户端用的 key，只存 sha256；用于鉴权与按 key 统计 |
+| **下游 key** | 客户端用的 key。鉴权只认 sha256；明文另存一份，用来生成 cc-switch 导入链接和「再抄一次」 |
+| **对外模型** | `/v1/models` 列出池子里所有能用的上游模型 + 一个「自动路由」名字（`publicModelId`，默认 `ufp`） |
 
 后台是「调度台」形态：左侧常驻机架按层列出条目，每行一盏状态灯（在线 / 冷却 / 熔断）与冷却倒计时；
 概览页有一条「尝试色带」——最近 80 次上游尝试各画一根细线，颜色表示结果、高度表示耗时，
@@ -69,8 +74,22 @@ claude
 拉取线上模型列表（标出免费的、以及不支持工具调用而 Claude Code 用不了的），勾选即建好渠道、key 与条目；
 再应用一次只补新 key 和新模型，不会重复建渠道。预设会把请求头写成该上游原生客户端的样子
 （OpenRouter 模仿 OpenCode，Google AI Studio 模仿 Gemini CLI），写在渠道的「附加请求头」里，可看可改；
-值里的 `{model}` 发请求时替换成条目的模型名。OpenCode Zen 的免费模型只允许在 OpenCode 里用，
-网关不伪装 OpenCode 去绕这个限制：Zen 预设只接你自己的 Zen key，免费模型列出但不能勾。
+值里的 `{model}` 发请求时替换成条目的模型名。
+
+OpenCode Zen 按官方端点表分协议：Claude/Qwen 走 `/zen/v1/messages`、GPT 与 Grok 走 `/zen/v1/responses`、
+其余走 `/zen/v1/chat/completions`，**Gemini 系列走 Google 原生协议但地址仍是 Zen**
+（`/zen/v1/models/<模型>:generateContent`）——和 Google AI Studio 是两套额度，不能互相代替，
+所以 Zen 的这条路由由预设自己建一个 gemini 协议的渠道。免费模型会照 OpenRouter 那样标出来，可以勾；
+不过 Zen 的免费额度是给 OpenCode 客户端的限时推广（官方文档原文 “free on OpenCode for a limited time”），
+网关不伪装成 OpenCode 去拿，被服务端拒绝时**只冷却这个「key × 模型」，不会停用整把 key**。
+
+## 下游能点名模型
+
+`/v1/models` 会把池子里所有能用的模型列出来。请求里的 `model` 写哪个上游模型名，路由就**优先**走它：
+同名的条目提到最前（带日期后缀的写法算同族，如 `claude-sonnet-4-5-20250929` 匹配 `claude-sonnet-4-5`）；
+那个模型被停用、在冷却或整条渠道不可用时，自动回落到后面的条目——**故障转移和全池自动路由都还在**。
+写「自动路由」那个名字（`publicModelId`，默认 `ufp`）就是不点名，整个池子按层与会话粘性分摊。
+名字不做校验，列表只是告诉你写哪些有意义。
 
 ## 它替你处理的麻烦事
 

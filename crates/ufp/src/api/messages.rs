@@ -75,6 +75,7 @@ pub async fn messages(
             &state.cooldowns,
             &state.sessions,
             session_id.as_deref(),
+            Some(requested_model.as_str()),
             needs,
         )
     }

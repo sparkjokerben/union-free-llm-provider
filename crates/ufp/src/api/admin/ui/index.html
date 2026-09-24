@@ -120,6 +120,12 @@ button.primary { background: var(--ink); color: var(--paper); border-color: var(
 button.ghost { background: none }
 button.danger { color: var(--fail); border-color: var(--fail-b); background: none }
 button.tiny { padding: 2px 7px; font-size: 12px }
+/* 导入链接得是真链接：由浏览器交给操作系统的 ccswitch:// 处理器，不能是 JS 跳转 */
+a.btn { display: inline-block; padding: 5px 11px; border-radius: var(--r);
+        border: 1px solid var(--line); background: var(--card); color: var(--ink);
+        text-decoration: none; font: inherit }
+a.btn:hover { border-color: var(--ink-3) }
+a.btn.primary { background: var(--ink); color: var(--paper); border-color: var(--ink) }
 input, select, textarea { font: inherit; background: var(--card); color: var(--ink);
                           border: 1px solid var(--line); border-radius: var(--r); padding: 5px 8px; width: 100% }
 textarea { min-height: 120px; font-family: var(--mono); font-size: 12px }

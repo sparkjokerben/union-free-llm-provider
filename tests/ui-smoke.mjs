@@ -338,7 +338,47 @@ if (WRITES) {
        return /停用/.test(txt) && /启用/.test(row.querySelector('button[data-togkey]').textContent) ? true : '状态没同步：' + txt;
      })()`, 300);
 
-  await step('对话框：删除渠道（自己清理干净）',
+  await step('下游 key：一键导入 cc-switch 的链接、可用模型都真的出来',
+    `(async () => {
+       // 临时造一条可用的模型（渠道 + key + 条目），好让「可用模型」有内容
+       const ch = await post('/admin/api/channels', { name: '__smoke_model_chan__', protocol: 'openai_chat',
+         base_url: 'http://127.0.0.1:9/v1', enabled: true });
+       await post('/admin/api/channels/' + ch.id + '/keys', { label: 'k', api_key: 'sk-smoke-model-key' });
+       await post('/admin/api/channels/' + ch.id + '/entries', { upstream_model: '__smoke_model__',
+         tier: 1, max_context: 200000, vision: true, pdf: false, enabled: true });
+       const dk = await post('/admin/api/downstream_keys', { name: '__smoke_dkey__', enabled: true });
+
+       // 对外模型列表：自动路由的名字排第一，池子里能用的模型都在
+       const models = await (await fetch('/v1/models', { headers: { 'x-api-key': dk.key } })).json();
+       const ids = models.data.map(m => m.id);
+       if (ids[0] !== 'ufp') return '第一个应该是对外那个自动路由的名字：' + ids.join();
+       if (!ids.includes('__smoke_model__')) return '池子里的模型没出现在列表里：' + ids.join();
+
+       await go('downstream');
+       await new Promise(r => setTimeout(r, 500));
+       const page = document.querySelector('#p-downstream');
+       if (!page.textContent.includes('__smoke_model__')) return '「可用模型」一段里没有这个模型';
+       const row = [...page.querySelectorAll('tr')].find(tr => tr.textContent.includes('__smoke_dkey__'));
+       if (!row) return '新建的下游 key 没出现在表里';
+       const btn = row.querySelector('button[data-import]');
+       if (!btn) return '这把 key 上没有「导入 cc-switch」按钮';
+       btn.click();
+       await new Promise(r => setTimeout(r, 900));
+       const a = document.querySelector('#dlg a.btn');
+       const href = a ? a.getAttribute('href') : '';
+       const text = document.querySelector('#dlg').textContent;
+       if (!href.startsWith('ccswitch://v1/import?resource=provider&app=claude&')) return '链接不对：' + href;
+       if (!href.includes('apiKey=' + dk.key)) return '链接里没有这把 key：' + href;
+       if (!/ANTHROPIC_BASE_URL/.test(text)) return '对话框里没有可手动填的那两行';
+       document.querySelector('#dlg').close();
+
+       // 自己造的这些临时东西自己收拾掉
+       await api('/admin/api/downstream_keys/' + dk.id, { method: 'DELETE' });
+       await api('/admin/api/channels/' + ch.id, { method: 'DELETE' });
+       return true;
+     })()`, 400);
+
+  await step('对话框：删除渠道（自己清理干净）', 
     `(async () => {
        const b = [...document.querySelectorAll('button[data-delchan]')]
          .find(x => x.closest('div.sec').textContent.includes('__smoke_chan__'));

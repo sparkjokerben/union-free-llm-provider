@@ -52,7 +52,10 @@ CREATE INDEX IF NOT EXISTS idx_entries_tier ON entries(tier);
 CREATE TABLE IF NOT EXISTS downstream_keys (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT NOT NULL,
-    key_hash     TEXT NOT NULL UNIQUE,   -- sha256(hex)，明文只在创建时展示一次
+    key_hash     TEXT NOT NULL UNIQUE,   -- sha256(hex)，鉴权只用它
+    -- 明文：只为「生成 cc-switch 一键导入链接」与「以后再抄一次」留着，
+    -- 鉴权不读它。老库里建的行没有这一列（NULL），后台会提示轮换一次。
+    secret       TEXT,
     key_prefix   TEXT NOT NULL,
     enabled      INTEGER NOT NULL DEFAULT 1,
     created_ms   INTEGER NOT NULL,
@@ -189,6 +192,20 @@ UPDATE upstream_keys SET status = 'ok', status_reason = ''
  WHERE status = 'disabled' AND disabled_ms IS NULL;
 "#;
 
+/// 老库补列（每次启动执行，幂等）。
+///
+/// SQLite 没有 `ADD COLUMN IF NOT EXISTS`，所以先查表结构再加。
+/// 只做「加列」这种无损操作，不动已有数据。
+pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_secret: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('downstream_keys') WHERE name = 'secret'")?
+        .exists([])?;
+    if !has_secret {
+        conn.execute_batch("ALTER TABLE downstream_keys ADD COLUMN secret TEXT")?;
+    }
+    Ok(())
+}
+
 /// 打开连接后统一设置的 pragma。
 pub const PRAGMAS: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -203,6 +220,31 @@ pub const SCHEMA_VERSION: i64 = 1;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 老库补上_secret_列_且不动已有数据() {
+        // 模拟一个旧版库：downstream_keys 没有 secret 列。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE downstream_keys (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                 key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
+                 enabled INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL,
+                 last_used_ms INTEGER);
+             INSERT INTO downstream_keys (name, key_hash, key_prefix, created_ms)
+             VALUES ('老 key', 'deadbeef', 'ufp-abc', 0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // 幂等：跑第二次不该报错
+        let (name, secret): (String, Option<String>) = conn
+            .query_row("SELECT name, secret FROM downstream_keys", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(name, "老 key");
+        assert_eq!(secret, None, "老行没有明文，等后台轮换时补上");
+    }
 
     #[test]
     fn 旧版手动停用的_key_被还原_上游拒绝的保持不动() {

@@ -7,11 +7,6 @@
 //! 模仿客户端请求头的做法参照 cc-switch `src/config/userAgentPresets.ts`（把转发请求伪装成
 //! 上游认得的客户端，由用户显式选择）。头都写进渠道的「附加请求头」，建好后在后台可见可改。
 //! 版本号取自各客户端 2026-09 的最新发布，过时了改渠道里的值即可。
-//!
-//! 边界：OpenCode Zen 的免费额度只允许在 OpenCode 内使用（服务端会回 403
-//! `FreeTierError`）。这是对方明确的访问限制，这里不伪装 OpenCode 去绕过它——
-//! Zen 预设只接用户自己的 Zen key，并且不列免费模型（403 还会触发网关自动停用 key，
-//! 连带把同一把 key 上的付费条目一起停掉）。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -37,7 +32,7 @@ pub struct Preset {
     pub summary: &'static str,
     /// 去哪申请 key。
     pub key_url: &'static str,
-    /// 请求头模仿的是谁（界面上说明用）；None 表示不模仿任何客户端。
+    /// 请求头模仿的是谁（界面上说明用）。
     pub client: Option<&'static str>,
     /// 按协议分的入口地址（Zen 按模型族分走不同协议）。
     pub routes: &'static [(Protocol, &'static str)],
@@ -89,17 +84,26 @@ pub const PRESETS: &[Preset] = &[
         name: "OpenCode Zen",
         summary: "OpenCode 的精选模型网关，按量付费；不同模型族走不同协议，会按需建多个渠道。",
         key_url: "https://opencode.ai/auth",
+        // Zen 不需要伪装客户端：付费模型不认客户端身份，免费模型的额度是 Zen 给
+        // OpenCode 客户端的限时推广（官方文档原文「free on OpenCode for a limited time」），
+        // 伪造 OpenCode 的身份去拿它，就是绕开对方明确设的访问限制，这里不做。
         client: None,
         routes: &[
             (Protocol::OpenAiChat, "https://opencode.ai/zen/v1"),
             (Protocol::OpenAiResponses, "https://opencode.ai/zen/v1"),
             (Protocol::Anthropic, "https://opencode.ai/zen/v1"),
+            // Zen 官方端点表：Gemini 系列走 Google 原生形态，但**域名仍是 Zen**
+            // （https://opencode.ai/zen/v1/models/<模型>:generateContent），
+            // 与 Google AI Studio 是两套额度，不能互相代替。
+            (Protocol::Gemini, "https://opencode.ai/zen/v1"),
         ],
         models: ModelSource::Zen,
         list_needs_key: false,
         notes: &[
-            "Zen 的免费模型只允许在 OpenCode 里用（其他客户端会被 403），这里不列，也不伪装 OpenCode 去绕。",
-            "Gemini 系列在 Zen 上走的是 Google 形态的路径，请直接用 Google AI Studio 预设。",
+            "Gemini 系列在 Zen 上走 Google 原生接口，但地址是 Zen 自己的 \
+             /zen/v1/models/<模型>:generateContent；额度也算 Zen 的，和 Google AI Studio 不是一回事。",
+            "带「免费」标记的是 Zen 给 OpenCode 客户端的限时推广。本网关不伪装成 OpenCode：\
+             如果被服务端拒绝，只冷却这个「key × 模型」，不会停用整把 key。",
         ],
     },
 ];
@@ -439,18 +443,26 @@ pub fn parse_zen(zen_body: &str, dev_body: &str) -> Result<Vec<ModelCandidate>, 
                 .and_then(|c| c.input)
                 .map(|c| c == 0.0);
             let tools = meta.and_then(|m| m.tool_call);
-            let (protocol, mut blocked) = match npm.as_str() {
-                "@ai-sdk/openai" => (Protocol::OpenAiResponses, String::new()),
-                "@ai-sdk/anthropic" => (Protocol::Anthropic, String::new()),
-                "@ai-sdk/google" => (
-                    Protocol::Gemini,
-                    "Gemini 系列请用 Google AI Studio 预设".to_string(),
-                ),
-                _ => (Protocol::OpenAiChat, String::new()),
+            // 协议照官方端点表（<https://opencode.ai/docs/zen> 的 Endpoints 一节）分派：
+            // 那一节逐模型给出「端点 + AI SDK 包」，而 models.dev 的 provider.npm
+            // 与「AI SDK 包」这一列一一对应，所以按 npm 认协议是照抄，不用猜。
+            let (protocol, mut blocked) = if z.id.starts_with("jev-") {
+                // Jev 是 System One 的结构化判定接口（/zen/v1/systemone），
+                // 既不产文本也不吃 messages，Claude Code 用不了。
+                (
+                    Protocol::OpenAiChat,
+                    "不是对话模型（Zen 的 System One 判定接口），Claude Code 用不了".to_string(),
+                )
+            } else {
+                match npm.as_str() {
+                    "@ai-sdk/openai" => (Protocol::OpenAiResponses, String::new()),
+                    "@ai-sdk/anthropic" => (Protocol::Anthropic, String::new()),
+                    // Gemini 是 Google 原生协议，但地址仍是 Zen（见 PRESETS 里的 routes）：
+                    // 走 /zen/v1/models/<模型>:generateContent，额度也记在 Zen 头上。
+                    "@ai-sdk/google" => (Protocol::Gemini, String::new()),
+                    _ => (Protocol::OpenAiChat, String::new()),
+                }
             };
-            if blocked.is_empty() && free == Some(true) {
-                blocked = "免费额度只允许在 OpenCode 里用".into();
-            }
             if blocked.is_empty() && tools == Some(false) {
                 blocked = NO_TOOLS.into();
             }
@@ -910,10 +922,10 @@ mod tests {
     }
 
     #[test]
-    fn zen_按_npm_分协议_免费和_gemini_不能选_下线的不列() {
+    fn zen_按_npm_分协议_gemini_走_zen_的地址_下线的不列() {
         let zen = r#"{"object":"list","data":[
           {"id":"claude-x"},{"id":"gpt-x"},{"id":"glm-x"},{"id":"big-pickle"},
-          {"id":"gemini-x"},{"id":"old-x"},{"id":"unknown-x"}]}"#;
+          {"id":"gemini-x"},{"id":"jev-1.13"},{"id":"old-x"},{"id":"unknown-x"}]}"#;
         let dev = r#"{"someone-else":{"models":{"zzz":{}}},"opencode":{"npm":"@ai-sdk/openai-compatible","models":{
           "claude-x":{"name":"Claude X","tool_call":true,"modalities":{"input":["text","image","pdf"]},
                       "limit":{"context":200000},"cost":{"input":3},"provider":{"npm":"@ai-sdk/anthropic"}},
@@ -921,6 +933,7 @@ mod tests {
           "glm-x":{"tool_call":true,"cost":{"input":0.6}},
           "big-pickle":{"tool_call":true,"cost":{"input":0}},
           "gemini-x":{"tool_call":true,"cost":{"input":2},"provider":{"npm":"@ai-sdk/google"}},
+          "jev-1.13":{"tool_call":false,"cost":{"input":0.042}},
           "old-x":{"status":"deprecated","cost":{"input":1}}
         }}}"#;
         let m = parse_zen(zen, dev).unwrap();
@@ -936,12 +949,34 @@ mod tests {
             "没写 npm 的用提供商默认值"
         );
         assert!(get("glm-x").blocked.is_empty());
+        assert_eq!(get("gemini-x").protocol, Protocol::Gemini);
         assert!(
-            get("big-pickle").blocked.contains("OpenCode"),
-            "免费模型只能在 OpenCode 里用"
+            get("gemini-x").blocked.is_empty(),
+            "Gemini 在 Zen 上是能用的：协议是 Google 原生，但域名是 Zen，不该拦"
         );
-        assert!(get("gemini-x").blocked.contains("Google AI Studio"));
+        assert_eq!(get("big-pickle").free, Some(true));
+        assert!(
+            get("big-pickle").blocked.is_empty(),
+            "免费模型照样列出来、可以勾（是否被服务端接受是另一回事）"
+        );
+        assert!(
+            get("jev-1.13").blocked.contains("System One"),
+            "Jev 不是对话模型"
+        );
         assert!(get("unknown-x").note.contains("models.dev"));
+    }
+
+    #[test]
+    fn zen_的_gemini_条目能真的建出渠道_地址是_zen_不是_google() {
+        // Gemini 走的是 Zen 的地址 + Google 的原生路径，两者缺一不可。
+        let p = find("opencode-zen").unwrap();
+        let base = route_base(p, Protocol::Gemini).expect("Zen 必须给 Gemini 留入口");
+        assert_eq!(base, "https://opencode.ai/zen/v1");
+        assert_eq!(
+            crate::upstream::gemini::endpoint_url(base, "gemini-3.8-flash", false),
+            "https://opencode.ai/zen/v1/models/gemini-3.8-flash:generateContent",
+            "官方端点表里写的就是这个地址：Zen 的域名 + Google 的方法路径"
+        );
     }
 
     #[test]

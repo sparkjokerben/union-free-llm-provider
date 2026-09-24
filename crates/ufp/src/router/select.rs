@@ -7,6 +7,9 @@
 //! 3. **层内会话粘性**：会话已落在这个层里的某个条目上就直接用它；否则按
 //!    `hash(会话 id, 条目, key)` 排序，不同会话摊到不同 key 上，同一会话稳定。
 //! 4. 返回的是**有序候选列表**，转发层按顺序试；层内不可用的排在最后。
+//! 5. **点名优先**：下游请求里写了具体模型名时，同名的条目提到最前（只提「能用」的那一档
+//!    次序不变）。点名的模型全不可用时，转发层会照原顺序换后面的条目——故障转移与
+//!    自动路由都还在，点名只是「优先」。
 //!
 //! 一个都不剩时的报错要能区分原因（超长 / 缺多模态能力 / 全在冷却），
 //! 以便回给 Claude Code 一个说得清的错误。
@@ -76,6 +79,7 @@ pub fn plan(
     cooldowns: &Cooldowns,
     sessions: &Sessions,
     session_id: Option<&str>,
+    requested_model: Option<&str>,
     needs: RequestNeeds,
 ) -> Result<Plan, SelectError> {
     let all = pool.candidates();
@@ -167,6 +171,12 @@ pub fn plan(
         return Err(SelectError::AllUnavailable);
     }
 
+    // 点名优先（规则 5）。排序是稳定的：同分候选保持上面算好的层序 / 粘性 / 哈希次序。
+    // 冷却或熔断的候选不用排除——转发层遇到它们直接跳过，不占尝试次数。
+    if let Some(req) = requested_model.map(str::trim).filter(|r| !r.is_empty()) {
+        ordered.sort_by_key(|c| model_match_score(&c.entry.upstream_model, req));
+    }
+
     let tier = chosen_tier.unwrap_or(lowest_tier);
     Ok(Plan {
         candidates: ordered,
@@ -180,6 +190,35 @@ pub fn plan(
         skipped_vision: skip_vision,
         skipped_pdf: skip_pdf,
     })
+}
+
+/// 下游请求的模型名与条目模型名的亲近程度：0 = 同名，1 = 同族（前缀 + 分隔符），2 = 无关。
+///
+/// 前缀那一档是为了带日期/版本的写法（下游要 `claude-sonnet-4-5-20250929`，
+/// 条目里是 `claude-sonnet-4-5`）。只在分隔符处断开才算同族：`gemini-3` 蹭不到
+/// `gemini-3x`；`gemini-3.8-flash` 与 `gemini-3.8-flash-lite` 算同族——本来就是
+/// 一家，谁在前由同档内的稳定排序（层序 / 粘性 / 哈希）决定，同名那个仍排最前。
+fn model_match_score(upstream_model: &str, requested: &str) -> u8 {
+    let a = upstream_model.trim().to_ascii_lowercase();
+    let b = requested.trim().to_ascii_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return 2;
+    }
+    if a == b {
+        return 0;
+    }
+    let (long, short) = if a.len() > b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    match long.strip_prefix(short.as_str()) {
+        Some(rest) => match rest.chars().next() {
+            Some(c) if "-_.:/@".contains(c) => 1,
+            _ => 2,
+        },
+        None => 2,
+    }
 }
 
 fn eligible_count(by_tier: &BTreeMap<i32, (Vec<Candidate>, Vec<Candidate>)>) -> usize {
@@ -267,6 +306,7 @@ mod tests {
             &Cooldowns::new(),
             &Sessions::new(),
             Some("s1"),
+            None,
             RequestNeeds::default(),
         )
         .unwrap();
@@ -283,6 +323,7 @@ mod tests {
             &Breakers::new(),
             &Cooldowns::new(),
             &Sessions::new(),
+            None,
             None,
             RequestNeeds {
                 est_tokens: 100_000,
@@ -301,6 +342,7 @@ mod tests {
             &Breakers::new(),
             &Cooldowns::new(),
             &Sessions::new(),
+            None,
             None,
             RequestNeeds {
                 vision: true,
@@ -336,10 +378,81 @@ mod tests {
             &Cooldowns::new(),
             &sessions,
             Some("s1"),
+            None,
             RequestNeeds::default(),
         )
         .unwrap();
         assert_eq!(plan.candidates[0].key.id, 102, "粘性命中的 key 应排最前");
+    }
+
+    #[test]
+    fn 同族判定在分隔符处断开() {
+        assert_eq!(
+            model_match_score("claude-sonnet-4-5", "claude-sonnet-4-5"),
+            0
+        );
+        assert_eq!(
+            model_match_score("claude-sonnet-4-5", "Claude-Sonnet-4-5 "),
+            0
+        );
+        assert_eq!(
+            model_match_score("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            1,
+            "带日期的写法算同族"
+        );
+        assert_eq!(
+            model_match_score("gemini-3", "gemini-3x"),
+            2,
+            "中间没有分隔符"
+        );
+        assert_eq!(model_match_score("gemini-3-flash", ""), 2);
+    }
+
+    #[test]
+    fn 点名要的模型排最前_哪怕它在更低的层() {
+        // 层 1 是 ch1、层 2 是 ch2；下游点名 model-2，就该先走层 2 的那条。
+        let pool = pool_with(vec![(1, 1, 200_000, true), (2, 2, 200_000, true)], 2);
+        let plan = plan(
+            &pool,
+            &Breakers::new(),
+            &Cooldowns::new(),
+            &Sessions::new(),
+            None,
+            Some("model-2"),
+            RequestNeeds::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.candidates[0].entry.upstream_model, "model-2");
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|c| c.entry.upstream_model == "model-1"),
+            "点名的模型之外，其他条目仍留在候选里做故障转移"
+        );
+    }
+
+    #[test]
+    fn 不点名或点名不存在时顺序与原来一样() {
+        let pool = pool_with(vec![(1, 1, 200_000, true), (2, 2, 200_000, true)], 2);
+        let mk = |req: Option<&str>| {
+            plan(
+                &pool,
+                &Breakers::new(),
+                &Cooldowns::new(),
+                &Sessions::new(),
+                None,
+                req,
+                RequestNeeds::default(),
+            )
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|c| c.entry.upstream_model.clone())
+            .collect::<Vec<_>>()
+        };
+        let base = mk(None);
+        assert_eq!(mk(Some("ufp")), base, "对外模型名是路由名，不是上游模型");
+        assert_eq!(mk(Some("不存在-的-模型")), base);
     }
 
     #[test]
@@ -354,6 +467,7 @@ mod tests {
                 &Cooldowns::new(),
                 &Sessions::new(),
                 Some(&sid),
+                None,
                 RequestNeeds::default(),
             )
             .unwrap();
