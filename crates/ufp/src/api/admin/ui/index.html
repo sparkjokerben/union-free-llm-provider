@@ -182,7 +182,10 @@ dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
   thead { display: none }
   tbody tr { border-bottom: 1px solid var(--line); padding: 8px 0 }
   td { border: 0; padding: 2px 0 }
-  td:not(.num)::before { content: attr(data-k) "　"; color: var(--ink-3); font-size: 11px }
+  /* 每一格都带上列名。数字格原来被排除在外，于是「0.1 小时」「0 / 32」这类值
+     在窄屏上孤零零地右对齐飘着，跟它那一行的标签对不上号。 */
+  td::before { content: attr(data-k) "　"; color: var(--ink-3); font-size: 11px }
+  td.num { text-align: left }
 }
 </style>
 </head>

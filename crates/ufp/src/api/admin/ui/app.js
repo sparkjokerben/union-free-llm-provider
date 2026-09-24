@@ -373,11 +373,11 @@ async function pRequests(host) {
       dlg(`<h2>这个请求换过的条目</h2>
         <table><thead><tr><th class="num">#</th><th>渠道</th><th>key</th><th>模型</th><th>协议</th>
         <th class="num">状态</th><th class="num">耗时</th><th>提交给了客户端</th><th>问题</th></tr></thead><tbody>
-        ${list.map((a) => `<tr><td class="num">${a.attempt_no}</td><td>${esc(a.channel)}</td>
-          <td>${esc(a.upstream_key)}</td><td>${esc(a.upstream_model)}</td><td>${esc(a.protocol)}</td>
-          <td class="num">${a.status >= 400 ? `<span class="tag fail">${a.status}</span>` : (a.status ?? '—')}</td>
-          <td class="num">${ms(a.total_ms)}</td><td>${a.committed ? '是' : ''}</td>
-          <td>${a.error_type ? `<span class="tag fail">${esc(a.error_type)}</span>` : ''}
+        ${list.map((a) => `<tr><td class="num" data-k="第几次">${a.attempt_no}</td><td data-k="渠道">${esc(a.channel)}</td>
+          <td data-k="key">${esc(a.upstream_key)}</td><td data-k="模型">${esc(a.upstream_model)}</td><td data-k="协议">${esc(a.protocol)}</td>
+          <td class="num" data-k="状态">${a.status >= 400 ? `<span class="tag fail">${a.status}</span>` : (a.status ?? '—')}</td>
+          <td class="num" data-k="耗时">${ms(a.total_ms)}</td><td data-k="提交给了客户端">${a.committed ? '是' : ''}</td>
+          <td data-k="问题">${a.error_type ? `<span class="tag fail">${esc(a.error_type)}</span>` : ''}
             <div class="note" style="margin:0">${esc(a.error_message || '')}</div></td></tr>`).join('')}
         </tbody></table>
         <div class="row" style="margin-top:14px"><button class="primary" onclick="document.getElementById('dlg').close()">关闭</button></div>`);
