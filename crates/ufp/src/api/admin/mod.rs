@@ -1547,7 +1547,10 @@ async fn test_connection(
         .unwrap_or_else(|| "连通性测试：请只回复 OK".to_string());
     let body = json!({
         "model": cand.entry.upstream_model,
-        "max_tokens": 32,
+        // 别给太小：Gemini 3.x 这类默认带思考的模型会把预算先花在思考上，
+        // 32 个 token 常常一个字的回话都剩不下，后台就只显示「空回话」——
+        // 连接明明是通的，看起来却像没通。
+        "max_tokens": 256,
         "stream": false,
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
     });

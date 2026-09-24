@@ -52,36 +52,59 @@ function fail(msg) {
   process.exit(1);
 }
 
-const profile = mkdtempSync(join(tmpdir(), 'ufp-smoke-'));
-const child = spawn(browser, [
-  '--headless=new',
-  `--remote-debugging-port=${PORT}`,
-  `--user-data-dir=${profile}`,
-  '--no-first-run',
-  '--no-default-browser-check',
-  '--disable-gpu',
-  '--disable-dev-shm-usage',
-  '--no-sandbox', // CI runner 里内核可能不给用户命名空间，不加这个 Chrome 直接起不来
-  'about:blank',
-], { stdio: ['ignore', 'ignore', 'pipe'] });
+// ── 启动浏览器 ─────────────────────────────────────────────────────────
+// CI 上偶发起不来（DevTools 端口迟迟不监听），所以：等满 60 秒、进程提前退出
+// 就立刻报错、整轮失败再重试一次。
+let child = null;
+process.on('exit', () => { try { child && child.kill('SIGKILL'); } catch {} });
 
-let browserLog = '';
-child.stderr.on('data', (d) => { browserLog += d.toString(); });
-process.on('exit', () => { try { child.kill('SIGKILL'); } catch {} });
+async function tryLaunch(port) {
+  const profile = mkdtempSync(join(tmpdir(), 'ufp-smoke-'));
+  const proc = spawn(browser, [
+    '--headless=new',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profile}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--disable-background-networking',
+    '--no-sandbox', // CI runner 里内核可能不给用户命名空间，不加这个 Chrome 直接起不来
+    'about:blank',
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
-async function pageTarget() {
-  for (let i = 0; i < 60; i++) {
+  let log = '';
+  let exited = false;
+  proc.stderr.on('data', (d) => { log += d.toString(); });
+  proc.on('exit', (code) => { exited = true; log += `\n[浏览器进程退出，code=${code}]`; });
+
+  const started = Date.now();
+  while (Date.now() - started < 60_000) {
     try {
-      const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
+      const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
       const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-      if (page) return page;
+      if (page) return { proc, page };
     } catch {}
-    await new Promise((r) => setTimeout(r, 250));
+    if (exited) break;
+    await new Promise((r) => setTimeout(r, 500));
   }
-  fail(`浏览器没起来。\n${browserLog.slice(-1500)}`);
+  try { proc.kill('SIGKILL'); } catch {}
+  throw new Error(`等了 ${Math.round((Date.now() - started) / 1000)} 秒还没有可调试的页面。\n${log.slice(-1200)}`);
 }
 
-const target = await pageTarget();
+let target = null;
+for (let attempt = 1; attempt <= 2; attempt++) {
+  const port = PORT + attempt - 1;
+  try {
+    const r = await tryLaunch(port);
+    child = r.proc;
+    target = r.page;
+    break;
+  } catch (e) {
+    if (attempt === 2) fail(e.message || String(e));
+    console.error(`· 第 ${attempt} 次启动浏览器没成功，重试一次…`);
+  }
+}
 const ws = new WebSocket(target.webSocketDebuggerUrl);
 const pending = new Map();
 const problems = [];
