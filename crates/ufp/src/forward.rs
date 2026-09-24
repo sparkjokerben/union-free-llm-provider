@@ -686,6 +686,10 @@ fn translate_upstream_error(status: Option<u16>, message: &str, kind: &str) -> A
     let message = truncate_error(message);
     match status {
         Some(400) => ApiError::invalid_request(format!("上游拒绝了请求（{kind}）：{message}")),
+        // 模型级的 403 不是「你的 key 不行」，别把人往查 key 的路上带（见 model_scoped_forbidden）
+        Some(403) if kind == "forbidden" => {
+            ApiError::invalid_request(format!("上游不让用这个模型（{kind}）：{message}"))
+        }
         Some(401) | Some(403) => {
             ApiError::authentication(format!("上游鉴权失败（{kind}）：{message}"))
         }
