@@ -82,11 +82,16 @@ pub fn anthropic_to_gemini_with_shadow(
     }
 
     if let Some(messages) = messages {
-        result["contents"] = json!(convert_messages_to_contents(
+        let mut contents = convert_messages_to_contents(
             messages,
             &shadow_turns,
             supports_multimodal_function_response,
-        )?);
+        )?;
+        // UFP: Gemini 3 要求每一步的工具调用都带签名（同一个判据：gemini-3 系列）
+        if supports_multimodal_function_response {
+            fill_missing_function_call_signatures(&mut contents);
+        }
+        result["contents"] = json!(contents);
     }
 
     if let Some(generation_config) = build_generation_config(&body) {
@@ -556,6 +561,38 @@ fn convert_messages_to_contents(
     Ok(contents)
 }
 
+/// UFP: Google 文档给的占位签名：历史里的工具调用不是 Gemini 生成的、没有签名时用它，
+/// 让 Gemini 3 跳过这一步的签名校验。
+/// <https://ai.google.dev/gemini-api/docs/thought-signatures>
+pub const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// UFP: 给历史里「一个签名都没有」的 model 步补上占位签名。
+///
+/// 故障转移会把别家模型的工具调用（Anthropic 的 `toolu_…`、OpenAI 的 `call_…`）
+/// 带进 Gemini 的历史，Gemini 3 会以 `Function call is missing a thought_signature
+/// in functionCall parts` 拒绝整个请求。Gemini 自己只在每步的第一个 functionCall 上
+/// 签名，所以也只补第一个；这一步里已经有真签名的不动。
+fn fill_missing_function_call_signatures(contents: &mut [Value]) {
+    for content in contents.iter_mut() {
+        if content.get("role").and_then(Value::as_str) != Some("model") {
+            continue;
+        }
+        let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let is_call = |part: &Value| part.get("functionCall").is_some();
+        let signed = parts
+            .iter()
+            .any(|part| is_call(part) && part.get("thoughtSignature").is_some());
+        if signed {
+            continue;
+        }
+        if let Some(first) = parts.iter_mut().find(|part| is_call(part)) {
+            first["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE);
+        }
+    }
+}
+
 fn find_matching_shadow_turn_for_assistant_message(
     content: Option<&Value>,
     shadow_turns: &[GeminiAssistantTurn],
@@ -754,17 +791,21 @@ fn convert_message_content_to_parts(
                 // on every functionCall in a multi-turn tool-use exchange.
                 // Without replaying the stored signature the upstream may
                 // reject with "missing a `thought_signature`".
-                if let Some(sig) = thought_signature_by_id
+                // UFP: 签名是 Part 的字段，与 functionCall 平级（上游在这里把它写进了
+                // functionCall 里面，Gemini 会报 `Unknown name "thoughtSignature" at
+                // ...function_call`；cc-switch 平时走 shadow 回放原始 parts，碰不到这条分支）。
+                let signature = thought_signature_by_id
                     .get(&id)
                     .or_else(|| thought_signature_by_id.get(raw_id))
-                {
-                    function_call["thoughtSignature"] = json!(sig);
-                } else if let Some(sig) = signature_from_id {
+                    .cloned()
                     // UFP: 无状态信封里的签名（shadow 为空也能回传）。
-                    function_call["thoughtSignature"] = json!(sig);
-                }
+                    .or(signature_from_id);
 
-                parts.push(json!({ "functionCall": function_call }));
+                let mut part = json!({ "functionCall": function_call });
+                if let Some(sig) = signature {
+                    part["thoughtSignature"] = json!(sig);
+                }
+                parts.push(part);
             }
             "tool_result" => {
                 let tool_use_id = block

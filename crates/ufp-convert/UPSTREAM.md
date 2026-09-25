@@ -65,6 +65,16 @@ rg -n 'UFP:' crates/ufp-convert/src                     # 列出所有本地改�
 - ✅ 工具调用的 `thoughtSignature` 依赖进程内存 shadow → 换成无状态签名信封
   （`gemini_signature.rs`：签名编进 `tool_use.id` 与思考块签名），重启/多实例都不丢。
 - ✅ Chat 上 gpt-5.x 需要 `max_completion_tokens` → `needs_max_completion_tokens()`。
+- ✅ 非 shadow 分支把 `thoughtSignature` 写进了 `functionCall` 里面（上游
+  `transform_gemini.rs` 的 `convert_message_content_to_parts`）→ 挂到 Part 上，与
+  `functionCall` 平级。cc-switch 平时走 shadow 回放碰不到；我们不用 shadow，每个带签名的
+  工具调用都会触发 `Unknown name "thoughtSignature" at ...function_call`。
+- ✅ `gemini_schema.rs` 把没写 `items` 的数组放进受限的 `parameters`，Gemini 回
+  `...items: missing field` → 改走 `parametersJsonSchema`。`items: {}` 与没有类型的嵌套
+  schema（JSON Schema 的「任意值」）Google 不报错，但受限 Schema 表达不了，一并改走。
+- ✅ 历史里有别家模型产生的工具调用（没有签名）时，Gemini 3 回 `Function call is missing
+  a thought_signature` → `fill_missing_function_call_signatures` 给这一步第一个 functionCall
+  补 Google 文档给的占位签名 `skip_thought_signature_validator`（UFP 新增，cc-switch 没有）。
 
 仍未处理（不阻塞主线）：
 

@@ -1290,10 +1290,78 @@ mod ufp_signature_tests {
         });
         let converted = anthropic_to_gemini(body).unwrap();
         let text = serde_json::to_string(&converted).unwrap();
-        assert!(text.contains("sig-call"), "工具调用的签名要回传：{text}");
+        // 签名是 Part 的字段，与 functionCall 平级；写进 functionCall 里会被 Gemini 400。
+        let call_part = &converted["contents"][1]["parts"][1];
+        assert_eq!(call_part["functionCall"]["name"], "get_weather", "{text}");
+        assert_eq!(call_part["thoughtSignature"], "sig-call", "{text}");
+        assert!(
+            call_part["functionCall"].get("thoughtSignature").is_none(),
+            "functionCall 里不能有 thoughtSignature：{text}"
+        );
+        assert_eq!(
+            converted["contents"][1]["parts"][0]["thoughtSignature"],
+            "sig-thought"
+        );
         assert!(text.contains("sig-thought"), "思考的签名要回放：{text}");
         assert!(!text.contains("_gs_"), "信封不该留给 Gemini：{text}");
         let _ = decode_thought;
+    }
+}
+
+// UFP: 别家模型产生的工具调用（没有签名）带进 Gemini 3 的历史。
+#[cfg(test)]
+mod ufp_foreign_tool_history_tests {
+    use crate::providers::gemini_signature::encode_tool_id;
+    use crate::providers::transform_gemini::{anthropic_to_gemini, SKIP_THOUGHT_SIGNATURE};
+    use serde_json::json;
+
+    fn history(model: &str, first_id: &str) -> serde_json::Value {
+        json!({
+            "model": model,
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "东京和巴黎的天气"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "先查东京"},
+                    {"type": "tool_use", "id": first_id, "name": "get_weather", "input": {"city": "Tokyo"}},
+                    {"type": "tool_use", "id": "toolu_02", "name": "get_weather", "input": {"city": "Osaka"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": first_id, "content": "晴"},
+                    {"type": "tool_result", "tool_use_id": "toolu_02", "content": "雨"}
+                ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn gemini_3_给没有签名的一步补占位签名_只补第一个调用() {
+        let out = anthropic_to_gemini(history("gemini-3-flash-preview", "toolu_01")).unwrap();
+        let parts = &out["contents"][1]["parts"];
+        assert_eq!(
+            parts[1]["thoughtSignature"], SKIP_THOUGHT_SIGNATURE,
+            "{out}"
+        );
+        assert!(parts[2].get("thoughtSignature").is_none(), "{out}");
+        assert!(
+            parts[0].get("thoughtSignature").is_none(),
+            "文本 part 不补：{out}"
+        );
+    }
+
+    #[test]
+    fn 已有真签名的一步不动() {
+        let id = encode_tool_id("call_1", "real-sig");
+        let out = anthropic_to_gemini(history("gemini-3-flash-preview", &id)).unwrap();
+        let parts = &out["contents"][1]["parts"];
+        assert_eq!(parts[1]["thoughtSignature"], "real-sig", "{out}");
+        assert!(parts[2].get("thoughtSignature").is_none(), "{out}");
+    }
+
+    #[test]
+    fn 非_gemini_3_不补() {
+        let out = anthropic_to_gemini(history("gemini-2.5-flash", "toolu_01")).unwrap();
+        assert!(!out.to_string().contains(SKIP_THOUGHT_SIGNATURE), "{out}");
     }
 }
 

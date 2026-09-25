@@ -100,7 +100,31 @@ fn requires_parameters_json_schema(schema: &Value) -> bool {
     }
 }
 
+/// UFP: 嵌套 schema 能不能用受限的 `Schema` 表达。
+///
+/// 上游只看关键字是否在白名单里，缺了必需结构的 schema 也会放进 `parameters`：
+/// - 数组没写 `items`（Claude Docs 这类 MCP 工具的 `{"type":"array"}`）——
+///   Google 实测回 `parameters.properties[batch].items: missing field`，这是线上的 400；
+/// - `items: {}` / 没有 `type` 的属性（JSON Schema 的「任意值」，zod 的 `z.any()`）——
+///   Google 不报错，但受限 Schema 表达不了「任意」，放进去等于让上游自己猜类型。
+///
+/// 这些都改走 `parametersJsonSchema`，语义原样保留。
+fn nested_requires_parameters_json_schema(schema: &Value) -> bool {
+    match schema {
+        Value::Object(obj) => {
+            !(obj.contains_key("type") || obj.contains_key("anyOf"))
+                || object_requires_parameters_json_schema(obj)
+        }
+        // `true` / `false` 这类布尔 schema 只有 JSON Schema 能表达
+        _ => true,
+    }
+}
+
 fn object_requires_parameters_json_schema(obj: &Map<String, Value>) -> bool {
+    // UFP: 数组必须带 items（见 nested_requires_parameters_json_schema）
+    if obj.get("type").and_then(Value::as_str) == Some("array") && !obj.contains_key("items") {
+        return true;
+    }
     for (key, value) in obj {
         match key.as_str() {
             "type" => {
@@ -115,12 +139,17 @@ fn object_requires_parameters_json_schema(obj: &Map<String, Value>) -> bool {
                 let Some(properties) = value.as_object() else {
                     return true;
                 };
-                if properties.values().any(requires_parameters_json_schema) {
+                // UFP: 每个属性自己也得有类型
+                if properties
+                    .values()
+                    .any(nested_requires_parameters_json_schema)
+                {
                     return true;
                 }
             }
             "items" => {
-                if !value.is_object() || requires_parameters_json_schema(value) {
+                // UFP: `items: {}` 也算不能用 Schema 表达
+                if nested_requires_parameters_json_schema(value) {
                     return true;
                 }
             }
@@ -128,7 +157,8 @@ fn object_requires_parameters_json_schema(obj: &Map<String, Value>) -> bool {
                 let Some(values) = value.as_array() else {
                     return true;
                 };
-                if values.iter().any(requires_parameters_json_schema) {
+                // UFP: anyOf 的每个分支同样要有类型
+                if values.iter().any(nested_requires_parameters_json_schema) {
                     return true;
                 }
             }
@@ -323,6 +353,75 @@ mod tests {
 
         assert_eq!(result["parameters"]["type"], "object");
         assert!(result["parameters"]["properties"].is_object());
+    }
+
+    /// UFP: `z.array(z.any())` 产出的 `items: {}` 是「任意值」，受限 Schema 表达不了。
+    #[test]
+    fn empty_items_uses_parameters_json_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "batch": { "type": "array", "items": {} }
+            },
+            "required": ["batch"]
+        });
+
+        let result = build_gemini_function_declaration("batch_tool", None, schema);
+
+        assert!(result.get("parameters").is_none(), "{result}");
+        assert_eq!(
+            result["parametersJsonSchema"]["properties"]["batch"]["items"],
+            json!({})
+        );
+    }
+
+    /// UFP: 数组连 items 都没写，同样只有 JSON Schema 能表达。
+    /// （线上的 400：`parameters.properties[items].items: missing field`）
+    #[test]
+    fn array_without_items_uses_parameters_json_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "items": { "type": "array", "description": "anything" } }
+        });
+
+        let result = build_gemini_function_declaration("list", None, schema);
+
+        assert!(result.get("parameters").is_none(), "{result}");
+        assert!(result.get("parametersJsonSchema").is_some());
+    }
+
+    /// UFP: 没有类型的属性（`z.any()`）与 anyOf 分支也走 JSON Schema。
+    #[test]
+    fn untyped_nested_schema_uses_parameters_json_schema() {
+        for schema in [
+            json!({"type": "object", "properties": {"value": {"description": "any"}}}),
+            json!({"type": "object", "properties": {"value": {"anyOf": [{"type": "string"}, {}]}}}),
+            json!({"type": "array", "items": {"items": {"type": "string"}}}),
+            json!({"type": "array", "items": true}),
+        ] {
+            let result = build_gemini_function_declaration("t", None, schema.clone());
+            assert!(result.get("parameters").is_none(), "{schema} → {result}");
+        }
+    }
+
+    /// UFP: 带类型的数组照旧走受限 Schema（别把能走的都赶去 JSON Schema）。
+    #[test]
+    fn typed_items_stay_on_parameters() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "mode": { "anyOf": [{ "type": "string" }, { "type": "integer" }] }
+            }
+        });
+
+        let result = build_gemini_function_declaration("tag", None, schema);
+
+        assert!(result.get("parametersJsonSchema").is_none(), "{result}");
+        assert_eq!(
+            result["parameters"]["properties"]["tags"]["items"]["type"],
+            "string"
+        );
     }
 
     /// Defensive: an atomic (non-object) schema is left untouched, because
