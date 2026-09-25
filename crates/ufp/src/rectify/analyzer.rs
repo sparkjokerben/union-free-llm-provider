@@ -51,6 +51,7 @@ pub async fn analyze(
     settings: &Settings,
     body: &Value,
     status: u16,
+    protocol: &str,
     error_message: &str,
 ) -> Result<Analysis, String> {
     let Some(entry_id) = settings.analysis_entry_id else {
@@ -64,10 +65,11 @@ pub async fn analyze(
     };
 
     let skeleton = skeleton::build(body);
-    let protocol = cand.channel.protocol.as_str().to_string();
+    // 协议是出错那个渠道的，不是分析条目自己的
     let prompt = format!(
-        "上游协议：{protocol}\n上游返回的 HTTP 状态：{status}\n上游返回的错误：\n{}\n\n请求骨架（JSON）：\n{}",
+        "上游协议：{protocol}\n上游返回的 HTTP 状态：{status}\n上游返回的错误：\n{}\n{}\n请求骨架（JSON）：\n{}",
         crate::pipeline::truncate_error(error_message),
+        wire_note(protocol),
         serde_json::to_string_pretty(&skeleton).unwrap_or_else(|_| "{}".into()),
     );
     let analyzer_body = json!({
@@ -119,6 +121,23 @@ pub async fn analyze(
         why,
         used_model: cand.entry.upstream_model.clone(),
     })
+}
+
+/// 报错里的路径指向转换后的上游请求，骨架却是转换前的 Anthropic 形态：告诉分析条目怎么对应。
+fn wire_note(protocol: &str) -> &'static str {
+    match protocol {
+        "gemini" => {
+            "\n注意：错误里的路径是网关转换后的 Gemini 请求。对应关系：\
+contents[i] ≈ messages[i]，contents[i].parts[j] ≈ messages[i].content[j]，\
+tools[0].function_declarations[k] ≈ tools[k]（type 为 BatchTool 的工具不计入 k），\
+function_declarations[k].parameters / parametersJsonSchema ≈ tools[k].input_schema。\n"
+        }
+        "openai_chat" | "openai_responses" => {
+            "\n注意：错误里的路径是网关转换后的 OpenAI 请求。\
+tools[k].function.parameters / tools[k].parameters ≈ tools[k].input_schema。\n"
+        }
+        _ => "",
+    }
 }
 
 fn extract_text(message: &Value) -> String {

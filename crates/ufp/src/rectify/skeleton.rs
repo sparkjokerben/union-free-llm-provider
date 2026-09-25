@@ -246,8 +246,19 @@ fn strip_descriptions(value: &mut Value) {
     match value {
         Value::Array(items) => items.iter_mut().for_each(strip_descriptions),
         Value::Object(map) => {
-            map.remove("description");
-            map.values_mut().for_each(strip_descriptions);
+            // 只删作为说明文字的 description；`properties` 下的键是属性名，
+            // 名叫 description 的属性得留着，不然分析条目看到的 schema 就是错的
+            if map.get("description").is_some_and(Value::is_string) {
+                map.remove("description");
+            }
+            for (k, v) in map.iter_mut() {
+                match (k.as_str(), v) {
+                    ("properties", Value::Object(props)) => {
+                        props.values_mut().for_each(strip_descriptions)
+                    }
+                    (_, v) => strip_descriptions(v),
+                }
+            }
         }
         _ => {}
     }
@@ -305,6 +316,24 @@ mod tests {
         assert!(text.contains("\"name\":\"Read\""), "{text}");
         assert!(text.contains("\"tool_result\""), "{text}");
         assert!(text.contains("metadata_present"), "{text}");
+    }
+
+    #[test]
+    fn 裁剪说明文字时不删名叫_description_的属性() {
+        let mut v = json!({"tools": [{"name": "T", "description": "长说明", "input_schema": {
+            "type": "object",
+            "description": "schema 说明",
+            "properties": {"description": {"type": "string", "description": "属性说明"}},
+            "required": ["description"]
+        }}]});
+        strip_descriptions(&mut v);
+        let schema = &v["tools"][0]["input_schema"];
+        assert!(v["tools"][0].get("description").is_none());
+        assert!(schema.get("description").is_none());
+        assert_eq!(
+            schema["properties"]["description"],
+            json!({"type": "string"})
+        );
     }
 
     #[test]

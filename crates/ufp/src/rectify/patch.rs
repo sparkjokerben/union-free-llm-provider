@@ -154,17 +154,25 @@ fn apply_one(body: &mut Value, patch: &PatchOp) -> Result<bool, String> {
             let Some(map) = cursor.as_object_mut() else {
                 return Err(format!("{} 的父级不是对象", patch.path));
             };
-            if !map.contains_key(key) {
-                return Ok(false); // 不存在就不改（replace 不创建）
+            let value = patch.value.clone().unwrap_or(Value::Null);
+            match map.get(key) {
+                None => Ok(false),                       // 不存在就不改（replace 不创建）
+                Some(old) if *old == value => Ok(false), // 值没变不算改动
+                Some(_) => {
+                    map.insert(key.clone(), value);
+                    Ok(true)
+                }
             }
-            map.insert(key.clone(), patch.value.clone().unwrap_or(Value::Null));
-            Ok(true)
         }
         (Token::Key(key), PatchOpKind::Add) => {
             let Some(map) = cursor.as_object_mut() else {
                 return Err(format!("{} 的父级不是对象", patch.path));
             };
-            map.insert(key.clone(), patch.value.clone().unwrap_or(Value::Null));
+            let value = patch.value.clone().unwrap_or(Value::Null);
+            if map.get(key) == Some(&value) {
+                return Ok(false);
+            }
+            map.insert(key.clone(), value);
             Ok(true)
         }
         (Token::Key(key), PatchOpKind::Remove) => {
@@ -182,7 +190,11 @@ fn apply_one(body: &mut Value, patch: &PatchOp) -> Result<bool, String> {
             }
             match patch.op {
                 PatchOpKind::Replace => {
-                    items[*i] = patch.value.clone().unwrap_or(Value::Null);
+                    let value = patch.value.clone().unwrap_or(Value::Null);
+                    if items[*i] == value {
+                        return Ok(false);
+                    }
+                    items[*i] = value;
                     Ok(true)
                 }
                 PatchOpKind::Remove => {
@@ -312,6 +324,17 @@ mod tests {
         assert!(ops.is_ok());
         let err = apply(&mut body, &ops.unwrap()).unwrap_err();
         assert!(err.contains("路径不存在"), "{err}");
+    }
+
+    #[test]
+    fn 值没变不算改动() {
+        let mut body = json!({"max_tokens": 4096, "tools": [{"name": "x", "input_schema": {"type": "object"}}]});
+        let ops = parse(&json!([
+            patch("replace", "/max_tokens", Some(json!(4096))),
+            patch("add", "/tools/0/input_schema/type", Some(json!("object"))),
+        ]))
+        .unwrap();
+        assert_eq!(apply(&mut body, &ops).unwrap(), 0);
     }
 
     #[test]

@@ -161,6 +161,7 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
         ..Default::default()
     };
     let mut last_error: Option<ApiError> = None;
+    let mut rectifier = crate::rectify::RectifierState::new();
     let mut empty_fallback: Option<(Vec<Bytes>, i64, i64, String)> = None;
 
     for cand in candidates.iter() {
@@ -196,7 +197,7 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             opencode: opencode.clone(),
         };
         let attempt_started = Instant::now();
-        let mut rectifier = crate::rectify::RectifierState::new();
+        rectifier.begin_candidate();
         let result = loop {
             let r = try_once(&state, cand, &input).await;
             if let AttemptResult::Rectifiable { message, status } = &r {
@@ -226,6 +227,15 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             }
             break r;
         };
+        rectifier
+            .settle(
+                &state,
+                matches!(
+                    result,
+                    AttemptResult::Done { .. } | AttemptResult::Committed { .. }
+                ),
+            )
+            .await;
         let elapsed_ms = attempt_started.elapsed().as_millis() as i64;
         log_attempt(&state, &ctx, cand, &result, elapsed_ms, meta.attempts);
 

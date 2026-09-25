@@ -3,9 +3,11 @@
 //! 每个矫正器都回答一个问题：「这条错误信息，我知道该怎么改写请求吗？」
 //! 知道就改写请求体并返回矫正器名字，转发层据此在同候选上重试一次。
 //!
-//! 复用 cc-switch 的两个整流器（思考签名、思考预算），另外补三个：
-//! 图片降级、max_tokens 越界下夹、（Gemini）工具 schema 报错时交由转换层
-//! 换用 `parametersJsonSchema`（该行为已在转换器里，这里只需识别错误）。
+//! 复用 cc-switch 的两个整流器（思考签名、思考预算），另外补两个：
+//! 图片降级、max_tokens 越界下夹。
+//!
+//! Gemini 工具 schema 走 `parameters` 还是 `parametersJsonSchema` 由转换层
+//! （`ufp_convert::providers::gemini_schema`）在发请求前决定，这里不参与。
 
 use serde_json::{json, Value};
 

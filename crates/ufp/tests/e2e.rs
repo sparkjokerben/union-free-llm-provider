@@ -1426,6 +1426,238 @@ async fn 已沉淀的规则会被直接套用不再分析() {
     assert_eq!(hits, 1);
 }
 
+/// 挑刺上游：每次都回同一条 400（补丁修不好它）。
+async fn always_400(message: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"message": message}})),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+fn read_tool_request() -> Value {
+    json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "max_tokens": 256,
+        "stream": false,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "读文件"}]}],
+        "tools": [{"name": "Read", "input_schema": {"type": "object",
+                   "properties": {"path": {"type": "string"}}, "required": ["path"]}}]
+    })
+}
+
+#[tokio::test]
+async fn 套了没用的规则只套一次_不计命中() {
+    const ERR: &str = "tool schema rejected: unknown keyword";
+    let picky = always_400(ERR).await;
+    let picky_uri = picky.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "picky", "openai_chat", &picky_uri, "sk-picky", "gpt-4o-mini", 1);
+        // 这条规则每次都「能应用」（add 一个新键），但修不好错误。
+        // 以前规则这一级没有次数限制，会对着上游一直重试下去。
+        let fp = ufp::rectify::rules::fingerprint("openai_chat", 400, ERR);
+        conn.execute(
+            "INSERT INTO rectify_rules (scope, error_fingerprint, error_sample, patch_json, source, enabled, created_ms, updated_ms)
+             VALUES ('openai_chat', ?1, '', ?2, 'llm', 1, 0, 0)",
+            rusqlite::params![fp, r#"[{"op":"add","path":"/tools/0/input_schema/additionalProperties","value":true}]"#],
+        )
+        .unwrap();
+    })
+    .await;
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client()
+            .post(format!("{}/v1/messages", gw.base))
+            .header("x-api-key", DOWNSTREAM_KEY)
+            .json(&read_tool_request())
+            .send(),
+    )
+    .await
+    .expect("规则失效时不该一直重试")
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let picky_requests = picky.received_requests().await.unwrap_or_default();
+    assert_eq!(picky_requests.len(), 2, "原请求一次 + 套规则后重试一次");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let hits: i64 = gw
+        .state
+        .db
+        .read(|conn| conn.query_row("SELECT hits FROM rectify_rules LIMIT 1", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(hits, 0, "没修好就不算命中");
+}
+
+#[tokio::test]
+async fn 分析给的补丁没修好就不沉淀_同类报错换候选也不再分析() {
+    const ERR: &str = "tool schema rejected: unknown keyword";
+    let analyzer = MockServer::start().await;
+    let patch_text = r#"{"why":"猜的","patch":[{"op":"add","path":"/tools/0/input_schema/additionalProperties","value":false}]}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_body("gpt-4o", patch_text)),
+        )
+        .mount(&analyzer)
+        .await;
+    let picky_a = always_400(ERR).await;
+    let picky_b = always_400(ERR).await;
+
+    let (analyzer_uri, a_uri, b_uri) = (analyzer.uri(), picky_a.uri(), picky_b.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "picky-a",
+            "openai_chat",
+            &a_uri,
+            "sk-a",
+            "gpt-4o-mini",
+            1,
+        );
+        seed_channel(
+            conn,
+            "picky-b",
+            "openai_chat",
+            &b_uri,
+            "sk-b",
+            "gpt-4o-mini",
+            1,
+        );
+        let (_key, entry_id) = seed_channel(
+            conn,
+            "analyzer",
+            "openai_chat",
+            &analyzer_uri,
+            "sk-ana",
+            "gpt-4o",
+            9,
+        );
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('runtime', ?1)",
+            rusqlite::params![serde_json::json!({"analysisEntryId": entry_id}).to_string()],
+        )
+        .unwrap();
+    })
+    .await;
+
+    let resp = client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(&read_tool_request())
+        .send()
+        .await
+        .unwrap();
+    // 两个挑刺候选都失败后会落到分析条目自己（它也在池子里），状态码不是这里要测的
+    let _ = resp.status();
+
+    // 分析条目也会作为普通候选被调到，只数「分析请求」（带请求骨架的那种）
+    let analysis_prompts: Vec<String> = analyzer
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .filter(|b| b.contains("请求骨架"))
+        .collect();
+    assert_eq!(analysis_prompts.len(), 1, "同一请求里同类报错只分析一次");
+    assert!(
+        analysis_prompts[0].contains("上游协议：openai_chat"),
+        "{}",
+        analysis_prompts[0]
+    );
+    let a = picky_a.received_requests().await.unwrap_or_default().len();
+    let b = picky_b.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        a + b,
+        3,
+        "先到的候选：原请求 + 补丁重试；后到的候选不再分析，只试一次"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let rules: i64 = gw
+        .state
+        .db
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM rectify_rules", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(rules, 0, "重试仍失败的补丁不该沉淀成规则");
+}
+
+// ============================================================================
+// Gemini 原生上游
+// ============================================================================
+
+#[tokio::test]
+async fn gemini_多轮工具调用_签名挂在_part_上_空_items_走_json_schema() {
+    use ufp_convert::providers::gemini_signature::encode_tool_id;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "晴"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 1, "totalTokenCount": 6}
+        })))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "gemini", "gemini", &uri, "g-key", "gemini-3-pro", 1);
+    })
+    .await;
+
+    let id = encode_tool_id("call_1", "sig-call");
+    let body = json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "max_tokens": 256,
+        "stream": false,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "东京天气"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "batch_tool", "input": {"batch": [1]}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+            ]}
+        ],
+        "tools": [{"name": "batch_tool", "input_schema": {"type": "object",
+            "properties": {"batch": {"type": "array", "items": {}}}}}]
+    });
+    let resp = client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let requests = upstream.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let call_part = &sent["contents"][1]["parts"][0];
+    assert_eq!(call_part["thoughtSignature"], "sig-call", "{sent}");
+    assert!(
+        call_part["functionCall"].get("thoughtSignature").is_none(),
+        "{sent}"
+    );
+    assert_eq!(call_part["functionCall"]["id"], "call_1", "{sent}");
+    let decl = &sent["tools"][0]["functionDeclarations"][0];
+    assert!(decl.get("parameters").is_none(), "{sent}");
+    assert_eq!(
+        decl["parametersJsonSchema"]["properties"]["batch"]["items"],
+        json!({})
+    );
+}
+
 // ============================================================================
 // 在线部署接口（CI 推包用）
 // ============================================================================
