@@ -23,6 +23,10 @@ use ufp_convert::types::RectifierConfig;
 pub enum BuiltinRectifier {
     ThinkingSignature,
     ThinkingBudget,
+    /// 上游不认当前思考参数写法：换一个等价的高配写法（不靠关掉思考通过）。
+    ThinkingForm,
+    /// 阶梯走完：这个模型完全不支持思考（转发层据此禁用条目）。
+    ThinkingUnsupported,
     MediaFallback,
     MaxTokensClamp,
 }
@@ -32,6 +36,8 @@ impl BuiltinRectifier {
         match self {
             BuiltinRectifier::ThinkingSignature => "thinking_signature",
             BuiltinRectifier::ThinkingBudget => "thinking_budget",
+            BuiltinRectifier::ThinkingForm => "thinking_form",
+            BuiltinRectifier::ThinkingUnsupported => "thinking_unsupported",
             BuiltinRectifier::MediaFallback => "media_fallback",
             BuiltinRectifier::MaxTokensClamp => "max_tokens_clamp",
         }
@@ -66,6 +72,31 @@ pub fn apply_builtin(
         let result = rectify_thinking_budget(body);
         if result.applied {
             return Some(BuiltinRectifier::ThinkingBudget);
+        }
+    }
+
+    // UFP: 思考参数阶梯（D14）。只在渠道勾了「思考开到最大」（请求体带私有标记）
+    // 且上游明说不吃思考参数时动：先降一档写法，都不行就标记「不支持」。
+    if cfg.enabled && ufp_convert::thinking_policy::is_thinking_rejection(error_message) {
+        if let Some(mode) = ufp_convert::thinking_policy::mode(body) {
+            match mode.downgrade() {
+                // 阶梯要连降两档（max→alt→legacy），不用 `tried` 限次数：
+                // 降不到底就是 None，天然有界。
+                Some(next) => {
+                    ufp_convert::thinking_policy::set_mode(body, next);
+                    return Some(BuiltinRectifier::ThinkingForm);
+                }
+                None if mode != ufp_convert::thinking_policy::Mode::Unsupported
+                    && !has(BuiltinRectifier::ThinkingUnsupported) =>
+                {
+                    ufp_convert::thinking_policy::set_mode(
+                        body,
+                        ufp_convert::thinking_policy::Mode::Unsupported,
+                    );
+                    return Some(BuiltinRectifier::ThinkingUnsupported);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -250,6 +281,53 @@ mod tests {
         assert_eq!(
             body["messages"][0]["content"][1]["text"],
             "[Unsupported Image]"
+        );
+    }
+
+    #[test]
+    fn 上游不认思考参数时逐级换写法_不关掉思考() {
+        use ufp_convert::thinking_policy::{mode, set_mode, Mode};
+        let mut body = json!({"max_tokens": 100});
+        set_mode(&mut body, Mode::Max);
+        let applied = apply_builtin(
+            &mut body,
+            "Unsupported parameter: 'reasoning' is not supported with this model.",
+            &RectifierConfig::default(),
+            &[],
+        );
+        assert_eq!(applied, Some(BuiltinRectifier::ThinkingForm));
+        assert_eq!(mode(&body), Some(Mode::Alt), "换写法，不关思考");
+
+        let applied = apply_builtin(
+            &mut body,
+            "Unknown name \"reasoning\"",
+            &RectifierConfig::default(),
+            &[BuiltinRectifier::ThinkingForm],
+        );
+        assert_eq!(applied, Some(BuiltinRectifier::ThinkingForm));
+        assert_eq!(mode(&body), Some(Mode::Legacy));
+
+        let applied = apply_builtin(
+            &mut body,
+            "thinking is not allowed here",
+            &RectifierConfig::default(),
+            &[BuiltinRectifier::ThinkingForm],
+        );
+        assert_eq!(applied, Some(BuiltinRectifier::ThinkingUnsupported));
+        assert_eq!(mode(&body), Some(Mode::Unsupported));
+    }
+
+    #[test]
+    fn 没有强制标记的渠道不碰阶梯() {
+        let mut body = json!({"max_tokens": 100});
+        assert_eq!(
+            apply_builtin(
+                &mut body,
+                "Unsupported parameter: 'reasoning'",
+                &RectifierConfig::default(),
+                &[]
+            ),
+            None
         );
     }
 

@@ -75,6 +75,11 @@ rg -n 'UFP:' crates/ufp-convert/src                     # 列出所有本地改�
 - ✅ 历史里有别家模型产生的工具调用（没有签名）时，Gemini 3 回 `Function call is missing
   a thought_signature` → `fill_missing_function_call_signatures` 给这一步第一个 functionCall
   补 Google 文档给的占位签名 `skip_thought_signature_validator`（UFP 新增，cc-switch 没有）。
+- ✅ `transform.rs` 的模型名判定都不去厂商前缀：OpenRouter 的 `openai/gpt-5.6` 既拿不到
+  `reasoning_effort`，`max_tokens` 字段名也会被拒 → 判定前先 `rsplit('/')` 取尾段。
+- ✅ `build_generation_config` 的 thinking 映射：新增 `thinking_policy.rs`（UFP），
+  渠道勾了「思考开到最大」时按模型分档发 `thinkingLevel`（3.x）/ `thinkingBudget`（2.x），
+  完全忽略客户端发的 thinking；没勾的渠道维持上游行为。
 
 仍未处理（不阻塞主线）：
 

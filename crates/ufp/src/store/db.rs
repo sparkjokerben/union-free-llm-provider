@@ -60,6 +60,16 @@ pub enum Write {
     RuleHit {
         rule_id: i64,
     },
+    /// 阶梯试出来的可用思考参数形式（learned 为空 = 这个模型不支持思考）。
+    EntryThinkingMode {
+        entry_id: i64,
+        mode: String,
+    },
+    /// 模型完全不支持思考：禁用条目并记下原因。
+    DisableEntryThinking {
+        entry_id: i64,
+        reason: String,
+    },
     /// 下游 key 最近使用时间。
     DownstreamKeyUsed {
         key_id: i64,
@@ -330,6 +340,20 @@ fn apply(conn: &Connection, w: Write, now: i64) -> DbResult<()> {
                  VALUES (?1,?2,?3,?4,?5)
                  ON CONFLICT(key_id, model) DO UPDATE SET until_ms = ?3, reason = ?4",
                 rusqlite::params![key_id, model, until_ms, reason, now],
+            )?;
+        }
+        Write::EntryThinkingMode { entry_id, mode } => {
+            conn.execute(
+                "UPDATE entries SET thinking_mode = ?2 WHERE id = ?1",
+                rusqlite::params![entry_id, mode],
+            )?;
+        }
+        Write::DisableEntryThinking { entry_id, reason } => {
+            conn.execute(
+                "UPDATE entries SET thinking_mode = 'unsupported', enabled = 0,
+                        notes = ?2
+                 WHERE id = ?1",
+                rusqlite::params![entry_id, reason],
             )?;
         }
         Write::DisableKey { key_id, reason } => {

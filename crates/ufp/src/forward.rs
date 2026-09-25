@@ -90,6 +90,10 @@ struct AttemptInput {
     log_template: Option<RequestLogRow>,
     /// 模仿 OpenCode 的候选用的会话身份（一次客户端请求里的各次尝试共用）。
     opencode: Option<OpencodeIds>,
+    /// 整条客户端请求开始的时刻：流式明细的总耗时按它算。
+    request_started: Instant,
+    /// 本次是第几次尝试（写进明细，别再写死 1）。
+    attempts: u32,
 }
 
 /// 每次尝试的结果分类。
@@ -195,7 +199,14 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             hints: Arc::clone(&hints),
             log_template: ctx.log_template.clone(),
             opencode: opencode.clone(),
+            request_started: started,
+            attempts: meta.attempts,
         };
+        // D14: 渠道勾了「思考开到最大」就打上强制标记（阶梯试出来的形式记在
+        // 条目上）。网关强制开的思考一律回给客户端看。
+        if apply_max_thinking(&mut input.body, cand) {
+            input.show_thinking = true;
+        }
         let attempt_started = Instant::now();
         rectifier.begin_candidate();
         let result = loop {
@@ -215,6 +226,21 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
                     )
                     .await
                 {
+                    // D14: 阶梯走完 = 这个模型完全不吃思考参数。不靠关掉思考蒙混过关，
+                    // 直接把它从池子里移除，换下一个候选。
+                    if ufp_convert::thinking_policy::mode(&input.body)
+                        == Some(ufp_convert::thinking_policy::Mode::Unsupported)
+                    {
+                        tracing::warn!(
+                            request_id = %ctx.request_id,
+                            channel = %cand.channel.name,
+                            model = %cand.entry.upstream_model,
+                            "上游不接受任何思考参数，已停用该条目：{}",
+                            truncate_error(message)
+                        );
+                        state.disable_entry_for_thinking(cand.entry.id, message);
+                        break r;
+                    }
                     tracing::info!(
                         request_id = %ctx.request_id,
                         channel = %cand.channel.name,
@@ -227,15 +253,21 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
             }
             break r;
         };
-        rectifier
-            .settle(
-                &state,
-                matches!(
-                    result,
-                    AttemptResult::Done { .. } | AttemptResult::Committed { .. }
-                ),
-            )
-            .await;
+        let succeeded = matches!(
+            result,
+            AttemptResult::Done { .. } | AttemptResult::Committed { .. }
+        );
+        rectifier.settle(&state, succeeded).await;
+        // 阶梯试出来的写法这次真跑通了 → 记到条目上，下个请求直接用（不重走阶梯）。
+        if succeeded {
+            if let Some(mode) = ufp_convert::thinking_policy::mode(&input.body) {
+                if mode != ufp_convert::thinking_policy::Mode::Max
+                    && cand.entry.thinking_mode != mode.as_str()
+                {
+                    state.note_entry_thinking_mode(cand.entry.id, mode.as_str());
+                }
+            }
+        }
         let elapsed_ms = attempt_started.elapsed().as_millis() as i64;
         log_attempt(&state, &ctx, cand, &result, elapsed_ms, meta.attempts);
 
@@ -455,6 +487,21 @@ pub async fn run(state: Arc<AppState>, ctx: ForwardCtx) -> Outcome {
     Outcome::Failed { error, meta }
 }
 
+/// 给这个候选的请求体打上「思考开到最大」的私有标记；返回是否真的在强制思考。
+///
+/// 阶梯（`thinking_policy::Mode`）试出来的可用形式记在 `entries.thinking_mode`，
+/// 下一个请求直接用学到的形式；记成 `unsupported` 的条目已经被网关停用，
+/// 人为重新启用后按「这个模型不支持思考」处理，不发任何思考参数。
+fn apply_max_thinking(body: &mut Value, cand: &Candidate) -> bool {
+    use ufp_convert::thinking_policy::{set_mode, Mode};
+    if !cand.channel.max_thinking {
+        return false;
+    }
+    let mode = Mode::parse(&cand.entry.thinking_mode).unwrap_or(Mode::Max);
+    set_mode(body, mode);
+    mode != Mode::Unsupported
+}
+
 fn record_session(state: &Arc<AppState>, ctx: &ForwardCtx, cand: &Candidate) {
     let Some(sid) = ctx.session_id.as_deref() else {
         return;
@@ -597,8 +644,13 @@ async fn attempt_stream(
         row.upstream_model = cand.entry.upstream_model.clone();
         row.channel_id = Some(cand.channel.id);
         row.key_id = Some(cand.key.id);
-        row.attempts = 1;
-        pipeline.attach_log(Arc::clone(&state.db), row, 200);
+        pipeline.attach_log(
+            Arc::clone(&state.db),
+            row,
+            200,
+            input.request_started,
+            input.attempts as i64,
+        );
     }
     let hints = match cand.channel.protocol {
         crate::store::Protocol::Gemini => Some(input.hints.as_ref().clone()),

@@ -681,6 +681,9 @@ struct ChannelPayload {
     /// 客户端模仿（'' / 'opencode'）。编辑时不传 = 不改。
     #[serde(default)]
     client_profile: Option<String>,
+    /// 强制把思考开到最大。编辑时不传 = 不改。
+    #[serde(default)]
+    max_thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -728,7 +731,7 @@ async fn list_channels(
         .db
         .read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile
+                "SELECT id, name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile, max_thinking
                  FROM channels ORDER BY id",
             )?;
             let channels: Vec<Value> = stmt
@@ -744,6 +747,7 @@ async fn list_channels(
                         "notes": r.get::<_, String>(6)?,
                         "created_ms": r.get::<_, i64>(7)?,
                         "client_profile": r.get::<_, String>(8)?,
+                        "max_thinking": r.get::<_, i64>(9)? != 0,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -828,8 +832,8 @@ async fn create_channel(
     let profile = crate::store::ClientProfile::parse(p.client_profile.as_deref().unwrap_or(""));
     let id = mutate(&state, move |conn| {
         conn.execute(
-            "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile, max_thinking)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 p.name,
                 p.protocol,
@@ -838,7 +842,8 @@ async fn create_channel(
                 p.enabled as i64,
                 p.notes,
                 chrono::Utc::now().timestamp_millis(),
-                profile.as_str()
+                profile.as_str(),
+                p.max_thinking.unwrap_or(false) as i64
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -863,7 +868,8 @@ async fn update_channel(
         conn.execute(
             "UPDATE channels SET name = ?2, protocol = ?3, base_url = ?4,
                     extra_headers = ?5, enabled = ?6, notes = ?7,
-                    client_profile = COALESCE(?8, client_profile) WHERE id = ?1",
+                    client_profile = COALESCE(?8, client_profile),
+                    max_thinking = COALESCE(?9, max_thinking) WHERE id = ?1",
             params![
                 id,
                 p.name,
@@ -872,7 +878,8 @@ async fn update_channel(
                 headers_json,
                 p.enabled as i64,
                 p.notes,
-                profile
+                profile,
+                p.max_thinking.map(|v| v as i64)
             ],
         )?;
         Ok(())
@@ -2203,7 +2210,7 @@ fn export_all(conn: &Connection) -> rusqlite::Result<Value> {
     };
     Ok(json!({
         "version": 1,
-        "channels": dump("SELECT id, name, protocol, base_url, extra_headers, enabled, notes, client_profile FROM channels", &["id","name","protocol","base_url","extra_headers","enabled","notes","client_profile"])?,
+        "channels": dump("SELECT id, name, protocol, base_url, extra_headers, enabled, notes, client_profile, max_thinking FROM channels", &["id","name","protocol","base_url","extra_headers","enabled","notes","client_profile","max_thinking"])?,
         "upstream_keys": dump("SELECT id, channel_id, label, api_key, enabled, status, status_reason FROM upstream_keys", &["id","channel_id","label","api_key","enabled","status","status_reason"])?,
         "entries": dump("SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled, notes FROM entries", &["id","channel_id","upstream_model","tier","max_context","vision","pdf","enabled","notes"])?,
         // 带 key_hash：恢复之后这些 key 还能继续用（明文不在备份里，界面上的提示照此为准）。
@@ -2254,9 +2261,9 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
             }
             let headers = ch.get("extra_headers").cloned().unwrap_or(json!({}));
             tx.execute(
-                "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(name) DO UPDATE SET protocol = ?2, base_url = ?3, extra_headers = ?4, enabled = ?5, notes = ?6, client_profile = ?8",
+                "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile, max_thinking)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(name) DO UPDATE SET protocol = ?2, base_url = ?3, extra_headers = ?4, enabled = ?5, notes = ?6, client_profile = ?8, max_thinking = ?9",
                 params![
                     name,
                     ch.get("protocol").and_then(|v| v.as_str()).unwrap_or("openai_chat"),
@@ -2268,7 +2275,8 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
                     crate::store::ClientProfile::parse(
                         ch.get("client_profile").and_then(|v| v.as_str()).unwrap_or("")
                     )
-                    .as_str()
+                    .as_str(),
+                    ch.get("max_thinking").and_then(|v| v.as_bool()).unwrap_or(false) as i64
                 ],
             )?;
             counts["channels"] = json!(counts["channels"].as_i64().unwrap_or(0) + 1);

@@ -19,6 +19,7 @@ pub mod json_canonical;
 pub mod providers;
 pub mod sse;
 pub mod thinking_budget_rectifier;
+pub mod thinking_policy;
 pub mod thinking_rectifier;
 pub mod tool_media;
 pub mod types;

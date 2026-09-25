@@ -92,12 +92,20 @@ pub struct Pipeline {
     upstream_error: Option<String>,
     /// 流式请求的落库上下文：管线结束时（或客户端断开被 drop 时）写请求明细。
     log: Option<PipelineLog>,
+    /// 本次尝试开始的时间，用来算「首内容」。
+    started: std::time::Instant,
+    /// 第一个真实内容块出现的时刻（相对 `started` 的毫秒数）。
+    first_content_ms: Option<i64>,
 }
 
 struct PipelineLog {
     db: Arc<Db>,
     row: RequestLogRow,
     status: i64,
+    /// 整条客户端请求开始的时刻：总耗时按它算（与流式无关的口径，含前面失败的候选）。
+    request_started: std::time::Instant,
+    /// 真实尝试次数（模板里写死的 1 不准）。
+    attempts: i64,
     written: bool,
 }
 
@@ -118,6 +126,8 @@ impl Pipeline {
             thinking: None,
             upstream_error: None,
             log: None,
+            started: std::time::Instant::now(),
+            first_content_ms: None,
         }
     }
 
@@ -125,13 +135,22 @@ impl Pipeline {
     ///
     /// 管线在流结束、或客户端提前断开导致管线被 drop 时写这一行（带 Drop 兜底），
     /// 所以「客户端看到一半就断了」也有记录。
-    pub fn attach_log(&mut self, db: Arc<Db>, mut row: RequestLogRow, status: i64) {
+    pub fn attach_log(
+        &mut self,
+        db: Arc<Db>,
+        mut row: RequestLogRow,
+        status: i64,
+        request_started: std::time::Instant,
+        attempts: i64,
+    ) {
         row.streaming = true;
         row.created_ms = chrono::Utc::now().timestamp_millis();
         self.log = Some(PipelineLog {
             db,
             row,
             status,
+            request_started,
+            attempts,
             written: false,
         });
     }
@@ -153,6 +172,10 @@ impl Pipeline {
         row.search_requests = self.usage.web_search_requests as i64;
         row.stop_reason = self.stop_reason.clone();
         row.http_status = log.status;
+        // UFP: 这三个字段以前没人填 → 流式请求在后台全是「总耗时 0ms / 首内容空 / 尝试 1」。
+        row.total_ms = log.request_started.elapsed().as_millis() as i64;
+        row.first_content_ms = self.first_content_ms;
+        row.attempts = log.attempts;
         if let Some((kind, message)) = error {
             row.error_type = Some(kind);
             row.error_message = Some(truncate_error(&message));
@@ -299,6 +322,9 @@ impl Pipeline {
                             );
                             self.emit_value("content_block_delta", &value);
                         }
+                        // UFP: 首个思考增量就算「有内容」并提交闸门。思考相位可能很长
+                        // （强制思考后是常态），不能整段压在预提交预算里等块结束。
+                        self.mark_content(true);
                         return Ok(());
                     }
                 }
@@ -366,6 +392,9 @@ impl Pipeline {
             return;
         }
         self.has_content = true;
+        if self.first_content_ms.is_none() {
+            self.first_content_ms = Some(self.started.elapsed().as_millis() as i64);
+        }
         if !self.committed {
             self.committed = true;
             // 把提交前攒下的事件搬到 out，随后（或已经）一起下发。
@@ -817,6 +846,42 @@ mod tests {
         assert!(out.contains("redacted_thinking"), "{out}");
         assert!(out.contains("SIG-123"), "签名必须带上：{out}");
         assert!(!out.contains("秘密推理过程"), "思考正文不该下发：{out}");
+    }
+
+    /// UFP: 隐藏思考时提交闸门不能等整段思考结束——强制思考后思考相位动辄几十秒，
+    /// 等块结束会把整段思考压在预提交预算（firstContentTimeoutMs）里。
+    #[test]
+    fn 隐藏思考时首个思考增量就提交() {
+        let mut p = Pipeline::new(cfg(false));
+        p.feed(
+            sse(
+                "message_start",
+                json!({"type":"message_start","message":{"model":"m","usage":{}}}),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        p.feed(sse("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}})).as_bytes()).unwrap();
+        assert!(!p.committed(), "思考块开始时还没有内容");
+        assert!(p.first_content_ms.is_none());
+        p.feed(sse("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"推理"}})).as_bytes()).unwrap();
+        assert!(p.committed(), "首个思考增量就该提交");
+        assert!(p.first_content_ms.is_some(), "首内容时刻要记下来写进明细");
+    }
+
+    #[test]
+    fn 首个内容块时记首内容时刻() {
+        let mut p = Pipeline::new(cfg(true));
+        p.feed(
+            sse(
+                "message_start",
+                json!({"type":"message_start","message":{"model":"m","usage":{}}}),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        p.feed(sse("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})).as_bytes()).unwrap();
+        assert!(p.first_content_ms.is_some());
     }
 
     #[test]

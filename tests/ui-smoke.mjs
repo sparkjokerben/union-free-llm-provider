@@ -338,6 +338,23 @@ if (WRITES) {
        return /停用/.test(txt) && /启用/.test(row.querySelector('button[data-togkey]').textContent) ? true : '状态没同步：' + txt;
      })()`, 300);
 
+  await step('渠道对话框：勾上「思考开到最大」真的存下来、页面上也标出来',
+    `(async () => {
+       const sec = () => [...document.querySelectorAll('#p-pool div.sec')].find(x => x.textContent.includes('__smoke_chan__'));
+       sec().querySelector('button[data-editchan]').click();
+       await new Promise(r => setTimeout(r, 400));
+       const box = document.querySelector('#f-maxthinking');
+       if (!box) return '渠道对话框里没有「思考开到最大」';
+       if (box.checked) return '新建的渠道不该默认开';
+       box.checked = true;
+       document.querySelector('#f-save').click();
+       await new Promise(r => setTimeout(r, 1200));
+       const ch = S.pool.channels.find(c => c.name === '__smoke_chan__');
+       if (!ch || !ch.max_thinking) return '勾上之后没存进渠道配置';
+       if (!/思考开到最大/.test(sec().textContent)) return '渠道卡片上没有标出「思考开到最大」';
+       return true;
+     })()`, 300);
+
   await step('下游 key：一键导入 cc-switch 的链接、可用模型都真的出来',
     `(async () => {
        // 临时造一条可用的模型（渠道 + key + 条目），好让「可用模型」有内容

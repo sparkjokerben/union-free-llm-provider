@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS channels (
     notes         TEXT NOT NULL DEFAULT '',
     created_ms    INTEGER NOT NULL,
     -- 请求体按哪个客户端的样子发：'' = 不模仿；'opencode' = 照 OpenCode（见 upstream/client_profile.rs）
-    client_profile TEXT NOT NULL DEFAULT ''
+    client_profile TEXT NOT NULL DEFAULT '',
+    -- 强制把思考开到最大（D14），不管下游发的是什么；预设建的渠道默认开
+    max_thinking   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS upstream_keys (
@@ -46,6 +48,8 @@ CREATE TABLE IF NOT EXISTS entries (
     pdf           INTEGER NOT NULL DEFAULT 0,
     enabled       INTEGER NOT NULL DEFAULT 1,
     notes         TEXT NOT NULL DEFAULT '',
+    -- 阶梯试出来的可用思考参数形式（''/max/alt/legacy/unsupported，见 thinking_policy.rs）
+    thinking_mode TEXT NOT NULL DEFAULT '',
     created_ms    INTEGER NOT NULL,
     UNIQUE(channel_id, upstream_model)
 );
@@ -206,6 +210,13 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         "client_profile",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column(
+        conn,
+        "channels",
+        "max_thinking",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column(conn, "entries", "thinking_mode", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }
 

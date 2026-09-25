@@ -2437,3 +2437,420 @@ async fn 不模仿的渠道_请求体与头都不动() {
         "默认仍然不要压缩"
     );
 }
+
+// ============================================================================
+// D14：预设渠道的「思考开到最大」+ 阶梯退让 + 流式明细的耗时
+// ============================================================================
+
+fn enable_max_thinking(conn: &rusqlite::Connection, channel: &str) {
+    conn.execute(
+        "UPDATE channels SET max_thinking = 1 WHERE name = ?1",
+        [channel],
+    )
+    .unwrap();
+}
+
+async fn sent_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap_or(Value::Null))
+        .collect()
+}
+
+async fn post_message(gw: &Gateway, body: &Value) -> reqwest::Response {
+    client()
+        .post(format!("{}/v1/messages", gw.base))
+        .header("x-api-key", DOWNSTREAM_KEY)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn 强制思考_gemini_不管客户端发什么都用最高档() {
+    let up = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "好"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4}
+        })))
+        .mount(&up)
+        .await;
+    let uri = up.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "gem", "gemini", &uri, "k", "gemini-3.5-flash", 1);
+        enable_max_thinking(conn, "gem");
+    })
+    .await;
+
+    for thinking in [
+        serde_json::Value::Null,
+        json!({"type": "disabled"}),
+        json!({"type": "enabled", "budget_tokens": 1024}),
+    ] {
+        let mut body = anthropic_body(false);
+        if !thinking.is_null() {
+            body["thinking"] = thinking;
+        }
+        let resp = post_message(&gw, &body).await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    }
+    for sent in sent_bodies(&up).await {
+        let cfg = &sent["generationConfig"]["thinkingConfig"];
+        assert_eq!(cfg["includeThoughts"], true, "{sent}");
+        assert_eq!(cfg["thinkingLevel"], "high", "{sent}");
+        assert!(cfg.get("thinkingBudget").is_none(), "{sent}");
+    }
+}
+
+#[tokio::test]
+async fn 强制思考_openai_chat_原生模型与其它模型用不同字段() {
+    let native = MockServer::start().await;
+    let other = MockServer::start().await;
+    for m in [&native, &other] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_body("m", "好")))
+            .mount(m)
+            .await;
+    }
+    let (native_uri, other_uri) = (native.uri(), other.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "native",
+            "openai_chat",
+            &native_uri,
+            "k1",
+            "openai/gpt-5.6",
+            1,
+        );
+        seed_channel(
+            conn,
+            "other",
+            "openai_chat",
+            &other_uri,
+            "k2",
+            "qwen/qwen3.8-27b:free",
+            1,
+        );
+        enable_max_thinking(conn, "native");
+        enable_max_thinking(conn, "other");
+    })
+    .await;
+
+    // 点名各自模型，避免路由把请求都送到同一个候选
+    for model in ["openai/gpt-5.6", "qwen/qwen3.8-27b:free"] {
+        let mut body = anthropic_body(false);
+        body["model"] = json!(model);
+        body["thinking"] = json!({"type": "disabled"});
+        let resp = post_message(&gw, &body).await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    }
+    let sent = sent_bodies(&native).await;
+    assert_eq!(sent[0]["reasoning_effort"], "max", "{sent:?}");
+    assert!(sent[0].get("reasoning").is_none(), "{sent:?}");
+    let sent = sent_bodies(&other).await;
+    assert_eq!(sent[0]["reasoning"]["effort"], "max", "{sent:?}");
+}
+
+#[tokio::test]
+async fn 强制思考_anthropic_新旧模型两种形态_标记不上线() {
+    let modern = MockServer::start().await;
+    let legacy = MockServer::start().await;
+    for m in [&modern, &legacy] {
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message("好")))
+            .mount(m)
+            .await;
+    }
+    let (modern_uri, legacy_uri) = (modern.uri(), legacy.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "new",
+            "anthropic",
+            &modern_uri,
+            "k1",
+            "claude-sonnet-5",
+            1,
+        );
+        seed_channel(
+            conn,
+            "old",
+            "anthropic",
+            &legacy_uri,
+            "k2",
+            "claude-sonnet-4-5-20250929",
+            1,
+        );
+        enable_max_thinking(conn, "new");
+        enable_max_thinking(conn, "old");
+    })
+    .await;
+
+    for model in ["claude-sonnet-5", "claude-sonnet-4-5-20250929"] {
+        let mut body = anthropic_body(false);
+        body["model"] = json!(model);
+        body["max_tokens"] = json!(32_000);
+        body["thinking"] = json!({"type": "disabled"});
+        let resp = post_message(&gw, &body).await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    }
+    let sent = sent_bodies(&modern).await;
+    assert_eq!(sent[0]["thinking"]["type"], "adaptive", "{sent:?}");
+    assert_eq!(sent[0]["thinking"]["display"], "summarized", "{sent:?}");
+    assert_eq!(sent[0]["output_config"]["effort"], "max", "{sent:?}");
+    assert!(
+        sent[0].get("_ufp_reasoning").is_none(),
+        "私有标记不能上线：{sent:?}"
+    );
+    let sent = sent_bodies(&legacy).await;
+    assert_eq!(sent[0]["thinking"]["type"], "enabled", "{sent:?}");
+    assert_eq!(sent[0]["thinking"]["budget_tokens"], 31_999, "{sent:?}");
+    assert_eq!(
+        sent[0]["max_tokens"], 32_000,
+        "预算必须小于 max_tokens：{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn 强制思考_responses_带_summary_与_include() {
+    let up = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_1", "object": "response", "status": "completed",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "好"}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&up)
+        .await;
+    let uri = up.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "resp",
+            "openai_responses",
+            &uri,
+            "k",
+            "openai/gpt-5.6",
+            1,
+        );
+        enable_max_thinking(conn, "resp");
+    })
+    .await;
+    let resp = post_message(&gw, &anthropic_body(false)).await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let sent = sent_bodies(&up).await;
+    assert_eq!(sent[0]["reasoning"]["effort"], "max", "{sent:?}");
+    assert_eq!(sent[0]["reasoning"]["summary"], "auto", "{sent:?}");
+    assert_eq!(
+        sent[0]["include"][0], "reasoning.encrypted_content",
+        "{sent:?}"
+    );
+    assert_eq!(sent[0]["store"], false, "{sent:?}");
+}
+
+#[tokio::test]
+async fn 阶梯_上游不认思考参数时换写法_走通的写法记到条目上() {
+    let picky = MockServer::start().await;
+    // 第一种写法（reasoning 对象）被拒
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "Unsupported parameter: 'reasoning' is not supported with this model."}
+        })))
+        .up_to_n_times(1)
+        .mount(&picky)
+        .await;
+    // 第二种（reasoning.max_tokens）也被拒
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "Unknown name \"reasoning\" at 'reasoning'."}
+        })))
+        .up_to_n_times(1)
+        .mount(&picky)
+        .await;
+    // 第三种（reasoning_effort）通过
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_body("m", "好了")))
+        .mount(&picky)
+        .await;
+
+    let uri = picky.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "picky",
+            "openai_chat",
+            &uri,
+            "k",
+            "qwen/qwen3.8-27b:free",
+            1,
+        );
+        enable_max_thinking(conn, "picky");
+    })
+    .await;
+    let mut body = anthropic_body(false);
+    body["model"] = json!("qwen/qwen3.8-27b:free");
+    let resp = post_message(&gw, &body).await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let sent = sent_bodies(&picky).await;
+    assert_eq!(sent.len(), 3, "两次退让各试一次：{sent:?}");
+    assert_eq!(sent[0]["reasoning"]["effort"], "max", "{sent:?}");
+    assert_eq!(sent[1]["reasoning"]["max_tokens"], 24_576, "{sent:?}");
+    assert_eq!(sent[2]["reasoning_effort"], "high", "{sent:?}");
+
+    // 走通的写法落库（写库是异步批量的，轮询等一下）
+    let mut mode = String::new();
+    for _ in 0..40 {
+        mode = gw
+            .state
+            .db
+            .read(|conn| {
+                conn.query_row("SELECT thinking_mode FROM entries LIMIT 1", [], |r| {
+                    r.get::<_, String>(0)
+                })
+            })
+            .await
+            .unwrap();
+        if !mode.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(mode, "legacy", "验证过的写法要记住，别每次重走阶梯");
+}
+
+#[tokio::test]
+async fn 阶梯走完_模型完全不支持思考_条目被停用() {
+    let picky = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "Invalid value for 'reasoning': thinking is not allowed on this model."}
+        })))
+        .mount(&picky)
+        .await;
+    let uri = picky.uri();
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(
+            conn,
+            "picky",
+            "openai_chat",
+            &uri,
+            "k",
+            "weird/model-x:free",
+            1,
+        );
+        enable_max_thinking(conn, "picky");
+    })
+    .await;
+    let mut body = anthropic_body(false);
+    body["model"] = json!("weird/model-x:free");
+    let resp = post_message(&gw, &body).await;
+    assert_eq!(resp.status(), 400, "没有任何候选可用");
+
+    assert_eq!(sent_bodies(&picky).await.len(), 3, "三种写法各试一次就收手");
+    // 写库是异步批量的，轮询等一下
+    let mut row = (1i64, String::new(), String::new());
+    for _ in 0..40 {
+        row = gw
+            .state
+            .db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT enabled, thinking_mode, notes FROM entries LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+            .unwrap();
+        if row.0 == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (enabled, mode, notes) = row;
+    assert_eq!(enabled, 0, "完全不支持思考的模型要移出池子");
+    assert_eq!(mode, "unsupported");
+    assert!(notes.contains("思考"), "要写清为什么被停用：{notes}");
+}
+
+#[tokio::test]
+async fn 流式明细_总耗时与首内容不再是零_尝试次数是真的() {
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"error": {"message": "overloaded"}}))
+                .set_delay(std::time::Duration::from_millis(60)),
+        )
+        .mount(&failing)
+        .await;
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(chat_completion_sse("m", &["好", "了"]))
+                .set_delay(std::time::Duration::from_millis(150)),
+        )
+        .mount(&slow)
+        .await;
+    let (a, b) = (failing.uri(), slow.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_channel(conn, "flaky", "openai_chat", &a, "k1", "m1", 1);
+        seed_channel(conn, "slow", "openai_chat", &b, "k2", "m2", 1);
+    })
+    .await;
+    let resp = post_message(&gw, &anthropic_body(true)).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await;
+
+    // 写库是异步批量的，轮询等一下
+    let mut row: (i64, Option<i64>, i64) = (0, None, 0);
+    for _ in 0..40 {
+        if let Ok(r) = gw
+            .state
+            .db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT total_ms, first_content_ms, attempts FROM request_logs
+                     WHERE streaming = 1 ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+        {
+            row = r;
+            if row.1.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(row.0 >= 200, "总耗时含前面失败的候选，不该是 0：{:?}", row);
+    assert!(row.1.is_some(), "首内容时刻要记：{:?}", row);
+    assert_eq!(row.2, 2, "试了两次就记两次，别写死 1：{:?}", row);
+}

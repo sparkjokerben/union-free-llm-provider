@@ -110,6 +110,52 @@ impl AppState {
             }
         });
     }
+
+    /// 阶梯试出了这个条目可用的思考参数形式，落库（重启后不用重走阶梯）。
+    pub fn note_entry_thinking_mode(&self, entry_id: i64, mode: &str) {
+        self.db
+            .write_blocking(crate::store::Write::EntryThinkingMode {
+                entry_id,
+                mode: mode.to_string(),
+            });
+        let pool = Arc::clone(&self.pool);
+        let db = Arc::clone(&self.db);
+        tokio::spawn(async move {
+            if let Err(e) = pool.reload(&db).await {
+                tracing::warn!(error = %e, "记录思考参数形式后刷新配置快照失败");
+            }
+        });
+    }
+
+    /// 这个模型完全不支持思考：禁用条目并告警，等人在后台看着决定要不要换模型。
+    pub fn disable_entry_for_thinking(&self, entry_id: i64, reason: &str) {
+        let reason = crate::pipeline::truncate_error(reason);
+        // 写进条目备注，让人在后台看到「为什么被停用」，而不是只看到一个灰掉的条目。
+        let note = crate::pipeline::truncate_error(&format!(
+            "思考开到最大：上游不接受任何思考参数，已自动停用（{reason}）"
+        ));
+        self.db
+            .write_blocking(crate::store::Write::DisableEntryThinking {
+                entry_id,
+                reason: note,
+            });
+        let settings = self.pool.load().settings.clone();
+        self.alerter.notify(
+            &settings.alerts,
+            "entry_thinking_unsupported",
+            "ufp：有个模型不支持思考，已从池子里移除",
+            &format!(
+                "条目 id {entry_id} 的上游不接受任何思考参数，已自动停用（网关对预设渠道强制把思考开到最大）。\n\n原因：{reason}\n\n如果这个模型本来就用不上思考，可以在后台重新启用它。"
+            ),
+        );
+        let pool = Arc::clone(&self.pool);
+        let db = Arc::clone(&self.db);
+        tokio::spawn(async move {
+            if let Err(e) = pool.reload(&db).await {
+                tracing::warn!(error = %e, "禁用条目后刷新配置快照失败");
+            }
+        });
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {

@@ -97,10 +97,16 @@ pub fn should_rectify_thinking_signature(
         return true;
     }
 
-    // 场景7: 非法请求（与 CCH 对齐，按 invalid request 统一兜底）
-    if lower.contains("非法请求")
+    // 场景7: 非法请求（与 CCH 对齐，按 invalid request 统一兜底）。
+    // UFP: 必须同时含思考类词——`invalid request` 在 OpenAI 兼容上游是家常便饭，
+    // 而这个整流器一旦触发就把整个思考历史清掉（签名一丢，多轮工具调用直接断链）。
+    // 强制思考之后每个请求都开着思考，无差别触发会变成常态。
+    if (lower.contains("非法请求")
         || lower.contains("illegal request")
-        || lower.contains("invalid request")
+        || lower.contains("invalid request"))
+        && ["signature", "thinking", "thought", "tool_use"]
+            .iter()
+            .any(|k| lower.contains(k))
     {
         return true;
     }
@@ -526,7 +532,16 @@ mod tests {
             &enabled_config()
         ));
         assert!(should_rectify_thinking_signature(
+            Some("invalid request: thinking block signature mismatch"),
+            &enabled_config()
+        ));
+        // UFP: 光有 invalid request 不再触发（否则普通 400 会清空思考历史）
+        assert!(!should_rectify_thinking_signature(
             Some("invalid request: malformed JSON"),
+            &enabled_config()
+        ));
+        assert!(!should_rectify_thinking_signature(
+            Some("invalid request: unsupported field 'additionalProperties' in tool schema"),
             &enabled_config()
         ));
     }

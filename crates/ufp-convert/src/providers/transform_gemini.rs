@@ -383,16 +383,26 @@ fn build_generation_config(body: &Value) -> Option<Value> {
     // - disabled：gemini-2.5 用 thinkingBudget=0 关掉思考；
     //   gemini-3 关不掉（官方限制），只把 includeThoughts 设成 false，
     //   避免把 0 发过去被拒。
-    if let Some(thinking) = body.get("thinking") {
+    let model = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    // UFP: 渠道勾了「思考开到最大」时按 thinking_policy 的形态发，完全忽略
+    // 客户端发的 thinking（thinking_policy.rs 里有各协议「最大」的事实与阶梯）。
+    if let Some(mode) = crate::thinking_policy::mode(body) {
+        if let Some(thinking_config) = crate::thinking_policy::gemini_thinking_config(
+            model,
+            mode,
+            body.get("max_tokens").and_then(Value::as_i64),
+        ) {
+            config.insert("thinkingConfig".to_string(), thinking_config);
+        }
+    } else if let Some(thinking) = body.get("thinking") {
         let kind = thinking
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("disabled");
-        let model = body
-            .get("model")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let is_gemini_3 = model.contains("gemini-3");
+        let series = crate::thinking_policy::gemini_series(model);
         let mut thinking_config = Map::new();
         match kind {
             "enabled" | "adaptive" => {
@@ -406,7 +416,7 @@ fn build_generation_config(body: &Value) -> Option<Value> {
             }
             "disabled" => {
                 thinking_config.insert("includeThoughts".to_string(), json!(false));
-                if !is_gemini_3 {
+                if !series.uses_level() {
                     thinking_config.insert("thinkingBudget".to_string(), json!(0));
                 }
             }

@@ -467,6 +467,7 @@ async function pPool(host) {
       return `<div class="sec">
         <h2>${esc(c.name)} <span class="tag">${esc(c.protocol)}</span>
           ${c.client_profile === 'opencode' ? '<span class="tag">模仿 OpenCode</span>' : ''}
+          ${c.max_thinking ? '<span class="tag">思考开到最大</span>' : ''}
           ${c.enabled ? '' : '<span class="tag fail">已停用</span>'}</h2>
         <p class="note">${esc(c.base_url)}${c.notes ? ' — ' + esc(c.notes) : ''}${hdrs.length
           ? `<br>附加请求头：<span class="mono">${hdrs.map(esc).join('、')}</span>` : ''}</p>
@@ -684,6 +685,7 @@ function channelForm(c) {
       <textarea id="f-headers" style="min-height:70px">${esc(JSON.stringify(cur.extra_headers || {}, null, 2))}</textarea></label>
     <label class="f"><span>备注</span><input id="f-notes" value="${esc(cur.notes || '')}"></label>
     <label class="f"><span><input type="checkbox" id="f-enabled" ${cur.enabled ? 'checked' : ''} style="width:auto"> 启用</span></label>
+    <label class="f"><span><input type="checkbox" id="f-maxthinking" ${cur.max_thinking ? 'checked' : ''} style="width:auto"> 思考开到最大（不管下游发什么）</span></label>
     ${dlgButtons()}`);
   onSave(async () => {
     let extra_headers = {};
@@ -693,7 +695,7 @@ function channelForm(c) {
       name: $('#f-name').value.trim(), protocol: $('#f-proto').value,
       base_url: $('#f-url').value.trim(), extra_headers,
       enabled: $('#f-enabled').checked, notes: $('#f-notes').value.trim(),
-      client_profile: $('#f-profile').value,
+      client_profile: $('#f-profile').value, max_thinking: $('#f-maxthinking').checked,
     };
     if (!payload.name || !payload.base_url) { toast('名字和 base_url 必填', true); return false; }
     if (c) await post('/admin/api/channels/' + c.id, payload, 'PATCH');

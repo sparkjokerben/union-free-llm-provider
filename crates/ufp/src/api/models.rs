@@ -124,6 +124,7 @@ mod tests {
             extra_headers: Vec::new(),
             enabled,
             client_profile: Default::default(),
+            max_thinking: false,
         };
         let key = |id: i64, channel_id: i64, enabled: bool| KeyCfg {
             id,
@@ -141,6 +142,7 @@ mod tests {
             vision: true,
             pdf: false,
             enabled,
+            thinking_mode: String::new(),
         };
         Pool {
             channels: [(1, channel(1, true)), (2, channel(2, false))]

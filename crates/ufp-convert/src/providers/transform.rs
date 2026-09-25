@@ -53,15 +53,23 @@ pub(crate) fn strip_leading_anthropic_billing_header(text: &str) -> &str {
     }
 }
 
+/// UFP: 去掉厂商前缀再判定模型。OpenRouter 的条目 id 带 `openai/`、`x-ai/` 这类前缀，
+/// 不剥掉的话 `openai/gpt-5.6` 既拿不到 `reasoning_effort`，`max_tokens` 字段名也会错。
+pub fn bare_model(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
 /// UFP: 除了 o-series，GPT-5 系列（gpt-5、gpt-5.1、gpt-5-codex…）也只认
 /// `max_completion_tokens`，继续发 `max_tokens` 会被 400 拒掉。
 pub fn needs_max_completion_tokens(model: &str) -> bool {
+    let model = bare_model(model);
     is_openai_o_series(model) || model.starts_with("gpt-5")
 }
 
 /// Detect OpenAI o-series reasoning models (o1, o3, o4-mini, etc.)
 /// These models require `max_completion_tokens` instead of `max_tokens`.
 pub fn is_openai_o_series(model: &str) -> bool {
+    let model = bare_model(model);
     model.len() > 1
         && model.starts_with('o')
         && model.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
@@ -76,7 +84,7 @@ pub fn is_openai_o_series(model: &str) -> bool {
 ///   so future releases like grok-4.10 need no whitelist update); retain the
 ///   previous `grok-build-*` family for saved providers.
 pub fn supports_reasoning_effort(model: &str) -> bool {
-    let normalized = model.to_lowercase();
+    let normalized = bare_model(model).to_lowercase();
     is_openai_o_series(&normalized)
         || normalized
             .strip_prefix("gpt-")
@@ -92,11 +100,20 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
 
 /// Detect models whose OpenAI reasoning effort supports a distinct `max` tier.
 fn supports_max_reasoning_effort(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
+    let normalized = bare_model(model).to_ascii_lowercase();
     matches!(
         normalized.as_str(),
         "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
     )
+}
+
+/// UFP: 强制思考时用的最高档 effort —— 有独立 max 档的模型给 `max`，其余给 `xhigh`。
+pub fn max_reasoning_effort(model: &str) -> &'static str {
+    if supports_max_reasoning_effort(model) {
+        "max"
+    } else {
+        "xhigh"
+    }
 }
 
 /// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
@@ -237,7 +254,18 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     // Map Anthropic thinking → OpenAI reasoning_effort
-    if supports_reasoning_effort(model) {
+    // UFP: 渠道勾了「思考开到最大」时按 thinking_policy 的形态发（OpenAI 原生 id 用
+    // reasoning_effort，其它 id 用 OpenRouter 风格的 reasoning 对象），完全不看
+    // 客户端发的 thinking；没有标记时维持原来的推导。
+    if let Some(mode) = crate::thinking_policy::mode(&body) {
+        if let Some((field, value)) = crate::thinking_policy::openai_chat_reasoning(
+            model,
+            mode,
+            supports_reasoning_effort(model),
+        ) {
+            result[field] = value;
+        }
+    } else if supports_reasoning_effort(model) {
         if let Some(effort) = resolve_reasoning_effort(&body) {
             result["reasoning_effort"] = json!(effort);
         }
@@ -550,8 +578,14 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ConvertError> {
     let mut content = Vec::new();
     let mut has_tool_use = false;
 
-    // DeepSeek provider 会把思考内容放在 message.reasoning_content。
-    if let Some(reasoning_content) = message.get("reasoning_content").and_then(|r| r.as_str()) {
+    // UFP: 思考内容两个字段都认——DeepSeek/MiMo 放 `reasoning_content`，
+    // OpenRouter 与新的 OpenAI 兼容上游放 `reasoning`（流式路径两个都认，
+    // 非流式以前只认 reasoning_content，OpenRouter 的思考会被静默丢掉）。
+    if let Some(reasoning_content) = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(|r| r.as_str())
+    {
         if !reasoning_content.is_empty() {
             content.push(json!({"type": "thinking", "thinking": reasoning_content}));
         }
@@ -1139,6 +1173,30 @@ mod tests {
         let msg = &result["messages"][0];
         assert_eq!(msg["reasoning_content"], "[redacted thinking]");
         assert_eq!(msg["tool_calls"][0]["id"], "call_123");
+    }
+
+    /// UFP: OpenRouter 之类的上游把思考放在 `message.reasoning`（不是
+    /// `reasoning_content`），非流式路径也要认，否则强制思考的成果在非流式下被丢掉。
+    #[test]
+    fn 非流式_也认_message_里的_reasoning_字段() {
+        let upstream = json!({
+            "id": "x", "object": "chat.completion", "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "42", "reasoning": "先算 17*23"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let out = openai_to_anthropic(upstream).unwrap();
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][0]["thinking"], "先算 17*23");
+        // reasoning_content 仍然认
+        let upstream = json!({
+            "id": "x", "object": "chat.completion", "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "42", "reasoning_content": "旧字段"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let out = openai_to_anthropic(upstream).unwrap();
+        assert_eq!(out["content"][0]["thinking"], "旧字段");
     }
 
     #[test]
@@ -1786,6 +1844,18 @@ mod tests {
         assert!(!is_openai_o_series("openai-gpt"));
         assert!(!is_openai_o_series("o"));
         assert!(!is_openai_o_series(""));
+    }
+
+    /// UFP: OpenRouter 的条目 id 带厂商前缀，判定前要先剥掉。
+    #[test]
+    fn test_厂商前缀不影响判定() {
+        assert!(is_openai_o_series("openai/o3-mini"));
+        assert!(needs_max_completion_tokens("openai/gpt-5.6"));
+        assert!(supports_reasoning_effort("openai/gpt-5.6"));
+        assert!(supports_reasoning_effort("x-ai/grok-4.6"));
+        assert!(!supports_reasoning_effort("qwen/qwen3.8-27b:free"));
+        assert!(!needs_max_completion_tokens("qwen/qwen3.8-27b:free"));
+        assert!(!needs_max_completion_tokens("x-ai/grok-4.6"));
     }
 
     #[test]

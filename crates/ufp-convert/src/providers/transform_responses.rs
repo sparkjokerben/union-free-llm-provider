@@ -1838,8 +1838,18 @@ pub fn anthropic_to_responses(
     }
 
     // Map Anthropic thinking → OpenAI Responses reasoning.effort
+    // UFP: 「思考开到最大」时按 thinking_policy 的形态发，并把 store/include 一起补上
+    // （信封靠 encrypted_content 往返，少了它多轮工具调用会断链）；没有标记时维持原推导。
     if let Some(model_name) = body.get("model").and_then(|m| m.as_str()) {
-        if super::transform::supports_reasoning_effort(model_name) {
+        if let Some(mode) = crate::thinking_policy::mode(&body) {
+            if let Some(reasoning) =
+                crate::thinking_policy::openai_responses_reasoning(model_name, mode)
+            {
+                result["reasoning"] = reasoning;
+                result["store"] = json!(false);
+                result["include"] = json!(["reasoning.encrypted_content"]);
+            }
+        } else if super::transform::supports_reasoning_effort(model_name) {
             if let Some(effort) = super::transform::resolve_reasoning_effort(&body) {
                 result["reasoning"] = json!({ "effort": effort });
             }

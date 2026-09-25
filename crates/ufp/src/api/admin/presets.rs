@@ -904,8 +904,9 @@ pub async fn apply(
                         None => format!("预设：{}", preset.name),
                     };
                     tx.execute(
-                        "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile)
-                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+                        // 预设渠道默认把思考开到最大（D14）：free 模型尤其吃这一套
+                        "INSERT INTO channels (name, protocol, base_url, extra_headers, enabled, notes, created_ms, client_profile, max_thinking)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, 1)",
                         params![name, protocol.as_str(), base, headers_json, notes, now, preset.profile.as_str()],
                     )?;
                     (tx.last_insert_rowid(), true)

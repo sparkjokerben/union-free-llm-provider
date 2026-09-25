@@ -119,6 +119,12 @@ Zen 的渠道**整体照 OpenCode 1.18.32 的样子发**（渠道上的「客户
 - **思考与签名**：把 thinking 设置映射到各家推理参数；上游不透明的状态
   （Gemini thoughtSignature、OpenAI encrypted_content）编码进 `thinking` / `redacted_thinking` 的
   签名里随历史往返，重启不丢。客户端没开 thinking 时改写成 `redacted_thinking`：签名照带、正文不显示。
+- **思考开到最大（D14，预设渠道默认开）**：渠道勾了这个开关后，不管下游发的是
+  `thinking: disabled`、不发、还是一个很小的 `budget_tokens`，都按该上游的最大形态发思考 ——
+  Anthropic 4.6+ 走 `adaptive` + `effort: max`，Gemini 3 走 `thinkingLevel: high`，
+  OpenRouter 走 `reasoning: {effort: max}`。网关强制开的思考一律回给客户端看。
+  上游不认这个写法就换一个等价写法（不会靠关掉思考蒙混过关），三种写法都被拒就把这个模型
+  移出池子并告警；走通的写法记在条目上，之后直接用。
 - **请求矫正（会自己学）**：400/413/422 先试确定性矫正器（思考签名、思考预算、max_tokens 下夹、
   图片降级），仍是未知错误就把「错误 + 请求骨架」交给后台指定的分析条目，接受它给出的
   受限 JSON Patch（只允许改写白名单路径，优先改写而不是删除），成功补丁沉淀成规则，下次直接用。

@@ -88,6 +88,8 @@ pub struct ChannelCfg {
     pub extra_headers: Vec<(String, String)>,
     pub enabled: bool,
     pub client_profile: ClientProfile,
+    /// 强制把思考开到最大（预设渠道默认开）。
+    pub max_thinking: bool,
 }
 
 /// 上游 key。冷却按 (key, model) 记，熔断按 (channel, model) 记。
@@ -112,6 +114,8 @@ pub struct EntryCfg {
     pub vision: bool,
     pub pdf: bool,
     pub enabled: bool,
+    /// 阶梯试出来的可用思考参数形式（'' = 还没试过）。
+    pub thinking_mode: String,
 }
 
 /// 下游 key（只存哈希）。
@@ -151,7 +155,8 @@ impl Pool {
         let mut channels = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT id, name, protocol, base_url, extra_headers, enabled, client_profile FROM channels",
+                "SELECT id, name, protocol, base_url, extra_headers, enabled, client_profile, max_thinking
+                 FROM channels",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -162,10 +167,12 @@ impl Pool {
                     r.get::<_, String>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             })?;
             for row in rows {
-                let (id, name, protocol, base_url, extra_headers, enabled, profile) = row?;
+                let (id, name, protocol, base_url, extra_headers, enabled, profile, max_thinking) =
+                    row?;
                 let Some(protocol) = Protocol::parse(&protocol) else {
                     tracing::warn!(channel = %name, protocol, "未知的上游协议，已跳过该渠道");
                     continue;
@@ -184,6 +191,7 @@ impl Pool {
                         extra_headers,
                         enabled: enabled != 0,
                         client_profile: ClientProfile::parse(&profile),
+                        max_thinking: max_thinking != 0,
                     },
                 );
             }
@@ -212,7 +220,7 @@ impl Pool {
         let mut entries = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled
+                "SELECT id, channel_id, upstream_model, tier, max_context, vision, pdf, enabled, thinking_mode
                  FROM entries WHERE enabled = 1
                  ORDER BY tier, channel_id, id",
             )?;
@@ -226,6 +234,7 @@ impl Pool {
                     vision: r.get::<_, i64>(5)? != 0,
                     pdf: r.get::<_, i64>(6)? != 0,
                     enabled: r.get::<_, i64>(7)? != 0,
+                    thinking_mode: r.get::<_, String>(8).unwrap_or_default(),
                 })
             })?;
             for row in rows {
