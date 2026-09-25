@@ -378,6 +378,38 @@ if (WRITES) {
        return true;
      })()`, 400);
 
+  await step('矫正规则页：下拉框选分析条目真的存进设置、停用渠道会标红',
+    `(async () => {
+       const ch = await post('/admin/api/channels', { name: '__smoke_ana_chan__', protocol: 'openai_chat',
+         base_url: 'http://127.0.0.1:9/v1', enabled: true });
+       await post('/admin/api/channels/' + ch.id + '/keys', { label: 'k', api_key: 'sk-smoke-ana-key' });
+       const en = await post('/admin/api/channels/' + ch.id + '/entries', { upstream_model: '__smoke_ana__',
+         tier: 9, max_context: 200000, vision: true, pdf: false, enabled: true });
+       const pick = async (value) => {
+         await go('rules');
+         await new Promise(r => setTimeout(r, 400));
+         const sel = document.querySelector('#ana');
+         if (!sel) return '矫正规则页没有分析条目下拉框';
+         sel.value = value;
+         sel.dispatchEvent(new Event('change'));
+         await new Promise(r => setTimeout(r, 1200));
+         return '';
+       };
+       let err = await pick(String(en.id));
+       if (err) return err;
+       if ((await api('/admin/api/settings')).analysisEntryId !== en.id) return '选了没存进设置';
+       if (document.querySelector('#p-rules .tag.fail')) return '可用的条目不该标红';
+       await post('/admin/api/channels/' + ch.id, { ...S.pool.channels.find(c => c.id === ch.id), enabled: false }, 'PATCH');
+       await go('rules');
+       await new Promise(r => setTimeout(r, 400));
+       if (!/渠道已停用/.test(document.querySelector('#p-rules .tag.fail')?.textContent || '')) return '渠道停用后没有提示';
+       err = await pick('');
+       if (err) return err;
+       if ((await api('/admin/api/settings')).analysisEntryId !== null) return '选「不启用」没清掉设置';
+       await api('/admin/api/channels/' + ch.id, { method: 'DELETE' });
+       return true;
+     })()`, 300);
+
   await step('对话框：删除渠道（自己清理干净）', 
     `(async () => {
        const b = [...document.querySelectorAll('button[data-delchan]')]

@@ -1055,8 +1055,36 @@ function searchForm(row) {
 
 // ── 矫正规则 ────────────────────────────────────────────────────────────
 async function pRules(host) {
-  const rows = await api('/admin/api/rules');
+  const [rows, settings] = await Promise.all([api('/admin/api/rules'), api('/admin/api/settings')]);
+  const chanOf = (e) => S.pool.channels.find((c) => c.id === e.channel_id);
+  // 选中的条目现在能不能用：渠道停用 / 条目停用 / 没有可用 key 时分析会直接跳过
+  const unusable = (e) => {
+    const ch = chanOf(e);
+    if (!ch || !ch.enabled) return '渠道已停用';
+    if (!e.enabled) return '条目已停用';
+    if (!S.pool.keys.some((k) => k.channel_id === e.channel_id && k.enabled && k.status !== 'disabled')) return '渠道没有可用 key';
+    return '';
+  };
+  const current = S.pool.entries.find((e) => e.id === settings.analysisEntryId);
+  const warn = current ? unusable(current)
+    : (settings.analysisEntryId != null ? '之前选的条目已被删除' : '');
   host.innerHTML = `
+    <div class="sec">
+      <h2>分析条目</h2>
+      <p class="note">内置矫正器和已有规则都修不好的 400，交给这个条目看「错误 + 请求骨架（不含正文）」并给出改写补丁；
+        补丁重试成功才会沉淀成下面的规则。不选就不做在线分析。</p>
+      <div class="row">
+        <select id="ana">
+          <option value="">（不启用在线分析）</option>
+          ${S.pool.entries.map((e) => {
+            const why = unusable(e);
+            return `<option value="${e.id}" ${e.id === settings.analysisEntryId ? 'selected' : ''}>`
+              + `${esc(chanOf(e)?.name || '?')} · ${esc(e.upstream_model)}${why ? `（${why}）` : ''}</option>`;
+          }).join('')}
+        </select>
+        ${warn ? `<span class="tag fail">${esc(warn)}，分析会被跳过</span>` : ''}
+      </div>
+    </div>
     <div class="sec">
       <h2>矫正规则</h2>
       <p class="note">上游用 400 拒绝请求时，网关先试内置矫正器（思考签名、预算、max_tokens 下夹、图片降级）；
@@ -1075,6 +1103,14 @@ async function pRules(host) {
       || '<tr><td class="empty" colspan="6">还没有规则。遇到没见过的 400 时会自动分析并生成。</td></tr>'}
       </tbody></table>
     </div>`;
+  $('#ana').onchange = guard(async (e) => {
+    // 保存前重新取一次设置，别拿进页面时的旧值盖掉别处刚改的项
+    const fresh = await api('/admin/api/settings');
+    const id = e.target.value ? Number(e.target.value) : null;
+    await post('/admin/api/settings', { ...fresh, analysisEntryId: id }, 'PUT');
+    toast(id ? '已设为分析条目，立即生效' : '已关闭在线分析');
+    await reload();
+  });
   host.onclick = guard(async (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -1097,7 +1133,7 @@ async function pSettings(host) {
       <p class="note">保存后立刻生效。常用项：publicModelId（不点名时的对外模型名，即「全池自动路由」那个名字）、
         modelEcho（响应里回显哪个模型名）、
         maxAttempts（一次请求最多试几个条目）、firstContentTimeoutMs、breaker.*、search.*、analysisEntryId
-        （「让另一个上游分析报错」用的条目）、alerts.smtp（邮件告警）。部署令牌不在这里，见下一节。</p>
+        （「让另一个上游分析报错」用的条目，在「矫正规则」页用下拉框选更方便）、alerts.smtp（邮件告警）。部署令牌不在这里，见下一节。</p>
       <textarea id="set" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea>
       <div class="row" style="margin-top:10px"><button class="primary" id="save">保存</button>
         <span class="note" id="set-dirty" style="margin:0"></span></div>
