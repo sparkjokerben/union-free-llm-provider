@@ -1,0 +1,33 @@
+{
+  "tag": "v0.1.14",
+  "files": {
+    "bootstrap.sh": {
+      "sha256": "d21ee0e9d2304c4bcf457a2c4fa364324cc8101b633b1114b45b798942eb1bd2",
+      "size": 4529
+    },
+    "remote-deploy.sh": {
+      "sha256": "37d8b3496c4d91cbda5dcf7eff8dd8cb558b68bdd12d1fe29942236da0ccb64f",
+      "size": 7707
+    },
+    "ufp-aarch64-unknown-linux-musl": {
+      "sha256": "90b12851c87a81ef3de028933b2235b7b08b4e80227d26c9578f42ab9dbefea5",
+      "size": 10748264
+    },
+    "ufp-apply-deploy": {
+      "sha256": "4637ca7b67fed2f1c67b6808b1842ac92aa054ebe0874cca142f1f742a25790a",
+      "size": 2283
+    },
+    "ufp-nginx.conf": {
+      "sha256": "bfd6cd75818117a7f6abadb3db7cc974f28c2322a3e0c433b35ad658e6c3edcb",
+      "size": 4106
+    },
+    "ufp-openrc": {
+      "sha256": "17ee7e10f550904694f15ee1cfb2712dd9853cc7f2e773d91ab8454f59b3c0ae",
+      "size": 3071
+    },
+    "ufp-x86_64-unknown-linux-musl": {
+      "sha256": "0efe6512bd7b7dc4936e902057ddcb1fd68d3b39a52f1fad7413017e2f075c17",
+      "size": 12698064
+    }
+  }
+}

@@ -1,0 +1,76 @@
+#!/sbin/openrc-run
+# ufp 的 OpenRC 服务脚本（Alpine）
+#
+# 安装：
+#   install -m 0755 deploy/openrc/ufp /etc/init.d/ufp
+#   rc-update add ufp default
+#   rc-service ufp start
+#
+# 升级（不断流）：把新二进制放到 /usr/local/bin/ufp.new，然后
+#   rc-service ufp upgrade
+# 新进程靠 SO_REUSEPORT 先接管监听，旧进程排空在途请求后自己退出。
+#
+# 注意：用 supervise-daemon 托管，崩溃会被自动拉起（这是「强稳定」的第一道保险）。
+
+name="ufp"
+description="统一 LLM 中转网关"
+
+command="/usr/local/bin/ufp"
+command_args="serve"
+command_user="ufp:ufp"
+# 用 supervise-daemon 托管：崩溃自动拉起（这是「强稳定」的第一道保险）。
+# 注意不要同时设 command_background，supervise-daemon 自己负责后台化。
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+respawn_period=10
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/ufp/stdout.log"
+error_log="/var/log/ufp/stderr.log"
+
+# 进程级配置（运行期配置在 SQLite 里，后台可改、即时生效）
+UFP_LISTEN="${UFP_LISTEN:-127.0.0.1:8787}"
+UFP_DB="${UFP_DB:-/var/lib/ufp/ufp.db}"
+UFP_LOG_DIR="${UFP_LOG_DIR:-/var/log/ufp}"
+UFP_MAX_BODY_BYTES="${UFP_MAX_BODY_BYTES:-33554432}"
+UFP_MAX_INFLIGHT="${UFP_MAX_INFLIGHT:-32}"
+# 收到 SIGTERM 后等在途请求结束的最长时间。
+# 设为 30 秒是权衡后的结果：升级时 OpenRC 会先停后起，这段窗口里新连接会被拒，
+# 所以窗口要短；代价是超过 30 秒的长流会被打断（Claude Code 会报连接错误并重试）。
+# 想彻底不打断，用下面 upgrade() 注释里那条「热切换」命令。
+UFP_DRAIN_SECONDS="${UFP_DRAIN_SECONDS:-30}"
+UFP_WORKERS="${UFP_WORKERS:-2}"
+# UFP_LOG=info,ufp=debug 可以调日志级别
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner "${command_user%:*}:${command_user#*:}" --mode 0750 \
+        "$(dirname "$UFP_DB")" "$UFP_LOG_DIR"
+}
+
+stop_pre() {
+    # 排空期间的日志留在 stderr.log，方便确认「还在处理在途请求」
+    einfo "正在等待在途请求结束（最多 ${UFP_DRAIN_SECONDS}s）"
+}
+
+# 升级：换二进制 + 重启服务。
+#
+# 为什么不用「新进程先起、旧进程排空」那套交接：supervise-daemon 会盯着自己的子进程，
+# 手动起的新进程会被它当成「多余的」，旧进程退出时它还会再拉一个起来 —— 两套机制
+# 互相打架，反而更容易出问题。这里选「崩溃自动重启」这一条更值钱的特性，
+# 升级用一次有界重启（默认最多 30 秒窗口，见上面的 UFP_DRAIN_SECONDS）。
+#
+# 想要零中断的话，手动做热切换（两个进程靠 SO_REUSEPORT 共存）：
+#   install -m 0755 /usr/local/bin/ufp.new /usr/local/bin/ufp
+#   setsid /usr/local/bin/ufp serve >/dev/null 2>&1 < /dev/null &
+#   rc-service ufp stop        # 只停被托管的那一个，在途请求会排空
+upgrade() {
+    ebegin "重启以应用新版本"
+    rc-service "$RC_SVCNAME" restart
+    eend $?
+}
+
