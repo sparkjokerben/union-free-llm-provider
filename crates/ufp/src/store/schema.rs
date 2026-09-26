@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS search_backends (
     enabled      INTEGER NOT NULL DEFAULT 1,
     cooldown_until_ms INTEGER,
     notes        TEXT NOT NULL DEFAULT '',
+    -- 搜索后端的尝试顺序：越小越先用，跑挂了才轮到下一个。老库补这一列时全填 0，
+    -- 加上并列时按 id 兜底，迁移前后顺序一模一样。
+    sort_order   INTEGER NOT NULL DEFAULT 0,
     created_ms   INTEGER NOT NULL
 );
 
@@ -217,6 +220,12 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column(conn, "entries", "thinking_mode", "TEXT NOT NULL DEFAULT ''")?;
+    add_column(
+        conn,
+        "search_backends",
+        "sort_order",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -302,6 +311,36 @@ mod tests {
             .unwrap();
         assert_eq!(name, "老渠道");
         assert_eq!(profile, "");
+    }
+
+    #[test]
+    fn 老库的搜索后端补上_sort_order_全填零_顺序仍按_id_不变() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE search_backends (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL,
+                 api_key TEXT NOT NULL DEFAULT '', base_url TEXT NOT NULL DEFAULT '',
+                 enabled INTEGER NOT NULL DEFAULT 1, cooldown_until_ms INTEGER,
+                 notes TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL);
+             INSERT INTO search_backends (name, kind, created_ms) VALUES ('a', 'tavily', 0);
+             INSERT INTO search_backends (name, kind, created_ms) VALUES ('b', 'jina', 0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // 幂等；老行全落到 0，并列时按 id 兜底，迁移前后「先试哪个」一模一样
+        migrate(&conn).unwrap();
+        let order: Vec<(String, i64)> = conn
+            .prepare("SELECT name, sort_order FROM search_backends ORDER BY sort_order, id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            order,
+            vec![("a".to_string(), 0), ("b".to_string(), 0)],
+            "老库的尝试顺序不该因为加列而变"
+        );
     }
 
     #[test]

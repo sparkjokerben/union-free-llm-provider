@@ -112,6 +112,19 @@ td.num, th.num { text-align: right; font-family: var(--mono) }
 .tag.fail { color: var(--fail); border-color: var(--fail); background: var(--fail-b) }
 .empty { color: var(--ink-3); padding: 14px 10px; font-size: 13px }
 
+/* ── 条目总表：一层一条分隔带，行可以拖着换层 ─────────────────────── */
+tr.band > td { background: var(--card); border-top: 1px solid var(--line);
+               border-bottom: 1px solid var(--line); padding: 7px 10px }
+tr.band .bnum { font-family: var(--mono); font-weight: 600; color: var(--ink); margin-right: 8px }
+tr.band .bcount { color: var(--ink-2); font-size: 12px }
+tr.band .bnote { color: var(--ink-3); font-size: 12px; margin: 0 8px }
+tr.band .brow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 7px 0 0 }
+tr.band .brow > * { width: auto }
+td.grip { width: 20px; padding-left: 0; padding-right: 0; cursor: grab; color: var(--ink-3);
+          user-select: none; -webkit-user-select: none; font-size: 11px; line-height: 1.4 }
+td.grip:active { cursor: grabbing }
+tr.dragging { opacity: .35 }
+
 /* ── 控件 ─────────────────────────────────────────────────────────── */
 button { font: inherit; cursor: pointer; border-radius: var(--r); border: 1px solid var(--line);
          background: var(--card); color: var(--ink); padding: 5px 11px }
@@ -215,6 +228,10 @@ dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
      在窄屏上孤零零地右对齐飘着，跟它那一行的标签对不上号。 */
   td::before { content: attr(data-k) "　"; color: var(--ink-3); font-size: 11px }
   td.num { text-align: left }
+  /* 总表在窄屏上靠「上移/下移」调整，拖拽是鼠标手势，触屏上本来就使不上 */
+  td.grip { display: none }
+  tr.band { padding: 0 }
+  tr.band > td { border-top: 0 }
 }
 </style>
 </head>
@@ -237,6 +254,7 @@ dialog h2 { font-family: var(--serif); font-size: 16px; margin: 0 0 12px }
     <section id="p-stats"></section>
     <section id="p-requests"></section>
     <section id="p-pool"></section>
+    <section id="p-order"></section>
     <section id="p-health"></section>
     <section id="p-downstream"></section>
     <section id="p-search"></section>

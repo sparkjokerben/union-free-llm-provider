@@ -1904,6 +1904,439 @@ async fn 后台_手动停用_key_不算上游拒绝_启用会清掉拒绝标记(
     assert!(k2["disabled_ms"].is_null());
 }
 
+fn tavily_results_from(site: &str) -> Value {
+    json!({
+        "query": "x",
+        "results": [{"title": "示例", "url": format!("https://{site}/"), "content": "正文", "score": 0.9}]
+    })
+}
+
+/// 搜索后端列表，摊成 (名字, 顺序值) 方便逐项断言。
+async fn search_backend_listing(
+    a: &impl Fn(reqwest::Method, &str, Option<Value>) -> reqwest::RequestBuilder,
+) -> Vec<(String, i64)> {
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/search_backends", None)).await;
+    pool.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap().to_string(),
+                r["sort_order"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn 后台_搜索后端重排_新加的排最后_按提交的次序重写() {
+    let gw = spawn_gateway(seed_admin).await;
+    let a = admin(&gw).await;
+    let mut ids = vec![];
+    for name in ["甲", "乙", "丙"] {
+        let (_, r) = json_of(a(
+            reqwest::Method::POST,
+            "/admin/api/search_backends",
+            Some(json!({ "name": name, "kind": "jina", "api_key": "",
+                         "base_url": "", "enabled": true, "notes": "" })),
+        ))
+        .await;
+        ids.push(r["id"].as_i64().unwrap());
+    }
+    // 新加的排在最后：刚添的备用通道不该插到已经调好的尝试顺序前面去
+    assert_eq!(
+        search_backend_listing(&a).await,
+        vec![
+            ("甲".to_string(), 10),
+            ("乙".to_string(), 20),
+            ("丙".to_string(), 30)
+        ]
+    );
+
+    let (s, out) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/reorder",
+        Some(json!({ "ids": [ids[2], ids[0], ids[1]] })),
+    ))
+    .await;
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["changed"], 3, "三个都换了位次");
+    let after = search_backend_listing(&a).await;
+    assert_eq!(
+        after.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["丙", "甲", "乙"]
+    );
+    assert_eq!(
+        after.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+        [10, 20, 30],
+        "重排后仍然是一串留得下空当的层级"
+    );
+
+    // 只换相邻两位：真正变了的只有那两行
+    let (s, out) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/reorder",
+        Some(json!({ "ids": [ids[2], ids[1], ids[0]] })),
+    ))
+    .await;
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["changed"], 2, "第一行没动，不该重写它");
+
+    // 残缺 / 越界的列表一律拒：页面开着的时候有人在别处加过后端，
+    // 照旧列表重排会把那一条落到顺序之外
+    let (s, body) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/reorder",
+        Some(json!({ "ids": &ids[..2] })),
+    ))
+    .await;
+    assert_eq!(s, 409, "{body}");
+    let (s, _) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/reorder",
+        Some(json!({ "ids": [ids[0], ids[1], 9999] })),
+    ))
+    .await;
+    assert_eq!(s, 409);
+    let (s, _) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/reorder",
+        Some(json!({ "ids": [ids[0], ids[0], ids[1]] })),
+    ))
+    .await;
+    assert_eq!(s, 400);
+
+    assert_eq!(
+        search_backend_listing(&a).await,
+        vec![
+            ("丙".to_string(), 10),
+            ("乙".to_string(), 20),
+            ("甲".to_string(), 30)
+        ],
+        "被拒的请求不该动到任何一行"
+    );
+}
+
+/// 搜索后端的顺序是**运行期**语义：`search_loop` 从头往后试，第一个搜到东西的就算数。
+/// 这条是本功能的验收点——排完的次序要真的改掉「先搜哪个」。
+#[tokio::test]
+async fn 后台_搜索后端重排_即刻改掉先搜哪个() {
+    let alpha = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tavily_results_from("a.example")))
+        .mount(&alpha)
+        .await;
+    let beta = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tavily_results_from("b.example")))
+        .mount(&beta)
+        .await;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    chat_completion_sse("gpt-4o-mini", &["好的"]).into_bytes(),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&upstream)
+        .await;
+
+    let (alpha_uri, beta_uri, upstream_uri) = (alpha.uri(), beta.uri(), upstream.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_admin(conn);
+        seed_search_backend(conn, "tavily", &alpha_uri, "tvly-alpha");
+        seed_search_backend(conn, "tavily", &beta_uri, "tvly-beta");
+        seed_channel(
+            conn,
+            "chat",
+            "openai_chat",
+            &upstream_uri,
+            "sk-up",
+            "gpt-4o-mini",
+            1,
+        );
+    })
+    .await;
+
+    async fn search(base: &str) -> String {
+        let resp = client()
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", DOWNSTREAM_KEY)
+            .json(&claude_code_search_request("示例查询"))
+            .send()
+            .await
+            .expect("请求失败");
+        assert_eq!(resp.status(), 200);
+        resp.text().await.unwrap()
+    }
+
+    let first = search(&gw.base).await;
+    assert!(
+        first.contains("https://a.example/"),
+        "先插的那个该先被搜：{first}"
+    );
+    assert!(
+        !first.contains("b.example"),
+        "搜到就停，不该打扰第二个：{first}"
+    );
+
+    let a = admin(&gw).await;
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/search_backends", None)).await;
+    let mut ids: Vec<i64> = pool
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    ids.reverse();
+    let (s, out) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/search_backends/reorder",
+        Some(json!({ "ids": ids })),
+    ))
+    .await;
+    assert_eq!(s, 200, "{out}");
+
+    // 搜索后端是每次搜都现读库的（api/messages.rs 的 load_search_backends），
+    // 不用等热加载——下一个请求就该换人
+    let second = search(&gw.base).await;
+    assert!(
+        second.contains("https://b.example/"),
+        "重排后该先搜第二个：{second}"
+    );
+}
+
+/// 种 4 个渠道各 1 个条目，全在第 1 层——就是后台刚装好、还没人排过的样子。
+fn seed_four_flat_entries(conn: &rusqlite::Connection) {
+    seed_admin(conn);
+    for (i, name) in ["一", "二", "三", "四"].iter().enumerate() {
+        seed_channel(
+            conn,
+            name,
+            "openai_chat",
+            "http://127.0.0.1:9",
+            "sk-x",
+            &format!("m{i}"),
+            1,
+        );
+    }
+}
+
+fn entry_tiers(pool: &Value) -> Vec<(i64, i64)> {
+    let mut v: Vec<(i64, i64)> = pool["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["id"].as_i64().unwrap(), e["tier"].as_i64().unwrap()))
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+fn entry_ids(pool: &Value) -> Vec<i64> {
+    pool["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_i64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn 后台_条目总表重排_按提交的层重写层级() {
+    let gw = spawn_gateway(seed_four_flat_entries).await;
+    let a = admin(&gw).await;
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let ids = entry_ids(&pool);
+    assert_eq!(ids.len(), 4);
+    assert!(
+        entry_tiers(&pool).iter().all(|(_, t)| *t == 1),
+        "种子应该全在第 1 层"
+    );
+
+    let (s, out) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/entries/reorder",
+        Some(json!({ "groups": [&ids[0..2], &ids[2..3], &ids[3..4]] })),
+    ))
+    .await;
+    assert_eq!(s, 200, "{out}");
+    assert_eq!(out["layers"], 3);
+    assert_eq!(out["changed"], 4, "四个条目原本都是 1，都要改");
+
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let tier = |id: i64| {
+        entry_tiers(&pool)
+            .into_iter()
+            .find(|(i, _)| *i == id)
+            .unwrap()
+            .1
+    };
+    assert_eq!(tier(ids[0]), 10, "第 1 层");
+    assert_eq!(tier(ids[1]), 10, "同层就是同一个层级");
+    assert_eq!(tier(ids[2]), 20, "第 2 层");
+    assert_eq!(tier(ids[3]), 30, "第 3 层");
+}
+
+#[tokio::test]
+async fn 后台_条目重排_覆盖不全一律拒_库里的层级一动不动() {
+    let gw = spawn_gateway(|conn| {
+        seed_admin(conn);
+        for name in ["一", "二"] {
+            seed_channel(
+                conn,
+                name,
+                "openai_chat",
+                "http://127.0.0.1:9",
+                "sk-x",
+                "m",
+                1,
+            );
+        }
+    })
+    .await;
+    let a = admin(&gw).await;
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let ids = entry_ids(&pool);
+    let before = entry_tiers(&pool);
+
+    // 少一个：像是页面打开之后有人在别处加过条目，照旧列表排会把那条落在层级之外
+    let (s, body) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/entries/reorder",
+        Some(json!({ "groups": [&ids[..1]] })),
+    ))
+    .await;
+    assert_eq!(s, 409, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("刷新"));
+
+    // 多一个库里没有的
+    let (s, _) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/entries/reorder",
+        Some(json!({ "groups": [&ids, &[9999][..]] })),
+    ))
+    .await;
+    assert_eq!(s, 409);
+
+    // 同一条落进两层
+    let (s, _) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/entries/reorder",
+        Some(json!({ "groups": [&ids, &ids[..1]] })),
+    ))
+    .await;
+    assert_eq!(s, 400);
+
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    assert_eq!(entry_tiers(&pool), before, "被拒的请求不该动到任何一行");
+}
+
+/// 这是整个功能的验收点：总表排的顺序要真的改掉「先试哪个上游」，而不只是页面上好看。
+/// mutate() 写完会热加载配置快照，所以第二次请求就该换人。
+#[tokio::test]
+async fn 后台_条目重排_即刻改掉先试哪个上游() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_body("gpt-4o-mini", "一号上游")),
+        )
+        .mount(&first)
+        .await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_body("llama-3.3-70b", "二号上游")),
+        )
+        .mount(&second)
+        .await;
+
+    let (first_uri, second_uri) = (first.uri(), second.uri());
+    let gw = spawn_gateway(move |conn| {
+        seed_downstream_key(conn);
+        seed_admin(conn);
+        seed_channel(
+            conn,
+            "一号",
+            "openai_chat",
+            &first_uri,
+            "sk-a",
+            "gpt-4o-mini",
+            1,
+        );
+        seed_channel(
+            conn,
+            "二号",
+            "openai_chat",
+            &second_uri,
+            "sk-b",
+            "llama-3.3-70b",
+            2,
+        );
+    })
+    .await;
+
+    // 不带会话头：两次请求之间没有粘性可比，层序就是唯一的变量
+    async fn ask(base: &str) -> String {
+        let resp = client()
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", DOWNSTREAM_KEY)
+            .json(&anthropic_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        let body: Value = resp.json().await.unwrap();
+        body["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    assert_eq!(ask(&gw.base).await, "一号上游", "重排前应当先试第 1 层");
+
+    let a = admin(&gw).await;
+    let (_, pool) = json_of(a(reqwest::Method::GET, "/admin/api/channels", None)).await;
+    let id_of = |model: &str| {
+        pool["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["upstream_model"] == model)
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let (s, out) = json_of(a(
+        reqwest::Method::POST,
+        "/admin/api/entries/reorder",
+        Some(json!({ "groups": [
+            [id_of("llama-3.3-70b")],
+            [id_of("gpt-4o-mini")]
+        ] })),
+    ))
+    .await;
+    assert_eq!(s, 200, "{out}");
+
+    assert_eq!(
+        ask(&gw.base).await,
+        "二号上游",
+        "重排后应当先试新的第 1 层——快照没热加载的话这里还会是一号"
+    );
+}
+
 #[tokio::test]
 async fn 后台_设置接口不回显部署令牌_保存设置不会改掉令牌() {
     let gw = spawn_gateway(seed_admin).await;

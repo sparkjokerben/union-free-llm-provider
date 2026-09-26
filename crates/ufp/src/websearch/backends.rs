@@ -81,10 +81,13 @@ impl SearchKind {
 }
 
 /// 从库里读出所有启用的搜索后端。
+///
+/// 出来的顺序就是尝试顺序：`search_loop` 从头往后试，第一个搜到东西的就算数，
+/// 后面的根本不会被打扰。顺序由后台「搜索」页排（sort_order），并列时按 id 兜底。
 pub fn load_backends(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<SearchBackend>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, kind, api_key, base_url, enabled, cooldown_until_ms
-         FROM search_backends WHERE enabled = 1 ORDER BY id",
+         FROM search_backends WHERE enabled = 1 ORDER BY sort_order, id",
     )?;
     let rows = stmt.query_map([], backend_row)?;
     let mut out = Vec::new();

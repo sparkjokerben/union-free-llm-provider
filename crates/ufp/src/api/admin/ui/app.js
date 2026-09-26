@@ -14,6 +14,7 @@ const PAGES = [
   ['stats', '用量'],
   ['requests', '请求'],
   ['pool', '渠道与条目'],
+  ['order', '条目总表'],
   ['health', '健康'],
   ['downstream', '下游 key'],
   ['search', '搜索'],
@@ -27,6 +28,7 @@ const S = {
   health: { breakers: [], cooldowns: [] },
   days: 7,
   onlyErrors: false,
+  orderQ: '', // 条目总表的过滤词
   probes: {}, // entry_id -> { text, cls, at }：最近一次连通性测试
   searchProbes: {}, // search_backend_id -> 同上
 };
@@ -194,8 +196,8 @@ function renderPages() {
 }
 
 const PAGE_FN = {
-  overview: pOverview, stats: pStats, requests: pRequests, pool: pPool, health: pHealth,
-  downstream: pDownstream, search: pSearch, rules: pRules, settings: pSettings,
+  overview: pOverview, stats: pStats, requests: pRequests, pool: pPool, order: pOrder,
+  health: pHealth, downstream: pDownstream, search: pSearch, rules: pRules, settings: pSettings,
 };
 
 async function render() {
@@ -562,6 +564,252 @@ async function pPool(host) {
   });
 }
 
+// 表内拖拽换顺序：原生 HTML5 拖放（没有前端构建步骤，引不了 dnd-kit 这类库）。
+// draggable 只挂手柄那一格，不然行里的文字没法选中；拖动时行本身在 DOM 里跟着鼠标走，
+// 落点就是最终位置，`.dragging` 的半透明标出它自己。
+//
+// onStart 在拖起时叫一次（要记拖之前的结构就记在这里），onDrop 收到落定之后的行 id
+// 顺序。原样放回不算数，直接返回，不打扰人。
+// tbody 每次现取：筛选重画会换掉 tbody 元素，捕获在闭包里的那份会变成脱离文档的旧节点。
+function wireRowDrag(host, tbodySel, hooks) {
+  const tbody = () => $(tbodySel, host);
+  const order = () => $$('tr[data-id]', tbody()).map((tr) => tr.dataset.id);
+  let src = null;
+  let wasDom = '';
+  const rowAt = (t) => (t instanceof Element ? t.closest('tr[data-id]') : null);
+
+  host.ondragstart = (e) => {
+    const tr = rowAt(e.target);
+    if (!tr) return;
+    src = tr; wasDom = order().join();
+    if (hooks.onStart) hooks.onStart(order());
+    tr.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', tr.dataset.id);
+  };
+  host.ondragover = (e) => {
+    if (!src) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const tr = rowAt(e.target);
+    if (!tr || tr === src) return;
+    const box = tr.getBoundingClientRect();
+    tbody().insertBefore(src, e.clientY > box.top + box.height / 2 ? tr.nextSibling : tr);
+  };
+  const drop = guard(async () => {
+    if (!src) return;
+    const tr = src;
+    src = null;
+    tr.classList.remove('dragging');
+    const now = order();
+    if (now.join() === wasDom) return;
+    await hooks.onDrop(now);
+  });
+  host.ondrop = (e) => { e.preventDefault(); drop(); };
+  host.ondragend = drop;
+}
+
+// ── 条目总表：所有渠道的条目铺进一张表，按层排 ──────────────────────────
+// 层的先后就是路由的先后（router/select.rs 用 tier 分 BTreeMap，取第一个有可用
+// 候选的层）。**层内不排序**：同一层的候选在 select.rs 里是按 hash(会话,条目,key)
+// 摊开的，页上排出来的先后在那一层不起作用——所以这里只提供「换层」，不提供
+// 「在本层里挪一位」，免得做出一个看着生效其实没生效的手势。
+function tierGroups() {
+  const g = new Map();
+  for (const e of S.pool.entries) {
+    if (!g.has(e.tier)) g.set(e.tier, []);
+    g.get(e.tier).push(e);
+  }
+  return [...g.values()]; // Map 保持插入顺序，entries 本来就是按 tier 排好的
+}
+
+const sameGroups = (a, b) => a.length === b.length
+  && a.every((g, i) => g.map((e) => e.id).join() === b[i].map((e) => e.id).join());
+
+// 落库：一次手势一次提交，写完走 reload()（mutate() 会热加载配置快照，即刻生效）
+async function saveGroups(groups) {
+  const clean = groups.map((g) => g.map((e) => e.id)).filter((ids) => ids.length);
+  try {
+    const r = await post('/admin/api/entries/reorder', { groups: clean });
+    await reload();
+    toast(`已排成 ${r.layers} 层，本次改了 ${r.changed} 个条目的层级`);
+  } catch (err) {
+    await reload().catch(() => {}); // 409：池子已经变了，先把界面拉回真实状态
+    throw err;
+  }
+}
+
+// 上移/下移一层：把条目挪进相邻的层
+async function moveLayer(id, dir) {
+  const groups = tierGroups();
+  const gi = groups.findIndex((g) => g.some((e) => e.id === id));
+  if (gi < 0) return;
+  const to = gi + dir;
+  if (to < 0 || to >= groups.length) return;
+  groups[to].push(...groups[gi].filter((e) => e.id === id));
+  groups[gi] = groups[gi].filter((e) => e.id !== id);
+  await saveGroups(groups);
+}
+
+// 把这一层并进上一层：层消失，条目回到上一层
+async function mergeLayer(index) {
+  if (index <= 0) return;
+  const groups = tierGroups();
+  groups[index - 1].push(...groups[index]);
+  groups.splice(index, 1);
+  await saveGroups(groups);
+}
+
+// 插入新层：勾哪几个条目，它们就从各自原来的层里移出来、组成插在这一层下面的新层。
+// 同一个对话框也用来「拆层」——只勾走一部分就是拆。
+function addLayer(index) {
+  const cur = tierGroups();
+  const at = S.pool.entries.map((e) => e.tier);
+  dlg(`<h2>在第 ${index + 2} 层的位置插入新层</h2>
+    <p class="note">勾中的条目会从各自原来的层里移出来，组成新的一层，没勾的留在原位。
+      只有整层都冷却或熔断了才会降级到下一层，所以同一层里放几个是摊流量用的。</p>
+    <div class="models">
+      ${S.pool.entries.map((e) => {
+        const h = entryHealth(e);
+        return `<label><input type="checkbox" value="${e.id}">
+          <span class="mid">${esc(e.upstream_model)}</span>
+          <span class="ctx">${esc(h.ch ? h.ch.name : '渠道已删')}</span>
+          <span class="meta">现在在第 ${at.indexOf(e.tier) + 1} 层（层级 ${e.tier}）</span></label>`;
+      }).join('')}
+    </div>
+    ${dlgButtons('插入')}`);
+  onSave(async () => {
+    const picked = $$('#dlg-body .models input:checked').map((i) => Number(i.value));
+    if (!picked.length) { toast('一层至少要有一个条目', true); return false; }
+    const groups = cur.map((g) => g.filter((e) => !picked.includes(e.id)));
+    groups.splice(index + 1, 0, S.pool.entries.filter((e) => picked.includes(e.id)));
+    await saveGroups(groups);
+  });
+}
+
+// 从表格 DOM 反推层结构：分隔带行开一个新层，条目行追加到当前层。
+// 插到分隔带前面就是「并进上一层」，插到后面就是「进下一层」，insertBefore 天然对。
+function readGroups(tbody) {
+  const groups = [];
+  let cur = null;
+  for (const tr of tbody.children) {
+    if (tr.classList.contains('band')) { cur = []; groups.push(cur); continue; }
+    if (!tr.dataset.id || !cur) continue;
+    const e = S.pool.entries.find((x) => x.id === Number(tr.dataset.id));
+    if (e) cur.push(e);
+  }
+  return groups.filter((g) => g.length);
+}
+
+function orderRow(e, gi, n) {
+  const h = entryHealth(e);
+  const lock = S.orderQ.trim() ? ' disabled' : ''; // 筛选态下不许改顺序，见 orderTable 的说明
+  return `<tr data-id="${e.id}">
+    <td class="grip" ${lock ? '' : 'draggable="true"'} title="按住拖到别的层">⠿</td>
+    <td class="num" data-k="层级">${e.tier}</td>
+    <td data-k="上游模型"><span class="lamp ${h.st}" style="display:inline-block;margin-right:7px"></span>${esc(e.upstream_model)}</td>
+    <td data-k="渠道">${esc(h.ch ? h.ch.name : '（渠道已删）')}</td>
+    <td class="num" data-k="上下文">${int(e.max_context)}</td>
+    <td data-k="状态">${e.enabled ? `<span class="note" style="margin:0">${esc(h.line)}</span>` : '<span class="tag">停用</span>'}</td>
+    <td data-k="连通性" data-probe-out="${e.id}">${probeHtml(S.probes[e.id])}</td>
+    <td><button class="tiny" data-probe="${e.id}">测</button>
+      <button class="tiny ghost" data-up="${e.id}" ${lock || gi === 0 ? 'disabled' : ''} title="上移一层">↑</button>
+      <button class="tiny ghost" data-down="${e.id}" ${lock || gi === n - 1 ? 'disabled' : ''} title="下移一层">↓</button>
+      <button class="tiny ghost" data-editentry="${e.id}">改</button>
+      <button class="tiny" data-togentry="${e.id}">${e.enabled ? '停用' : '启用'}</button>
+      <button class="tiny danger" data-delentry="${e.id}">删</button></td>
+  </tr>`;
+}
+
+// 总表的过滤：渠道名、模型名、备注任一命中即可
+const orderHit = (e, q) => !q || `${e.upstream_model} ${e.notes} ${
+  entryHealth(e).ch ? entryHealth(e).ch.name : ''}`.toLowerCase().includes(q);
+
+function orderTable() {
+  const q = S.orderQ.trim().toLowerCase();
+  const groups = tierGroups();
+  const bands = groups
+    .map((g, i) => ({ i, rows: g.filter((e) => orderHit(e, q)) }))
+    .filter((b) => b.rows.length);
+  const cells = 8;
+  return `${q ? '<p class="note">筛选状态下不能调整顺序——按一个不完整的列表排，排出来的全局顺序是错的。'
+      + '清空搜索框就能接着排。</p>' : ''}
+    <table><thead><tr><th></th><th class="num">层级</th><th>上游模型</th><th>渠道</th>
+      <th class="num">上下文</th><th>状态</th><th>连通性</th><th></th></tr></thead><tbody>
+    ${bands.map((b) => `<tr class="band"><td colspan="${cells}">
+        <span class="bnum">第 ${b.i + 1} 层</span><span class="bcount">${b.rows.length} 条</span>
+        <span class="bnote">层级 ${groups[b.i][0].tier} · 层内按会话哈希分摊</span>
+        <div class="brow">
+          <button class="tiny" data-addlayer="${b.i}" ${q ? 'disabled' : ''}>＋ 在下面插入新层</button>
+          ${b.i > 0 ? `<button class="tiny ghost" data-merge="${b.i}" ${q ? 'disabled' : ''}>并入上层</button>` : ''}
+        </div></td></tr>
+      ${b.rows.map((e) => orderRow(e, b.i, groups.length)).join('')}`).join('')
+      || `<tr><td class="empty" colspan="${cells}">${S.pool.entries.length ? '没有匹配的条目' : '还没有条目'}</td></tr>`}
+    </tbody></table>`;
+}
+
+async function pOrder(host) {
+  const n = S.pool.entries.length;
+  host.innerHTML = `
+    <div class="sec">
+      <h2>条目总表</h2>
+      <p class="note">所有渠道的条目按层排在一张表里。层与层的先后决定请求先试谁——整层都冷却或熔断了
+        才降级到下一层。<b>层内不排序</b>：同一层的条目本来就按会话哈希摊给不同渠道，
+        在这一层里排先后不会改变任何请求的走向。拖一行的手柄可以换层，也可以用 ↑↓ 或「插入新层」。</p>
+      <div class="row"><input id="order-q" placeholder="按渠道、模型或备注过滤" value="${esc(S.orderQ)}">
+        <span id="order-count" class="note" style="margin:0;flex:none"></span></div>
+    </div>
+    <div class="sec" id="order-wrap"></div>`;
+
+  // 只重画表格，输入框不碰——边打边筛时焦点和光标必须留在框里
+  const paint = () => {
+    const q = S.orderQ.trim().toLowerCase();
+    const shown = tierGroups().reduce((s, g) => s + g.filter((e) => orderHit(e, q)).length, 0);
+    $('#order-wrap', host).innerHTML = orderTable();
+    $('#order-count', host).textContent = q ? `筛出 ${shown} / ${n} 个` : `${n} 个条目`;
+  };
+  paint();
+  $('#order-q', host).oninput = (e) => { S.orderQ = e.target.value; paint(); };
+
+  host.onclick = guard(async (e) => {
+    const g = (attr) => e.target.closest(`button[data-${attr}]`);
+    const ent = (attr) => S.pool.entries.find((x) => x.id === Number(g(attr).dataset[attr]));
+    if (g('probe')) return probeEntry(Number(g('probe').dataset.probe));
+    if (g('editentry')) return entryForm(ent('editentry').channel_id, ent('editentry'));
+    if (g('up')) return moveLayer(Number(g('up').dataset.up), -1);
+    if (g('down')) return moveLayer(Number(g('down').dataset.down), 1);
+    if (g('addlayer')) return addLayer(Number(g('addlayer').dataset.addlayer));
+    if (g('merge')) return mergeLayer(Number(g('merge').dataset.merge));
+    if (g('togentry')) {
+      const en = ent('togentry');
+      await post('/admin/api/entries/' + en.id, { ...en, enabled: !en.enabled }, 'PATCH');
+      toast(en.enabled ? '条目已停用' : '条目已启用');
+    } else if (g('delentry')) {
+      if (!confirm('删除这个条目？')) return;
+      await api('/admin/api/entries/' + Number(g('delentry').dataset.delentry), { method: 'DELETE' });
+      toast('条目已删除');
+    } else return;
+    await reload();
+  });
+
+  // 拖拽换层。层内挪动不算数：那一层的先后是按会话哈希摊的，页上排了也不改变请求走向，
+  // 所以 onDrop 里要把这种情况退回去并说清楚，而不是让它看着像生效了。
+  const tbody = () => $('#order-wrap tbody', host);
+  let was = null; // 拖起时的层结构，用来判断这次到底跨没跨层
+  wireRowDrag(host, '#order-wrap tbody', {
+    onStart: () => { was = readGroups(tbody()); },
+    onDrop: async () => {
+      const now = readGroups(tbody());
+      if (sameGroups(was, now)) {
+        await render();
+        toast('同一层内不排序——层内的条目本来就按会话哈希摊开', true);
+        return;
+      }
+      await saveGroups(now);
+    },
+  });
+}
+
 // ── 新增渠道：先选预设 ──────────────────────────────────────────────────
 async function newChannel() {
   const presets = await api('/admin/api/presets');
@@ -733,6 +981,8 @@ function entryForm(channelId, en) {
       <label class="f"><span>上下文窗口（token）</span><input id="f-ctx" type="number" value="${cur.max_context}"></label>
     </div>
     <p class="note">上下文窗口和模态会参与路由：放不下或没有对应能力的请求会自动跳过这个条目。</p>
+    <p class="note">层级是「分组」不是「序号」：数字相同就是同一层，层内按会话哈希摊流量。
+      想看全局顺序、或者要加一层，去「条目总表」页排，别在这里一个个填。</p>
     <label class="f"><span><input type="checkbox" id="f-vision" ${cur.vision ? 'checked' : ''} style="width:auto"> 支持图片</span></label>
     <label class="f"><span><input type="checkbox" id="f-pdf" ${cur.pdf ? 'checked' : ''} style="width:auto"> 支持 PDF</span></label>
     <label class="f"><span><input type="checkbox" id="f-enabled" ${cur.enabled ? 'checked' : ''} style="width:auto"> 启用</span></label>
@@ -971,17 +1221,42 @@ function newDownstreamKey() {
 // ── 搜索后端 ────────────────────────────────────────────────────────────
 const SEARCH_KINDS = ['tavily', 'exa', 'firecrawl', 'parallel', 'jina'];
 
+// 保存搜索后端的尝试顺序。每次搜索都现读库（api/messages.rs 的 load_search_backends），
+// 所以这里不用像条目那样等热加载——写完下一次搜索就按新顺序走。
+async function saveSearchOrder(ids) {
+  try {
+    const r = await post('/admin/api/search_backends/reorder', { ids });
+    await reload();
+    toast(`尝试顺序已保存，改了 ${r.changed} 个后端`);
+  } catch (err) {
+    await reload().catch(() => {}); // 409：先把界面拉回服务端真正接受的那份顺序
+    throw err;
+  }
+}
+
 async function pSearch(host) {
   const rows = await api('/admin/api/search_backends');
+  const n = rows.length;
+  const move = async (id, dir) => {
+    const ids = rows.map((r) => r.id);
+    const i = ids.indexOf(id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    ids.splice(j, 0, ids.splice(i, 1)[0]);
+    await saveSearchOrder(ids);
+  };
   host.innerHTML = `
     <div class="sec">
       <h2>搜索后端</h2>
       <p class="note">网关自己执行网页搜索：上游模型调用搜索 → 网关查这些后端 → 结果以标准块回给 Claude Code。
-        多个后端会依次尝试，被限流的那一个进入冷却。「测」会拿真实配置搜一次，不影响冷却。</p>
+        <b>从上到下就是尝试顺序</b>：第一个搜到东西的就算数，后面的根本不会被打扰；被限流的那一个进入冷却，
+        这次就跳过它接着往下试。拖行首的手柄或用 ↑↓ 改顺序，改完下一次搜索就生效。
+        「测」会拿真实配置搜一次，不影响冷却。</p>
       <div class="row"><button class="primary" data-add>新增搜索后端</button>
-        ${rows.length > 1 ? '<button data-testall>全部测一遍</button>' : ''}</div>
-      <table><thead><tr><th>名字</th><th>类型</th><th>密钥</th><th>base_url</th><th>状态</th><th>冷却</th><th>连通性</th><th></th></tr></thead><tbody>
-      ${rows.map((r) => `<tr>
+        ${n > 1 ? '<button data-testall>全部测一遍</button>' : ''}</div>
+      <table><thead><tr><th></th><th>名字</th><th>类型</th><th>密钥</th><th>base_url</th><th>状态</th><th>冷却</th><th>连通性</th><th></th></tr></thead><tbody>
+      ${rows.map((r, i) => `<tr data-id="${r.id}">
+        <td class="grip" draggable="true" title="按住拖动改顺序">⠿</td>
         <td data-k="名字">${esc(r.name)}</td><td data-k="类型">${esc(r.kind)}</td>
         <td data-k="密钥" class="mono">${esc(r.api_key_masked || '（无需密钥）')}</td>
         <td data-k="base_url" class="note" style="margin:0">${esc(r.base_url || '默认')}</td>
@@ -989,12 +1264,16 @@ async function pSearch(host) {
         <td data-k="冷却">${r.cooldown_until_ms && r.cooldown_until_ms > Date.now() ? `<span class="tag hold">${remain(r.cooldown_until_ms)}</span>` : ''}</td>
         <td data-k="连通性" data-sprobe-out="${r.id}">${probeHtml(S.searchProbes[r.id])}</td>
         <td><button class="tiny" data-test="${r.id}">测</button>
+          <button class="tiny ghost" data-up="${r.id}" ${i === 0 ? 'disabled' : ''} title="上移一位">↑</button>
+          <button class="tiny ghost" data-down="${r.id}" ${i === n - 1 ? 'disabled' : ''} title="下移一位">↓</button>
           <button class="tiny ghost" data-edit="${r.id}">改</button>
           <button class="tiny" data-tog="${r.id}">${r.enabled ? '停用' : '启用'}</button>
           <button class="tiny danger" data-del="${r.id}">删</button></td></tr>`).join('')
-      || '<tr><td class="empty" colspan="8">还没有搜索后端 —— 不配的话 WebSearch 会用不了，其他功能不受影响</td></tr>'}
+      || '<tr><td class="empty" colspan="9">还没有搜索后端 —— 不配的话 WebSearch 会用不了，其他功能不受影响</td></tr>'}
       </tbody></table>
     </div>`;
+  // 搜索后端没有「层」：顺序就是纯粹的先后，挪一格都算数，不用像条目那样判断跨没跨层
+  wireRowDrag(host, 'table tbody', { onDrop: (ids) => saveSearchOrder(ids.map(Number)) });
   const row = (b, attr) => rows.find((r) => r.id === Number(b.dataset[attr]));
   host.onclick = guard(async (e) => {
     const b = e.target.closest('button');
@@ -1002,6 +1281,8 @@ async function pSearch(host) {
     if (b.hasAttribute('data-add')) return searchForm(null);
     if (b.dataset.edit) return searchForm(row(b, 'edit'));
     if (b.dataset.test) return probeSearch({ id: Number(b.dataset.test) }, Number(b.dataset.test));
+    if (b.dataset.up) return move(Number(b.dataset.up), -1);
+    if (b.dataset.down) return move(Number(b.dataset.down), 1);
     if (b.hasAttribute('data-testall')) {
       await Promise.all(rows.map((r) => probeSearch({ id: r.id }, r.id)));
       return;

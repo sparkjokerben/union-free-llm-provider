@@ -37,6 +37,10 @@ const forceRo = ['1', 'true', 'yes'].includes(String(process.env.UFP_SMOKE_RO ||
 const allowWrite = process.argv.includes('--write');
 const WRITES = !forceRo && (isLoopback || allowWrite);
 
+// 后台的页签数。加了页面记得改这里——下面那处断言和结尾的汇总都用它，
+// 免得只改了其中一半，测试自己撒谎。
+const PAGES_COUNT = 10;
+
 if (process.argv.includes('--selfcheck')) {
   console.log(JSON.stringify({
     地址: BASE, 主机: host, 本机: isLoopback,
@@ -223,10 +227,10 @@ await step('登录后：控制台可见、登录框收起来',
   `getComputedStyle(document.querySelector('.shell')).display !== 'none' &&
    getComputedStyle(document.querySelector('#gate')).display === 'none'`, 200);
 
-await step('外壳渲染：机架 + 读数带 + 九个页签',
+await step(`外壳渲染：机架 + 读数带 + ${PAGES_COUNT} 个页签`,
   `document.querySelector('#rail').innerHTML.length > 20 &&
    document.querySelector('#readout').textContent.trim().length > 0 &&
-   document.querySelectorAll('#pages button').length === 9`, 200);
+   document.querySelectorAll('#pages button').length === ${PAGES_COUNT}`, 200);
 
 // 网格默认 align-content:stretch 会把 100vh 的余量摊给各行，顶部读数带那一行
 // 于是被撑高，内容少的时候（池子空着、页面稀疏）标题下面就多出一大块空白。
@@ -395,6 +399,160 @@ if (WRITES) {
        return true;
      })()`, 400);
 
+  await step('条目总表：所有渠道的条目铺在一张表里，层内不排序',
+    `(async () => {
+       const ch = await post('/admin/api/channels', { name: '__smoke_ord_chan__', protocol: 'openai_chat',
+         base_url: 'http://127.0.0.1:9/v1', enabled: true });
+       await post('/admin/api/channels/' + ch.id + '/keys', { label: 'k', api_key: 'sk-smoke-ord-key' });
+       for (const [m, t] of [['__smoke_ord_a__', 1], ['__smoke_ord_b__', 1], ['__smoke_ord_c__', 5]]) {
+         await post('/admin/api/channels/' + ch.id + '/entries', { upstream_model: m, tier: t,
+           max_context: 200000, vision: true, pdf: false, enabled: true });
+       }
+       await go('order');
+       await new Promise(r => setTimeout(r, 600));
+       const page = document.querySelector('#p-order');
+       const bands = [...page.querySelectorAll('tr.band')];
+       if (bands.length < 2) return '只有 ' + bands.length + ' 条层分隔带，tier 1 与 tier 5 该分成两层';
+       if (!/第 1 层/.test(bands[0].textContent)) return '第一条分隔带不是第 1 层：' + bands[0].textContent;
+       if (!/层内按会话哈希分摊/.test(bands[0].textContent)) return '分隔带上没写清层内不排序';
+       const rows = [...page.querySelectorAll('tr[data-id]')].filter(tr => /__smoke_ord_/.test(tr.textContent));
+       if (rows.length !== 3) return '表里只有 ' + rows.length + ' 行我们造的条目';
+       if (!rows[0].querySelector('td.grip[draggable]')) return '行首没有可拖的手柄';
+       const all = [...page.querySelectorAll('tr[data-id]')];
+       if (!all[0].querySelector('button[data-up]').disabled) return '第一行的「上移」不该是可点的';
+       if (!all[all.length - 1].querySelector('button[data-down]').disabled) return '最后一行的「下移」不该是可点的';
+       if (rows.find(tr => tr.textContent.includes('__smoke_ord_b__')).querySelector('td.num').textContent.trim() !== '1') {
+         return '层级列没显示原始 tier';
+       }
+       return true;
+     })()`, 300);
+
+  await step('条目总表：搜索过滤，并且过滤时不给改顺序',
+    `(async () => {
+       const inp = document.querySelector('#order-q');
+       if (!inp) return '总表页没有搜索框';
+       inp.focus();  // 直接赋 .value 不会聚焦，那样测不到「边打边筛焦点不丢」
+       inp.value = '__smoke_ord_b__';
+       inp.dispatchEvent(new Event('input'));
+       await new Promise(r => setTimeout(r, 300));
+       const page = document.querySelector('#p-order');
+       const rows = [...page.querySelectorAll('tr[data-id]')];
+       if (rows.length !== 1) return '筛出 ' + rows.length + ' 行，应该只有 1 行';
+       if (!/__smoke_ord_b__/.test(rows[0].textContent)) return '筛出来的不是那一条';
+       if (rows[0].querySelector('td.grip[draggable]')) return '过滤状态下还能拖';
+       if (!rows[0].querySelector('button[data-up]').disabled) return '过滤状态下还能上移';
+       if (!/不能调整顺序/.test(page.textContent)) return '没提示为什么这时候不能排';
+       if (document.activeElement !== inp) return '输入框被重画掉了，焦点丢了';
+       inp.value = '';
+       inp.dispatchEvent(new Event('input'));
+       await new Promise(r => setTimeout(r, 300));
+       return true;
+     })()`, 300);
+
+  await step('条目总表：上移一层，层级真的改了、空层自动消失',
+    `(async () => {
+       const rowOf = (m) => [...document.querySelectorAll('#p-order tr[data-id]')]
+         .find(tr => tr.textContent.includes(m));
+       const c = rowOf('__smoke_ord_c__');
+       if (!c) return '表里找不到这一条';
+       c.querySelector('button[data-up]').click();
+       await new Promise(r => setTimeout(r, 1600));
+       const after = rowOf('__smoke_ord_c__');
+       if (!after) return '挪完这一行不见了';
+       // 它搬进了唯一的那一层，于是三层并成一层，层级一起变成 10
+       if (after.querySelector('td.num').textContent.trim() !== '10') return '上移一层后层级不是 10';
+       const bands = [...document.querySelectorAll('#p-order tr.band')];
+       if (bands.length !== 1) return '搬空的那层没消失，还剩 ' + bands.length + ' 层';
+       if (!/3 条/.test(bands[0].textContent)) return '第 1 层没收成 3 条：' + bands[0].textContent;
+       if (S.pool.entries.find(e => e.upstream_model === '__smoke_ord_c__').tier !== 10) return '共享状态没刷新';
+       return true;
+     })()`, 300);
+
+  await step('条目总表：插入新层——勾哪几个就成哪一层',
+    `(async () => {
+       await go('order');
+       await new Promise(r => setTimeout(r, 500));
+       document.querySelector('#p-order tr.band button[data-addlayer]').click();
+       await new Promise(r => setTimeout(r, 500));
+       const dlg = document.querySelector('#dlg');
+       if (!dlg.open) return '「插入新层」没打开对话框';
+       if (!/插入新层/.test(dlg.querySelector('h2').textContent)) return '对话框标题不对';
+       const label = [...dlg.querySelectorAll('.models label')].find(l => l.textContent.includes('__smoke_ord_b__'));
+       if (!label) return '勾选列表里没有这一条';
+       label.querySelector('input').checked = true;
+       document.querySelector('#f-save').click();
+       await new Promise(r => setTimeout(r, 1800));
+       if (document.querySelector('#dlg').open) return '保存没成功，对话框还开着';
+       const bands = [...document.querySelectorAll('#p-order tr.band')];
+       if (bands.length !== 2) return '插入后有 ' + bands.length + ' 层，应该是 2 层';
+       if (!/2 条/.test(bands[0].textContent)) return '第 1 层不是 2 条：' + bands[0].textContent;
+       if (!/1 条/.test(bands[1].textContent)) return '第 2 层不是 1 条：' + bands[1].textContent;
+       if (S.pool.entries.find(e => e.upstream_model === '__smoke_ord_b__').tier !== 20) return '勾的那条没换层';
+       return true;
+     })()`, 300);
+
+  // 窄屏（<860px）表格会退化成键值行：每个 td 靠 data-k 显示列名。分隔带与手柄
+  // 是新加的，得确认它们在这套布局下不塌——手柄是鼠标手势，触屏上本来就使不上。
+  await send('Emulation.setDeviceMetricsOverride', { width: 420, height: 860, deviceScaleFactor: 1, mobile: false });
+  await step('窄屏：总表退化成键值行，分隔带还在、拖拽手柄收起来',
+    `(async () => {
+       await go('order');
+       await new Promise(r => setTimeout(r, 700));
+       const band = document.querySelector('#p-order tr.band');
+       if (!band) return '分隔带没了';
+       if (getComputedStyle(band).display !== 'block') return '分隔带在窄屏下没退成块';
+       const row = [...document.querySelectorAll('#p-order tr[data-id]')]
+         .find(tr => tr.textContent.includes('__smoke_ord_b__'));
+       if (!row) return '表里找不到这一条';
+       if (getComputedStyle(row.querySelector('td.grip')).display !== 'none') return '窄屏下还露着拖拽手柄';
+       const tier = row.querySelector('td.num');
+       if (!/层级/.test(getComputedStyle(tier, '::before').content)) return '层级格没带列名，会认不出是数字';
+       if (row.getBoundingClientRect().width > 420) return '行宽超出视口，窄屏上会横向滚动';
+       return true;
+     })()`, 300);
+  await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 860, deviceScaleFactor: 1, mobile: false });
+
+  await step('条目总表：临时渠道自己清理干净',
+    `(async () => {
+       const ch = S.pool.channels.find(c => c.name === '__smoke_ord_chan__');
+       if (!ch) return '临时渠道不见了（可能已经被别的步骤删了）';
+       await api('/admin/api/channels/' + ch.id, { method: 'DELETE' });
+       await go('order');
+       await new Promise(r => setTimeout(r, 500));
+       if (/__smoke_ord_/.test(document.querySelector('#p-order').textContent)) return '清理后表里还有残留';
+       return true;
+     })()`, 300);
+
+  await step('搜索页：顺序就是尝试顺序，↑↓ 改完就存进库里',
+    `(async () => {
+       for (const n of ['__smoke_s甲__', '__smoke_s乙__', '__smoke_s丙__']) {
+         await post('/admin/api/search_backends', { name: n, kind: 'jina', api_key: '',
+           base_url: '', enabled: true, notes: '' });
+       }
+       await go('search');
+       await new Promise(r => setTimeout(r, 700));
+       const page = document.querySelector('#p-search');
+       const rows = () => [...page.querySelectorAll('tr[data-id]')].filter(tr => /__smoke_s/.test(tr.textContent));
+       const names = () => rows().map(tr => tr.querySelector('td[data-k="名字"]').textContent);
+       if (rows().length !== 3) return '表里只有 ' + rows().length + ' 行我们造的后端';
+       if (names().join() !== '__smoke_s甲__,__smoke_s乙__,__smoke_s丙__') return '初始顺序不对：' + names().join();
+       if (!/从上到下就是尝试顺序/.test(page.textContent)) return '页面上没写清这个顺序是尝试顺序';
+       if (!rows()[0].querySelector('td.grip[draggable]')) return '行首没有可拖的手柄';
+       if (!rows()[0].querySelector('button[data-up]').disabled) return '第一行的「上移」不该可点';
+       if (!rows()[2].querySelector('button[data-down]').disabled) return '最后一行的「下移」不该可点';
+
+       rows()[0].querySelector('button[data-down]').click();
+       await new Promise(r => setTimeout(r, 1600));
+       if (names().join() !== '__smoke_s乙__,__smoke_s甲__,__smoke_s丙__') return '下移之后顺序不对：' + names().join();
+       const saved = (await api('/admin/api/search_backends')).filter(r => /__smoke_s/.test(r.name)).map(r => r.name);
+       if (saved.join() !== '__smoke_s乙__,__smoke_s甲__,__smoke_s丙__') return '没有存进库里：' + saved.join();
+
+       for (const r of (await api('/admin/api/search_backends')).filter(r => /__smoke_s/.test(r.name))) {
+         await api('/admin/api/search_backends/' + r.id, { method: 'DELETE' });
+       }
+       return true;
+     })()`, 300);
+
   await step('矫正规则页：下拉框选分析条目真的存进设置、停用渠道会标红',
     `(async () => {
        const ch = await post('/admin/api/channels', { name: '__smoke_ana_chan__', protocol: 'openai_chat',
@@ -467,7 +625,7 @@ if (problems.length) {
   fail('页面控制台有报错：\n  ' + problems.join('\n  '));
 }
 
-console.log(`\n✓ 后台冒烟测试通过：登录、九个页面${WRITES ? '、写操作、对话框' : '（只读，未做写操作）'}都正常，控制台无异常。`);
+console.log(`\n✓ 后台冒烟测试通过：登录、${PAGES_COUNT} 个页面${WRITES ? '、写操作、对话框' : '（只读，未做写操作）'}都正常，控制台无异常。`);
 ws.close();
 child.kill('SIGKILL');
 process.exit(0);

@@ -63,6 +63,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/admin/api/entries/{id}",
             patch(update_entry).delete(delete_entry),
         )
+        .route("/admin/api/entries/reorder", post(reorder_entries))
         .route(
             "/admin/api/downstream_keys",
             get(list_downstream_keys).post(create_downstream_key),
@@ -95,6 +96,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             patch(update_search_backend).delete(delete_search_backend),
         )
         .route("/admin/api/search_backends/test", post(test_search_backend))
+        .route(
+            "/admin/api/search_backends/reorder",
+            post(reorder_search_backends),
+        )
         .route("/admin/api/presets", get(presets::list))
         .route("/admin/api/presets/{id}/models", post(presets::models))
         .route("/admin/api/presets/{id}/apply", post(presets::apply))
@@ -1078,6 +1083,68 @@ async fn update_entry(
     Ok(Json(json!({"ok": true})).into_response())
 }
 
+/// 「条目总表」一次提交的整体层级：从高到低，每项是一层的条目 id。
+///
+/// 层内顺序**不参与路由**——同一层的候选在 `router/select.rs` 里是按
+/// `hash(会话, 条目, key)` 摊开的，页面上只能调层与层的先后。
+#[derive(Deserialize)]
+struct ReorderPayload {
+    groups: Vec<Vec<i64>>,
+}
+
+/// 重排后层级落在 10、20、30……，层与层之间永远留得下插新层的空当。
+const TIER_STEP: i32 = 10;
+
+/// 按后台总表提交的顺序重写所有条目的层级。
+///
+/// 覆盖不到的条目一律当冲突（409）而不是悄悄放过：页面打开之后如果有人在别处加过
+/// 条目，照着旧列表重排会把那一条落在层级之外。单事务里比对，冲突时事务随 `tx`
+/// 析构回滚，一行都不会动。
+async fn reorder_entries(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<ReorderPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let mut sent: Vec<i64> = p.groups.iter().flatten().copied().collect();
+    sent.sort_unstable();
+    if sent.windows(2).any(|w| w[0] == w[1]) {
+        return Err(bad_request("同一个条目出现在多个层里"));
+    }
+    let groups = p.groups;
+    // 第 i 层 → 层级 (i+1)*10；层内几条共用同一个层级（层内不排序，见 router/select.rs）
+    let wanted: Vec<(i64, i64)> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(i, g)| {
+            g.iter()
+                .map(move |id| (*id, (i as i64 + 1) * TIER_STEP as i64))
+        })
+        .collect();
+    let layers = groups.len();
+    // 这里没有走 mutate()：它把库错误一律当成 500，而这个接口需要回 409
+    // 「条目有变动，请刷新页面」——那不是服务器出错，是页面过期了。
+    let out = state
+        .db
+        .admin(move |conn| {
+            let tx = conn.transaction()?;
+            let Some(changed) = rewrite_order(&tx, "entries", "tier", &wanted)? else {
+                return Ok(None);
+            };
+            tx.commit()?;
+            Ok(Some(changed))
+        })
+        .await
+        .map_err(internal)?;
+    let Some(changed) = out else {
+        return Err(conflict("条目有变动（有人加过或删过），请刷新页面再排"));
+    };
+    if let Err(e) = state.pool.reload(&state.db).await {
+        tracing::warn!(error = %e, "条目重排后重载配置快照失败");
+    }
+    Ok(Json(json!({ "ok": true, "layers": layers, "changed": changed })).into_response())
+}
+
 async fn delete_entry(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1545,8 +1612,8 @@ async fn list_search_backends(
         .db
         .read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, kind, api_key, base_url, enabled, cooldown_until_ms, notes
-                 FROM search_backends ORDER BY id",
+                "SELECT id, name, kind, api_key, base_url, enabled, cooldown_until_ms, notes, sort_order
+                 FROM search_backends ORDER BY sort_order, id",
             )?;
             let rows: Vec<Value> = stmt
                 .query_map([], |r| {
@@ -1561,6 +1628,7 @@ async fn list_search_backends(
                         "enabled": r.get::<_, i64>(5)? != 0,
                         "cooldown_until_ms": r.get::<_, Option<i64>>(6)?,
                         "notes": r.get::<_, String>(7)?,
+                        "sort_order": r.get::<_, i64>(8)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1583,9 +1651,16 @@ async fn create_search_backend(
         ));
     }
     let id = mutate(&state, move |conn| {
+        // 新加的排在最后：刚添的备用通道不该插到已经调好的尝试顺序前面去。
+        // 步长 10 是为了中间留得下空当——重排之后又是 10/20/30……
+        let next: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM search_backends",
+            [],
+            |r| r.get(0),
+        )?;
         conn.execute(
-            "INSERT INTO search_backends (name, kind, api_key, base_url, enabled, notes, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO search_backends (name, kind, api_key, base_url, enabled, notes, sort_order, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 p.name,
                 p.kind,
@@ -1593,6 +1668,7 @@ async fn create_search_backend(
                 p.base_url.trim().trim_end_matches('/'),
                 p.enabled as i64,
                 p.notes,
+                next,
                 chrono::Utc::now().timestamp_millis()
             ],
         )?;
@@ -1657,6 +1733,53 @@ async fn delete_search_backend(
     })
     .await?;
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+/// 「搜索后端」页拖出来的尝试顺序，从高到低。
+#[derive(Deserialize)]
+struct SearchReorderPayload {
+    ids: Vec<i64>,
+}
+
+/// 按后台排的顺序重写搜索后端的尝试次序。
+///
+/// 和条目那边不同，这里**不需要**热加载配置快照：搜索后端是每次搜都直接从库里读的
+/// （`api/messages.rs` 的 `load_search_backends`），所以写完下一次搜索就按新顺序走。
+async fn reorder_search_backends(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(p): Json<SearchReorderPayload>,
+) -> Result<Response, Response> {
+    require_auth(&state, &headers)?;
+    let mut seen = p.ids.clone();
+    seen.sort_unstable();
+    if seen.windows(2).any(|w| w[0] == w[1]) {
+        return Err(bad_request("同一个搜索后端出现了两次"));
+    }
+    // 一条一个次位：搜索后端没有「层」的概念，顺序就是纯粹的先后
+    let wanted: Vec<(i64, i64)> = p
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, (i as i64 + 1) * TIER_STEP as i64))
+        .collect();
+    let out = state
+        .db
+        .admin(move |conn| {
+            let tx = conn.transaction()?;
+            let Some(changed) = rewrite_order(&tx, "search_backends", "sort_order", &wanted)?
+            else {
+                return Ok(None);
+            };
+            tx.commit()?;
+            Ok(Some(changed))
+        })
+        .await
+        .map_err(internal)?;
+    let Some(changed) = out else {
+        return Err(conflict("搜索后端有变动（有人加过或删过），请刷新页面再排"));
+    };
+    Ok(Json(json!({ "ok": true, "changed": changed })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2216,7 +2339,7 @@ fn export_all(conn: &Connection) -> rusqlite::Result<Value> {
         // 带 key_hash：恢复之后这些 key 还能继续用（明文不在备份里，界面上的提示照此为准）。
         "downstream_keys": dump("SELECT id, name, key_hash, key_prefix, enabled FROM downstream_keys", &["id","name","key_hash","key_prefix","enabled"])?,
         "rectify_rules": dump("SELECT id, scope, error_fingerprint, error_sample, patch_json, source, enabled FROM rectify_rules", &["id","scope","error_fingerprint","error_sample","patch_json","source","enabled"])?,
-        "search_backends": dump("SELECT id, name, kind, api_key, base_url, enabled, notes FROM search_backends", &["id","name","kind","api_key","base_url","enabled","notes"])?,
+        "search_backends": dump("SELECT id, name, kind, api_key, base_url, enabled, notes, sort_order FROM search_backends", &["id","name","kind","api_key","base_url","enabled","notes","sort_order"])?,
         "settings": conn.query_row("SELECT value FROM settings WHERE key = 'runtime'", [], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!({})),
     }))
 }
@@ -2387,8 +2510,8 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
             )?;
             if exists == 0 {
                 tx.execute(
-                    "INSERT INTO search_backends (name, kind, api_key, base_url, enabled, notes, created_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO search_backends (name, kind, api_key, base_url, enabled, notes, sort_order, created_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         name,
                         kind,
@@ -2396,6 +2519,9 @@ fn import_all(conn: &Connection, payload: &Value) -> rusqlite::Result<Value> {
                         row.get("base_url").and_then(|v| v.as_str()).unwrap_or(""),
                         row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) as i64,
                         row.get("notes").and_then(|v| v.as_str()).unwrap_or(""),
+                        // 尝试顺序也是配置的一部分：备份里没这一列的旧档一律当 0，
+                        // 靠 id 兜底，还原出来的先后和当初存进去时一样
+                        row.get("sort_order").and_then(|v| v.as_i64()).unwrap_or(0),
                         now
                     ],
                 )?;
@@ -2478,6 +2604,61 @@ fn internal<E: std::fmt::Display>(e: E) -> Response {
 
 fn bad_request(message: &str) -> Response {
     ApiError::invalid_request(message.to_string()).into_response()
+}
+
+/// 409：请求本身没错，是它依据的状态过期了（页面打开后池子变了）。刷新即可重试。
+fn conflict(message: &str) -> Response {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "invalid_request_error",
+        message.to_string(),
+    )
+    .into_response()
+}
+
+/// 后台「排序」类接口的共同动作：把提交上来的 `(id, 顺序值)` 写进 `table.column`，
+/// 返回真正改动的行数。提交里的 id 集合和库里对不上时返回 `Ok(None)`，由调用方回 409。
+///
+/// 顺序值由调用方给——条目是**按层**给的（层内几条共用一个层级），搜索后端是**按位次**
+/// 给的（一条一个次位）。写死成「位置」的话，条目那一层就废了。
+///
+/// 比对和写入在同一个事务里：调用方拿到 `None` 直接 return，事务随 `tx` 析构回滚，
+/// 一行都不会动。也因此不用「先查一遍再写」——那样中间还留着被别人插队的窗口。
+fn rewrite_order(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    wanted: &[(i64, i64)],
+) -> rusqlite::Result<Option<usize>> {
+    let mut stmt = tx.prepare(&format!("SELECT id, {column} FROM {table}"))?;
+    let current: HashMap<i64, i64> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    drop(stmt);
+
+    // 覆盖不全就是过期了：页面打开之后有人在别处加过条目/后端，照旧列表排会把
+    // 那一条落在顺序之外。宁可让人刷新重来，也不要静默丢掉它。
+    let mut ids: Vec<i64> = current.keys().copied().collect();
+    ids.sort_unstable();
+    let mut sent: Vec<i64> = wanted.iter().map(|(id, _)| *id).collect();
+    sent.sort_unstable();
+    if ids != sent {
+        return Ok(None);
+    }
+
+    let mut changed = 0usize;
+    for (id, want) in wanted {
+        // 顺序没变的行不写：多数情况下只有被挪动的那几行真的变了
+        if current.get(id) == Some(want) {
+            continue;
+        }
+        tx.execute(
+            &format!("UPDATE {table} SET {column} = ?2 WHERE id = ?1"),
+            params![id, want],
+        )?;
+        changed += 1;
+    }
+    Ok(Some(changed))
 }
 
 /// 测试失败时补一句人话：目标只有 IPv4 地址、而本机没有 IPv4 出口时，原始报错只是一句
